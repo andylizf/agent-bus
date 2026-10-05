@@ -15,7 +15,7 @@ if [ "$2" = --codex ]; then
   exec > >(while IFS= read -r line; do
       echo "$(date '+%F %T') $line"
       case $line in
-        MSG*|"WATCH $id down"*|"WATCH $id exited"*|"WATCH $id expired"*|"WATCH $id reconnecting"*|"WATCH skill copy outdated"*)
+        (MSG*|"WATCH $id down"*|"WATCH $id exited"*|"WATCH $id expired"*|"WATCH $id reconnecting"*|"WATCH skill copy outdated"*)
           codex queue --thread "$CODEX_THREAD_ID" --message "agent-bus ($id): $line" 2>&1 ;;
       esac
     done) 2>&1
@@ -42,7 +42,7 @@ while true; do
     ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3 "$host" "python3 $BUS watch $id --exit-on-eof" <&3 2>&1
   fi | while IFS= read -r line; do
     echo "$line"
-    case $line in "WATCH $id down"*|"no agent $id"*) exit 7 ;; esac
+    case $line in ("WATCH $id down"*|"no agent $id"*) exit 7 ;; esac
   done &
   wait $!
   [ $? = 7 ] && exit 0
