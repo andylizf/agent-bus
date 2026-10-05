@@ -6,7 +6,7 @@ export AGENT_BUS_ROOT="$1/bus-test-$(date +%s)"   # a fresh directory per run, s
 cd "$(dirname "$0")/../bin"
 bus() { python3 bus.py "$@"; }
 
-setsid sleep 300 & P=$!   # stands in for a task started by `pool.py run` (its own process group)
+setsid sleep 300 & P=$!   # stands in for a task started by bin/run.sh (its own process group)
 bus up alice-embed --gpus 1,3 --task "test task" --hours 2 --pid "$P" --on-request release --human alice
 timeout 8 python3 bus.py watch alice-embed --interval 2 < /dev/null > "$1/watch.out" &
 sleep 1
