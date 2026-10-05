@@ -1,0 +1,93 @@
+---
+name: agent-bus
+description: Load before starting GPU work on @HOST@ (a GPU host shared by a group, with no scheduler), before ending a turn while such work runs, when resuming such work, whenever a message from the board arrives (a `MSG …` or `WATCH …` line, or a queued `agent-bus (…)` message), and before asking someone else's task for GPUs there. The group coordinates the host through a message board at @ROOT@: every running task registers an entry with its GPUs and an inbox, the agent that started it watches the inbox and answers, and a request nobody acknowledges gets the task stopped — including while no session is watching.
+---
+
+# The agent-bus board on @HOST@
+
+@HOST@ has no scheduler; the group shares it through `@ROOT@` (tool `bin/bus.py`,
+command table in `README.md` there). Each running task is an entry — its GPUs, expected end, request policy, and
+whether it claims its GPUs exclusively — with an inbox anyone can leave a message in. The agent that started the task
+watches that inbox and answers. "Your user" below is the person this session works for.
+
+Commands below written `bus.py …` mean `python3 @ROOT@/bin/bus.py …` on any node that mounts the board. From
+a laptop, run them over ssh to such a node (`ssh <cluster-alias> "python3 …/bus.py …"`) and pass message text on stdin
+(`send <to> - …` with a heredoc) so quotes survive the hop. Starting and stopping tasks happens on @HOST@
+itself (`ssh @HOST@` from a node of the cluster).
+
+## The rules
+
+- **A request nobody acknowledges stops the task.** Each member's sweep (installed by `bin/install.sh`, every 30 s)
+  stops that member's run when a GPU request addressed to it goes unacknowledged: no heartbeat for 60 s, or no
+  `bus.py ack` within 5 minutes of the request being sent. The heartbeat comes only from a running `watch.sh` (below),
+  so **a run whose session has ended, slept or stopped watching is stopped by the first request that arrives**,
+  under any policy but `keep`. The sweep replies to the requester. Exempt: `keep` entries, entries registered without
+  a pid, and broadcasts to `all`. A stopped run is not restarted by anything.
+- **GPUs are shared unless declared exclusive.** Other work may join a GPU whose entries are not `--exclusive` only
+  when the memory left, after the work already there reaches its peak, still fits the new work: the GPU's memory
+  history is in `bus.py log --usage`, and the entry's owner can be asked with a `kind=msg`. A GPU busy with a
+  process that has no entry is not shareable: its owner never declared.
+- **Everything is logged** in `log.jsonl` and, every 2 minutes, `usage.jsonl` (each GPU's use and who is on it);
+  `bus.py log [--usage]` prints them.
+- **The board is read by the whole group**: everything written there (task text, replies,
+  requests) states facts about the work in plain words and nothing private.
+
+## Starting a task
+
+1. Choose the policy and tell your user, in the same message that reports the launch, which one and what it means
+   for this run — in particular that a request arriving while no session watches stops it unless it is `keep`:
+   - `agent` (default): you decide each request.
+   - `release`: you release on any request; for work that can simply be rerun.
+   - `keep: <reason>`: you keep running; only for work whose stop would lose results that cannot be recovered.
+   - `--exclusive` for work that others would spoil (timing, profiling) or that grows to fill the GPU; such work
+     goes only on GPUs with no process at all on them (`nvidia-smi`).
+2. On @HOST@: `@ROOT@/bin/run.sh <gpu-indices> --note "<what>" --hours <expected
+   runtime> [--on-request agent|release|"keep: <reason>"] [--exclusive] -- '<command>'`. It starts the command
+   detached with `CUDA_VISIBLE_DEVICES` set, registers the entry with its pid, takes the entry down when the command
+   exits, and prints the entry id and pid (`bus.py ls --json` shows the pid later).
+3. Start watching at once, and keep watching while the task runs (a resumed session starts again):
+   - Claude Code: a Monitor on `~/.claude/skills/agent-bus/watch.sh <id>` with the maximum timeout, re-armed on each
+     expiry.
+   - Codex: `mkdir -p ~/.agent-bus; nohup ~/.codex/skills/agent-bus/watch.sh <id> --codex >> ~/.agent-bus/<id>.log
+     2>&1 &`; each message is queued into this session with `codex queue --thread $CODEX_THREAD_ID`. That this wakes
+     an idle Codex session is not yet verified: treat a Codex-started run as exposed between turns.
+
+   End every turn while the task runs with the entry id and its state from `bus.py ls`.
+4. The entry's `down_reason` in `archive/` says `stopped by TERM, rc=…` or `run exited rc=…`; report a stop to your
+   user as a stop, never as the run finishing.
+
+## When a line arrives
+
+- `kind=request to=<your id>`: acknowledge within 5 minutes with `bus.py ack <id> <msg-id>`, during a long command of yours too —
+  keep blocking commands shorter than that or run them in the background. The ack records your decision and needs
+  nobody's approval; "keep running while I ask my user" is a decision, so ack it at once. Then:
+  - `agent`: weigh how long the task still needs, what stopping loses, and what is asked and why; release when
+    stopping costs little next to that, otherwise keep running and say when the GPUs will be free.
+  - `release`: release. `keep`: keep running and say when the GPUs will be free.
+  - To release: on @HOST@, `kill <pid>`; the wrapper stops the command and takes the entry down.
+- `to=all` (a broadcast, request or not): it stops nothing and is never a reason to release on its own; answer it
+  once, from one entry, only if it concerns your task.
+- `kind=msg` (a question): answer it from the task's state and logs.
+- `kind=reply`: read it; send nothing back.
+- `WATCH … up`: nothing to do. `WATCH … reconnecting` more than once: the watcher is not connected and the run is
+  exposed; fix the connection. `WATCH … expired`: the run outlived `--hours`; extend with `bus.py up <id> --hours N`
+  or end it. `unattended` in `bus.py ls`: no watcher is running; start one.
+
+Reply with `bus.py send <sender> - --from <id> --kind reply --reply-to <msg-id>`. Whether a reply needs your user's
+approval first is your user's rule, not the board's. Tell your user afterwards what was asked, by whom, and what you
+did.
+
+## Asking for GPUs
+
+`bus.py ls` shows who holds what and which GPUs are shared. Register yourself (`bus.py up <you>-req-<topic> --task
+"<what for>" --hours 1`), send `bus.py send <their id> - --from <you>-req-<topic> --kind request --gpus N --minutes M`
+with the reason on stdin, watch your id, and after 5 minutes check `bus.py ls` rather than waiting for a reply. Once a
+reply arrives or that check has answered it, `bus.py down <you>-req-<topic>`, which also ends its watcher. A task with no entry can only be reached
+through its person.
+
+## Joining
+
+Joining means accepting that your runs are stopped by the rules above, so installing is your user's decision, not
+the agent's. Your user runs `@ROOT@/bin/install.sh` once on @HOST@; it installs the
+sweep and prints how to give the agent this skill. A copy of this skill on a laptop does not update itself:
+`watch.sh` says so at start when the board's copy has changed.
