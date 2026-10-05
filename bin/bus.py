@@ -15,6 +15,8 @@ ROOT = Path(os.environ.get("AGENT_BUS_ROOT") or Path(__file__).resolve().parent.
 STALE = 60           # seconds without a heartbeat before an agent counts as unattended (watch beats every 5 s)
 RESPOND = 300        # seconds a watched agent has to act on a request before it counts as unresponsive
 SNAPSHOT_EVERY = 120 # seconds between GPU usage snapshots written by the sweep
+IDLE_UTIL = 5        # percent: an entry whose GPUs are all below this is idle
+IDLE_WARN = int(os.environ.get("AGENT_BUS_IDLE_WARN", 1800))  # seconds idle before the owner's agent is warned, and between warnings
 DIR_MODE = 0o2775    # the board's group may create files in every directory
 FILE_MODE = 0o664
 
@@ -185,7 +187,8 @@ def send(args):
 
 def fmt(m):
     extra = "".join(f" {k}={m[k]}" for k in ("gpus", "minutes", "reply_to") if m.get(k))
-    return f"MSG {m['id']} {stamp(m['ts'])} from={m['from']} ({m['from_user']}) to={m.get('to')} kind={m['kind']}{extra}: {m['text']}"
+    text = str(m["text"]).replace("\r", " ").replace("\n", "\\n")  # one line per message: a newline in the text can never pose as a MSG or WATCH line
+    return f"MSG {m['id']} {stamp(m['ts'])} from={m['from']} ({m['from_user']}) to={m.get('to')} kind={m['kind']}{extra}: {text}"
 
 
 def inbox(args):
@@ -274,15 +277,53 @@ def snapshot(host):
     last.touch()
 
 
+def gpu_util():
+    """{gpu index: utilization %} on this host, or {} without nvidia-smi."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,utilization.gpu", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    return {i.strip(): int(u) for i, u in (l.split(",") for l in out.splitlines() if "," in l)}
+
+
+def warn_idle(a, p, util):
+    """Leave a `warn` message in the entry's own inbox once its GPUs have all been under IDLE_UTIL % for IDLE_WARN s,
+    and again every IDLE_WARN s while that lasts; the watching agent wakes on it."""
+    gpus = [g for g in str(a.get("gpus", "")).split(",") if g in util]
+    if not gpus:
+        return
+    if max(util[g] for g in gpus) >= IDLE_UTIL:
+        if a.get("idle_since"):
+            a.pop("idle_since"); a.pop("idle_warned", None)
+            write_json(p, a)
+        return
+    t = now()
+    if not a.get("idle_since"):
+        a["idle_since"] = t
+        write_json(p, a)
+        return
+    idle = t - a["idle_since"]
+    if idle >= IDLE_WARN and t - a.get("idle_warned", 0) >= IDLE_WARN:
+        text = (f"low utilization: gpus {','.join(gpus)} have been under {IDLE_UTIL}% for {idle // 60} min "
+                f"(now {', '.join(f'gpu{g} {util[g]}%' for g in gpus)}). Release them, or tell your user why they are held.")
+        send(argparse.Namespace(to=a["id"], sender="agent-bus", kind="warn", text=text, reply_to=None, gpus=None, minutes=None))
+        a["idle_warned"] = t
+        write_json(p, a)
+        event("idle_warn", agent=a["id"], gpus=a.get("gpus"), idle_min=idle // 60)
+
+
 def sweep(args):
     """Run every 30 s by each user's own timer on the GPU host, for that user's entries there.
 
+    Also warns an entry's own agent (a `warn` message in its inbox) when its GPUs sit under IDLE_UTIL % for IDLE_WARN s.
     A request for GPUs stops the task when nobody can answer it: the entry's watcher is gone (no heartbeat for
     STALE seconds), or it is watched but the request sat unacknowledged for RESPOND seconds. Exempt: `keep`
     entries, entries without a pid (locks), and broadcasts to `all`. The stop is a SIGTERM to the launcher's wrapper, which stops its command and cleans up.
     """
     me, host = getpass.getuser(), socket.gethostname().split(".")[0]
     snapshot(host)
+    util = gpu_util()
     for p in sorted((ROOT / "agents").glob("*.json")):
         a = read_json(p)
         if not a or a["user"] != me or a.get("host") != host:
@@ -295,6 +336,8 @@ def sweep(args):
             hb_path(a["id"]).unlink(missing_ok=True)
             event("down", agent=a["id"], reason="process exited (sweep)")
             continue
+        warn_idle(a, p, util)
+        a = read_json(p) or a
         # only requests addressed to this entry: a broadcast to `all` never stops anything
         reqs = [m for m in unread_msgs(a) if m["kind"] == "request" and m.get("to") == a["id"]]
         if not reqs:
@@ -385,7 +428,7 @@ def main():
     s.add_argument("to")
     s.add_argument("text", help="'-' reads it from stdin")
     s.add_argument("--from", dest="sender", help="your agent id (default: your netID)")
-    s.add_argument("--kind", default="msg", choices=["msg", "request", "reply"])
+    s.add_argument("--kind", default="msg", choices=["msg", "request", "reply", "warn"])
     s.add_argument("--reply-to")
     s.add_argument("--gpus", help="for a request: how many or which")
     s.add_argument("--minutes", type=int, help="for a request: for how long")

@@ -25,6 +25,8 @@ a new file or an atomic rename. The tool is one Python 3.9 file with no dependen
   that person's jobs that have a request addressed to them and no answer: no heartbeat for 60 seconds, or no
   acknowledgement within 5 minutes. It replies to the requester and logs the stop. Only a job's owner can signal its
   processes, which is why everyone runs their own sweep.
+- Idle warnings: when every GPU of an entry stays under 5% utilization for 30 minutes, the sweep leaves a `warn`
+  message in that entry's own inbox, so the agent that started the job is woken to release the GPUs or explain them.
 - Logs: `log.jsonl` records every registration, message, acknowledgement and stop; `usage.jsonl` records each
   GPU's utilization, memory and processes every 2 minutes. `bus.py log [--usage]` prints them.
 
