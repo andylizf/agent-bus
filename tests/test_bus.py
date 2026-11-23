@@ -223,7 +223,11 @@ class Board(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         late = json.loads((self.root / "bookings" / f"{r.stdout.split()[1].rstrip(':')}.json").read_text())
         self.assertEqual(late["end"] - late["start"], 3 * 3600)
-        self.assertEqual(len(self.bookings()), 5)
+        r = self.bus("book", "--gpus", "1", "--from", "tomorrow 03:00", "--to", "tomorrow 04:00")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        same = json.loads((self.root / "bookings" / f"{r.stdout.split()[1].rstrip(':')}.json").read_text())
+        self.assertEqual(same["end"] - same["start"], 3600)
+        self.assertEqual(len(self.bookings()), 6)
         # only the owner removes one
         self.edit_booking(first, user="carol")
         self.assertNotEqual(self.bus("unbook", first).returncode, 0)

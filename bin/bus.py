@@ -601,11 +601,12 @@ def book(args):
     try:
         gpus = parse_gpus(args.gpus)
         start, _ = parse_time(args.start)
-        end, bare = parse_time(args.end, base=start)  # a bare HH:MM is on the start's day
+        end, bare = parse_time(args.end)
+        if bare:  # a bare HH:MM is on the start's day, and '--from 22:00 --to 01:00' means 01:00 the next day
+            end = parse_time(args.end, base=start)[0]
+            end += 86400 if end <= start else 0
     except ValueError as e:
         sys.exit(str(e))
-    if bare and end <= start:  # '--from 22:00 --to 01:00' means 01:00 the next day
-        end += 86400
     if end <= start:
         sys.exit(f"the booking ends ({when(end)}) before it starts ({when(start)})")
     me = getpass.getuser()
