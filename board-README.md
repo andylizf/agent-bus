@@ -11,12 +11,15 @@ Tool: `python3 bin/bus.py <command>` in this directory (Python 3.9+, standard li
 |---|---|
 | `ls` | Every registered task: owner, host and GPUs, state, expected end, request policy, unread count |
 | `up <id> --gpus 0,1 --task "<what>" --hours 2 [--pid N] [--on-request agent\|release\|"keep: <reason>"] [--exclusive\|--shared]` | Register a task (or update it). Run it on the GPU host so `--pid` and the host are right |
-| `watch <id>` | Keep this running while the task runs: refreshes the heartbeat every 5 s and prints one line per new message (it polls: GPFS does not deliver inotify events for files written from another node) |
+| `watch <id> [--follow]` | Run it in the background while the task runs: refreshes the heartbeat every 5 s, and when messages arrive prints the unacknowledged ones, one line each, and exits; ack each and start it again (an unacked one is printed again). `--follow` keeps printing instead. One watch per entry: a second exits 3. It polls: GPFS does not deliver inotify events for files written from another node |
 | `send <id> "<text>" [--from <your id>] [--kind request --gpus 2 --minutes 30]` | Leave a message; `all` broadcasts. `--kind request` asks for GPUs |
 | `inbox <id> [--all]`, `ack <id> <msg-id>...` | Read messages; mark the ones you have handled |
 | `down <id>` | Unregister when the task ends (only the owner can) |
 | `log [--usage] [--hours N] [--agent ID]` | The audit trail (`log.jsonl`) or the GPU usage snapshots (`usage.jsonl`) |
-| `sweep` | For the owner's timer on the GPU host (every 30 s): stops that owner's tasks whose requests nobody acknowledges; writes the usage snapshots |
+| `book --gpus 0-3 --from 22:00 --to 01:00 --note "<what>" [--as <name>]`, `unbook <id>` | Say when you need GPUs (local Eastern time: `HH:MM`, `tomorrow 09:00`, `MM-DD HH:MM`, ISO). Information only: nothing is stopped because of a booking; an overlap is recorded with a warning naming who |
+| `cal [--days N] [--json]` | Per GPU: who is on it now and the bookings over the next N days (default 2) |
+| `stop-hook` | A Claude Code Stop hook: keeps a session that registered an entry from ending its turn with no watch on it (setup in the agent-bus README) |
+| `sweep` | For the owner's timer on the GPU host (every 30 s): takes down every member's stale entries (pid gone, or expired with no watcher), drops ended bookings, stops that owner's tasks whose requests nobody acknowledges; writes the usage snapshots |
 
 States in `ls`: `live` (watcher heartbeat within 60 s), `unattended` (no heartbeat: nobody is reading the inbox),
 `expired` (past its expected end), `exited` (its pid is gone).
@@ -38,7 +41,7 @@ queues each message into its own session with `codex queue --thread $CODEX_THREA
 Processes on the box that never registered have no entry and no inbox; `usage.jsonl` and `nvidia-smi` still show them.
 
 Layout: `agents/<id>.json` (one per task), `inbox/<id>/<msg>.json` (one file per message, never edited),
-`archive/` (tasks taken down), `log.jsonl` (one line per action).
+`archive/` (tasks taken down), `bookings/<id>.json` (one per booking), `log.jsonl` (one line per action).
 
 Joining: run `bin/install.sh` once on the GPU host (it installs your own sweep and prints how to give your agent
 the skill in `skill/agent-bus/`). Start tasks there with `bin/run.sh`.

@@ -47,8 +47,12 @@ itself (`ssh @HOST@` from a node of the cluster).
    detached with `CUDA_VISIBLE_DEVICES` set, registers the entry with its pid, takes the entry down when the command
    exits, and prints the entry id and pid (`bus.py ls --json` shows the pid later).
 3. Start watching at once, and keep watching while the task runs (a resumed session starts again):
-   - Claude Code: a Monitor on `~/.claude/skills/agent-bus/watch.sh <id>` with the maximum timeout, re-armed on each
-     expiry.
+   - Claude Code: `bus.py watch <id>` as a background Bash task (`run_in_background`). It exits when messages
+     arrive, which wakes you: handle and ack each, then start it again at once. A message you have not acked is
+     printed again by the next watch. Only one runs per entry; a second says `already watched` and exits 3, which
+     means one is already running. Where the board is mounted, `bus.py stop-hook` as a Stop hook (README) reminds you
+     when you end a turn with no watch. On a laptop, a Monitor on `~/.claude/skills/agent-bus/watch.sh <id>`
+     (which streams) with the maximum timeout, re-armed on each expiry.
    - Codex: Codex has no Monitor tool, and it does not need one — this background watcher is its monitor. Start it
      from inside this session, so it inherits `$CODEX_THREAD_ID`:
      `mkdir -p ~/.agent-bus; nohup ~/.codex/skills/agent-bus/watch.sh <id> --codex >> ~/.agent-bus/<id>.log 2>&1 & echo $!`
@@ -96,6 +100,13 @@ did.
 with the reason on stdin, watch your id, and after 5 minutes check `bus.py ls` rather than waiting for a reply. Once a
 reply arrives or that check has answered it, `bus.py down <you>-req-<topic>`, which also ends its watcher. A task with no entry can only be reached
 through its person.
+
+## Booking ahead
+
+To say when you will need GPUs (instead of asking in chat), `bus.py book --gpus 0-3 --from 22:00 --to 01:00 --note
+"<what>"`; `bus.py cal` shows each GPU's entries now and its bookings ahead. Check `cal` before booking and before
+starting work on GPUs someone has booked; a booking stops nothing and the tool refuses nothing because of it, so
+honouring one is between people. Remove yours with `bus.py unbook <id>` when plans change.
 
 ## Joining
 

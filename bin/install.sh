@@ -27,7 +27,11 @@ Description=agent-bus sweep every 30 s on $host
 ConditionHost=$fqdn
 
 [Timer]
-OnBootSec=60
+# OnActiveSec fires once each time the timer itself is started or restarted, so OnUnitActiveSec always has a run to
+# count from; with OnBootSec + OnUnitActiveSec alone, a timer started well after boot (a lingering user manager
+# often starts minutes late) can sit active with no next trigger. OnStartupSec counts from the user manager's start.
+OnStartupSec=60
+OnActiveSec=10
 OnUnitActiveSec=30
 AccuracySec=5
 
