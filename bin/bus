@@ -1,0 +1,9 @@
+#!/usr/bin/python3 -IB
+"""agent-bus v2 entry point. Runs isolated (-I: no user site, no environment-driven imports, not the script's
+directory on sys.path); the package is found next to this file only."""
+import os, sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+from agentbus.cli import main  # noqa: E402
+
+sys.exit(main())
