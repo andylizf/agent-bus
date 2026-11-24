@@ -524,7 +524,7 @@ h2 small { text-transform: none; letter-spacing: 0; font-weight: 400; color: var
 .scroll-hint { display: block; }
 .empty { color: var(--ink-2); background: var(--surface); border: 1px dashed var(--line-2); border-radius: 10px; padding: 14px 16px; margin: 0; }
 .table-scroll { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
-table { border-collapse: collapse; width: 100%; font-size: 13px; }
+table { border-collapse: collapse; width: 100%; min-width: 680px; font-size: 13px; }  /* narrow screens scroll the table, not squeeze it */
 th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 700; }
 td .dot { margin-right: 6px; }
@@ -564,6 +564,7 @@ tr:last-child td { border-bottom: 0; }
 .gchip span { display: inline-grid; place-items: center; width: 38px; height: 35px; border-radius: 6px; border: 1px solid var(--line-2);
   background: var(--surface-2); font: 700 14px/1 var(--mono); color: var(--ink-2); cursor: pointer; user-select: none; }
 .gchip span:hover { border-color: var(--accent); }
+@media (max-width: 420px) { .gchip span { width: 33px; } }  /* all 8 on one row at phone width */
 .gchip input:checked + span { background: var(--accent); border-color: var(--accent); color: var(--surface); }
 .gchip input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
 .f-actions { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; }
