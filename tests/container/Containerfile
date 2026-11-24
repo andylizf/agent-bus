@@ -1,0 +1,33 @@
+# Two-user Rocky Linux 9 test host with systemd as PID 1, logind, linger and
+# a delegated cgroup v2 subtree for each user manager. Built and run by up.sh.
+FROM docker.io/rockylinux/rockylinux:9
+
+RUN dnf -y install --setopt=install_weak_deps=False \
+        systemd systemd-pam dbus-broker dbus-tools \
+        python3 procps-ng util-linux git findutils which sudo \
+    && dnf clean all
+
+# Units that make no sense (or hang) inside a container.
+RUN systemctl mask \
+        systemd-remount-fs.service dev-hugepages.mount sys-fs-fuse-connections.mount \
+        getty.target console-getty.service \
+        systemd-udevd.service systemd-udev-trigger.service systemd-udevd-control.socket \
+        systemd-udevd-kernel.socket systemd-firstboot.service \
+        2>/dev/null || true
+
+# Users alice/bob in group lab; /shared is a group-writable parent with no sticky bit.
+RUN groupadd -g 2000 lab \
+    && useradd -m -u 2001 -g 2000 -s /bin/bash alice \
+    && useradd -m -u 2002 -g 2000 -s /bin/bash bob \
+    && install -d -o root -g lab -m 2770 /shared \
+    && chmod 0400 /etc/shadow
+# chmod 0400: with the stock mode 0000, unix_chkpwd gets EACCES on /etc/shadow in
+# this container, pam_unix's account step fails, and user@<uid>.service dies with
+# status 224/PAM.
+
+# Give every user manager all controllers (the stock unit delegates only some).
+RUN mkdir -p /etc/systemd/system/user@.service.d \
+    && printf '[Service]\nDelegate=yes\n' > /etc/systemd/system/user@.service.d/delegate.conf
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/usr/sbin/init"]
