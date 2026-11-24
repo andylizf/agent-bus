@@ -35,7 +35,11 @@ def need_linux(f):
     return f if LINUX else unittest.skip("needs Linux /proc")(f)
 
 
+SCALE = float(os.environ.get("AGENT_BUS_TEST_TIME_SCALE") or 1)   # a loaded host: every wait in the tests is longer
+
+
 def wait_for(pred, timeout=30.0, step=0.2, what="condition"):
+    timeout *= SCALE
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         v = pred()

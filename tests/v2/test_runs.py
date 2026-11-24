@@ -3,7 +3,7 @@ hot update (design 3.3-3.8, 4.1-4.3). Needs a systemd user manager with cgroup d
 tests/container, or the GPU host); every unit is named with a test prefix and removed after."""
 import json, os, secrets, shutil, signal, subprocess, sys, time, unittest
 
-from helpers import BUS, PY, REPO, BusTest, need_systemd, wait_for
+from helpers import BUS, PY, REPO, SCALE, BusTest, need_systemd, wait_for
 from agentbus import core, runner
 
 SLEEP = "sleep 300"
@@ -70,8 +70,8 @@ class Runs(BusTest):
     def test_backfill_run_entry_env_and_exit_status(self):
         out = self.tmp / "env.txt"
         p = self.bg("run", "--gpus", "2,3", "--hours", "1", "--note", "env check", "--",
-                    f"echo $CUDA_VISIBLE_DEVICES $AGENT_BUS_ID > {out}; sleep 2; exit 7")
-        self.assertEqual(p.wait(60), 7)
+                    f"echo $CUDA_VISIBLE_DEVICES $AGENT_BUS_ID > {out}; sleep {2 * SCALE}; exit 7")
+        self.assertEqual(p.wait(60 * SCALE), 7)
         cvd, rid = out.read_text().split()
         self.assertEqual(cvd, "2,3")
         st = self.state(rid)
@@ -105,7 +105,7 @@ class Runs(BusTest):
         self.assertEqual(self.props(d["main_unit"], "MemoryMax")["MemoryMax"], str(100 * 1024 * 1024))
 
     def test_setsid_children_stay_in_slice_and_leader_exit(self):
-        d = self.start("setsid bash -c 'sleep 4' & (setsid sleep 4 &) ; exit 3")
+        d = self.start(f"setsid bash -c 'sleep {4 * SCALE}' & (setsid sleep {4 * SCALE} &) ; exit 3")
         st = self.wait_state(d["id"], "leader-exited", 20)
         self.assertEqual(st["exit_status"], 3)
         e = json.loads(self.entry_file(d["id"]).read_text())
@@ -227,7 +227,7 @@ class Runs(BusTest):
         t = time.monotonic()
         m = self.request(d["id"])
         self.wait_state(d["id"], ("stopping", "ended"), 5)
-        self.assertLess(time.monotonic() - t, 5)
+        self.assertLess(time.monotonic() - t, 5 * SCALE)
         st = self.wait_state(d["id"], "ended", 40)
         self.assertTrue(st["end_reason"].startswith("request "))
         rep = wait_for(lambda: [x for x in self.replies(m["reply_to"]) if x.get("request_id") == m["request_id"]], 10,
@@ -237,8 +237,7 @@ class Runs(BusTest):
     def test_wrong_to_run_triggers_nothing(self):
         d = self.start(SLEEP)
         self.request(d["id"], to_run="f" * 32)
-        time.sleep(2)
-        st = self.state(d["id"])
+        st = wait_for(lambda: (lambda x: x if x["requests"] else None)(self.state(d["id"])), 10, what="request seen")
         self.assertEqual(st["state"], "running")
         self.assertIn("stale", list(st["requests"].values())[0]["state"])
 
@@ -490,7 +489,8 @@ class Runs(BusTest):
         time.sleep(0.5)
         a = self.bg("supervise", d["id"], "--adopt")
         b = self.bg("supervise", d["id"], "--adopt")
-        time.sleep(3)
+        wait_for(lambda: a.poll() is not None or b.poll() is not None, 10, what="one adopter to exit")
+        time.sleep(1)
         codes = sorted([p.poll() for p in (a, b)], key=lambda x: (x is not None, x))
         self.assertEqual(codes[0], None)
         self.assertEqual(codes[1], 3)
