@@ -262,10 +262,12 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
         r.setdefault("objections", [])
         if r.get("state") == "standing":
             lapse_at = max(r["start"], r["objection_close"]) + lim["lapse_s"]
-            if r["id"] in sticky_lapsed:
+            revs = [r["revision"]] + (r.get("lineage") or [])
+            if any(f"{r['id']}@{v}" in sticky_lapsed for v in revs):     # remembered for this revision only
                 r.update(state="lapsed", why="no run of its owner on it within the no-show limit")
             elif t >= lapse_at and entries is not None and not any(
                     e.get("booking") == r["id"] and e["user"] == r["user"] and e["state"] in ("running", "waiting-handoff")
+                    and e.get("booking_revision") in revs
                     and e.get("occupancy") == "live" and e["started"] <= lapse_at for e in entries) and not any(
                     x["user"] == r["user"] and x["revision"] in [r["revision"]] + (r.get("lineage") or [])
                     and max(r["start"], r["objection_close"]) - lim["lapse_s"] <= x["arrived"] <= lapse_at

@@ -35,8 +35,9 @@ def states(fb, t, **kw):
     return {r["id"]: r for r in bk.evaluate(fb, t, seen=kw.pop("seen", {}), record=False, **kw)}
 
 
-def entry(bid, user, started, state="running", occupancy="live"):
-    return dict(id=f"{user}-x", user=user, booking=bid, state=state, occupancy=occupancy, started=started)
+def entry(bid, user, started, state="running", occupancy="live", revision=None):
+    return dict(id=f"{user}-x", user=user, booking=bid, state=state, occupancy=occupancy, started=started,
+                booking_revision=revision)
 
 
 class States(unittest.TestCase):
@@ -160,12 +161,13 @@ class States(unittest.TestCase):
 
     def test_not_lapsed_with_run_started_in_time(self):
         b = booking("alice-1-a", "alice", [0], T0 + H, T0 + 5 * H)
-        r = self.one(b, T0 + H + 31 * 60, entries=[entry("alice-1-a", "alice", T0 + H + 60)])
+        r = self.one(b, T0 + H + 31 * 60, entries=[entry("alice-1-a", "alice", T0 + H + 60, revision=b["_sha"])])
         self.assertEqual(r["state"], "standing")
 
     def test_waiting_handoff_counts_for_no_show(self):
         b = booking("alice-1-a", "alice", [0], T0 + H, T0 + 5 * H)
-        r = self.one(b, T0 + H + 40 * 60, entries=[entry("alice-1-a", "alice", T0 + H + 60, "waiting-handoff")])
+        r = self.one(b, T0 + H + 40 * 60, entries=[entry("alice-1-a", "alice", T0 + H + 60, "waiting-handoff",
+                                                          revision=b["_sha"])])
         self.assertEqual(r["state"], "standing")
 
     def test_stale_heartbeat_run_does_not_count(self):
@@ -175,8 +177,8 @@ class States(unittest.TestCase):
 
     def test_sticky_lapsed(self):
         b = booking("alice-1-a", "alice", [0], T0 + H, T0 + 5 * H)
-        r = self.one(b, T0 + H + 40 * 60, entries=[entry("alice-1-a", "alice", T0 + H + 35 * 60)],
-                     sticky_lapsed={"alice-1-a"})
+        r = self.one(b, T0 + H + 40 * 60, entries=[entry("alice-1-a", "alice", T0 + H + 35 * 60, revision=b["_sha"])],
+                     sticky_lapsed={f"alice-1-a@{b['_sha']}"})
         self.assertEqual(r["state"], "lapsed")
 
     def chain(self, new_gpus, new_start, new_end):
