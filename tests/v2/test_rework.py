@@ -283,7 +283,7 @@ class InheritanceAndArrival(unittest.TestCase):
 
 @need_systemd
 class ArrivalOnTheBoard(BusTest):
-    board_settings = dict(min_objection_s=1, default_objection_s=2, lapse_s=3)
+    board_settings = dict(min_objection_s=1, default_objection_s=2, lapse_s=20)   # room to see it stand on a busy host
 
     def test_scheduled_run_records_its_arrival_and_the_booking_stays_standing_after_it_ends(self):
         t = int(time.time())
@@ -296,7 +296,7 @@ class ArrivalOnTheBoard(BusTest):
                        what="the arrival record")
         self.assertEqual(os.stat(arr).st_mode & 0o777, 0o644)
         self.bus_json("release", d["id"], "--wait", str(40 * SCALE), "--json")
-        time.sleep(4)   # past the no-show limit with no run on the booking
+        wait_for(lambda: time.time() > t + 22, 60, what="past the no-show limit with no run on the booking")
         b = next(b for b in self.bus_json("cal", "--json")["bookings"] if b["id"] == bid)
         self.assertEqual(b["state"], "standing")
 

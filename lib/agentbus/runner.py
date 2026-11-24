@@ -705,6 +705,10 @@ class Supervisor:
         dest = f"{self.rid}-{now()}.json"
         try:
             os.rename(f"{self.rid}.json", dest, src_dir_fd=afd, dst_dir_fd=gfd)
+        except OSError as e:          # left on the board and said so; `bus gc --mine` archives it later
+            self.s["archive_error"] = f"{core.errno_name(e)}: {e}"
+            return
+        try:
             e = dict(self.entry(), state="ended", end_reason=self.s.get("end_reason"), ended=now())
             core.replace(gfd, dest, core.dumps(e))
         except OSError:
