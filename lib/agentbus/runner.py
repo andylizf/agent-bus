@@ -64,6 +64,16 @@ def ctl_dir(rid):
     return core.private_dir("ctl", rid)
 
 
+def reserve_state(rid):
+    """Create the run's private state file exclusively; False when that id is taken."""
+    try:
+        fd = os.open(state_path(rid), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    os.close(fd)
+    return True
+
+
 def load_state(rid):
     s = core.read_private(state_path(rid))
     if s is None:
@@ -251,17 +261,22 @@ def slice_state(cg_rel):
     return "populated"
 
 
-def cgroup_pids(cg_rel):
-    """Every pid in the cgroup and below (for the report; the stop goes through systemd)."""
-    out = []
+def cgroup_pids(cg_rel, strict=False):
+    """Every pid in the cgroup and below. With strict, None when any part of the subtree cannot be read (a caller
+    deciding exclusivity must not mistake an unreadable part for an empty one)."""
+    out, bad = [], []
     base = CG_ROOT + cg_rel
-    for d, _, files in os.walk(base):
-        if "cgroup.procs" in files:
-            try:
-                with open(os.path.join(d, "cgroup.procs")) as f:
-                    out += [int(x) for x in f.read().split()]
-            except OSError:
-                pass
+    for d, _, files in os.walk(base, onerror=bad.append):
+        if "cgroup.procs" not in files:
+            bad.append(d)
+            continue
+        try:
+            with open(os.path.join(d, "cgroup.procs")) as f:
+                out += [int(x) for x in f.read().split()]
+        except (OSError, ValueError) as e:
+            bad.append(e)
+    if strict and bad:
+        return None
     return out
 
 
@@ -506,7 +521,8 @@ def unit_exists(unit):
 
 
 def cmd_exec(rid, run, argv, cwd=None):
-    """bus exec: admitted, launching, then registered once the scope is in the slice (or cancelled)."""
+    """bus exec: admitted, launching (the launcher's identity recorded), then registered by the guard that runs inside
+    the new scope just before the command (bus _exec-guard), or cancelled."""
     s = load_state(rid)
     if s.get("mode") != "systemd":
         raise Refused(f"{rid} runs in fallback mode (no user manager): no exec into it")
@@ -518,10 +534,11 @@ def cmd_exec(rid, run, argv, cwd=None):
         if a.get("run") != run:
             raise Refused(f"{rid} is now run {a.get('run')}, not {run}: refusing a stale exec")
         ident = core.proc_identity(os.getpid())
-        a["inflight"].append(dict(exec_id=eid, client=ident, state="admitted", t=now()))
+        a["inflight"].append(dict(exec_id=eid, client=ident, launcher=None, state="admitted", t=now()))
         admit_write(rid, a)
     if os.environ.get("AGENT_BUS_TEST_EXEC_PAUSE") == "admitted":
         os.kill(os.getpid(), signal.SIGSTOP)
+    unit = scope_unit(rid, eid)
     with admit_lock(rid):
         a = admit_read(rid)
         it = next((x for x in a["inflight"] if x["exec_id"] == eid), None)
@@ -529,38 +546,44 @@ def cmd_exec(rid, run, argv, cwd=None):
             raise Refused(f"exec {eid} was cancelled before it started")
         it["state"] = "launching"
         admit_write(rid, a)
+        # the launcher starts while the lock is held, and its identity is in the ledger before anyone reads it
+        cmd = ["systemd-run", "--user", "--quiet", "--scope", f"--slice={s['units']['slice']}", f"--unit={unit}",
+               "--", sys.executable, "-IB", own_bus(), "_exec-guard", rid, eid, run, "--", *argv]
+        if os.environ.get("AGENT_BUS_TEST_EXEC_PAUSE") == "launcher":   # tests: a launcher that has not yet run
+            cmd = ["sh", "-c", 'kill -STOP $$; exec "$@"', "sh", *cmd]
+        p = subprocess.Popen(cmd, cwd=cwd or None)
+        it["launcher"] = core.proc_identity(p.pid) or dict(pid=p.pid, boot_id=core.boot_id(), ticks=None)
+        admit_write(rid, a)
     if os.environ.get("AGENT_BUS_TEST_EXEC_PAUSE") == "launching":
         os.kill(os.getpid(), signal.SIGSTOP)
-    unit = scope_unit(rid, eid)
-    p = subprocess.Popen(["systemd-run", "--user", "--quiet", "--scope", f"--slice={s['units']['slice']}",
-                          f"--unit={unit}", "--", *argv],
-                         cwd=cwd or None)
-    registered = False
-    while True:
-        if not registered and unit_exists(unit):
-            registered = True
-            with admit_lock(rid, timeout=30):
-                a = admit_read(rid)
-                for x in a["inflight"]:
-                    if x["exec_id"] == eid:
-                        x["state"] = "registered"
-                admit_write(rid, a)
-        if p.poll() is not None:
-            break
-        time.sleep(0.1)
-    if not registered:
-        with admit_lock(rid, timeout=30):
-            a = admit_read(rid)
-            for x in a["inflight"]:
-                if x["exec_id"] == eid and x["state"] != "registered":
-                    x["state"] = "cancelled"
-            admit_write(rid, a)
+    p.wait()
+    with admit_lock(rid, timeout=30):
+        a = admit_read(rid)
+        for x in a["inflight"]:
+            if x["exec_id"] == eid and x["state"] == "launching":
+                x["state"] = "cancelled"       # the launcher ended and the guard never registered it
+        admit_write(rid, a)
     return p.returncode
 
 
+def exec_guard(rid, eid, run, argv):
+    """`bus _exec-guard`: the first process inside a new exec scope. Under the admit lock it registers the intent only
+    while it is still launching and the run's generation is current; otherwise the command never starts. A scope that
+    appears after its intent was cancelled therefore runs nothing."""
+    with admit_lock(rid, timeout=30):
+        a = admit_read(rid)
+        it = next((x for x in a.get("inflight", []) if x["exec_id"] == eid), None)
+        if not it or it["state"] != "launching" or a.get("run") != run:
+            print(f"bus: exec {eid} into {rid} was cancelled or is stale; nothing started", file=sys.stderr)
+            return 126
+        it["state"] = "registered"
+        admit_write(rid, a)
+    os.execvp(argv[0], argv)
+
+
 def resolve_intents(rid):
-    """Under the admit lock: cancel intents whose client is gone and whose scope does not exist. Returns the exec ids
-    still outstanding (admitted or launching with a live client, or launching whose scope is being created)."""
+    """Under the admit lock: an intent is cancelled only when its client and its launcher are both gone and no scope of
+    it exists; a scope that exists means registered. Returns the exec ids still outstanding."""
     with admit_lock(rid, timeout=10):
         a = admit_read(rid)
         a["admission"] = "closed"
@@ -568,10 +591,15 @@ def resolve_intents(rid):
         for x in a.get("inflight", []):
             if x["state"] in ("registered", "cancelled"):
                 continue
-            gone = not core.identity_alive(x.get("client"))
-            if x["state"] == "launching" and unit_exists(scope_unit(rid, x["exec_id"])):
-                x["state"] = "registered"
-            elif gone:
+            client_gone = not core.identity_alive(x.get("client"))
+            launcher = x.get("launcher")
+            launcher_gone = launcher is None or (launcher.get("ticks") is not None and not core.identity_alive(launcher))
+            scope = unit_query(scope_unit(rid, x["exec_id"]), "LoadState", "ActiveState")
+            if not scope[0]:
+                out.append(x["exec_id"])          # systemd did not answer: nothing is decided
+            elif scope[1].get("LoadState") == "loaded" and scope[1].get("ActiveState") not in ("inactive", "failed"):
+                x["state"] = "registered"          # its scope is in the slice: the stop includes it
+            elif client_gone and launcher_gone:
                 x["state"] = "cancelled"
             else:
                 out.append(x["exec_id"])
@@ -773,10 +801,22 @@ class Supervisor:
             for pid, rec in esc.items():
                 pidfd_signal(rec, getattr(signal, f"SIG{sig}"))
         else:
+            # the group is signalled only while its leader is the process recorded at launch, checked through a pidfd
+            # (a group id is the leader's pid: with the leader verified, the group cannot be someone else's)
+            leader = s.get("leader")
+            if not leader or not core.identity_alive(leader):
+                return
             try:
-                os.killpg(self.child[1], getattr(signal, f"SIG{sig}"))
-            except (OSError, TypeError):
+                fd = os.pidfd_open(leader["pid"])
+            except (OSError, AttributeError):
+                return
+            try:
+                if core.identity_alive(leader):
+                    os.killpg(leader["pid"], getattr(signal, f"SIG{sig}"))
+            except OSError:
                 pass
+            finally:
+                os.close(fd)
 
     @staticmethod
     def unit_exclusive(cg, unit, esc):
@@ -788,8 +828,8 @@ class Supervisor:
         if unit not in parts:
             return False
         top = "/".join(parts[:parts.index(unit) + 1])
-        pids = cgroup_pids(top)
-        return bool(pids) and all(p in esc for p in pids)
+        pids = cgroup_pids(top, strict=True)
+        return bool(pids) and all(p in esc for p in pids)       # None (unreadable somewhere) is never exclusive
 
     def group_state(self):
         """Fallback: 'gone' when the job's process group is empty and the leader has been reaped."""
@@ -845,7 +885,7 @@ class Supervisor:
             if not gone:
                 remains.append("process group still has processes")
         gpus = s["gpus"]            # every one of the run's original GPUs, a partially released one included
-        confirmed = set(s.get("reconciled", []))
+        confirmed = {r["pid"] for r in s.get("reconciled", []) if isinstance(r, dict) and core.identity_alive(r)}
         clear, mine, other, err = gpu_release_check(self.rid, gpus, confirmed)
         held = dict(getattr(gpu_release_check, "held", {}) or {}) if mine else {}
         unres = s.setdefault("unresolved", {})
@@ -870,6 +910,9 @@ class Supervisor:
             remains.append(f"unattributed processes of {core.USER} on GPUs {core.gpu_text(s['gpus'])}: "
                            f"{','.join(map(str, mine))} (bus reconcile {self.rid})")
         s["_other_on_gpus"] = other
+        if err:                       # a failed scan proves nothing about any GPU: no GPU counts as released
+            s["gpus_released"] = []
+            s.pop("gpus_released_checked", None)
         # everything of the job is gone and only processes nobody's records explain remain: the owner decides
         s["_reconcile"] = dict(pids=mine, held=sorted(held) or sorted(s.get("held_gpus") or gpus),
                                released=sorted(set(gpus) - set(held or s.get("held_gpus") or gpus))) \
@@ -897,6 +940,8 @@ class Supervisor:
                     self.reply(board, req, "yes", f"GPUs {core.gpu_text(newly)} free of this job; GPUs "
                                                   f"{core.gpu_text(rc['held'])} held: a process of ours there is "
                                                   f"not attributed to any run")
+        s["gpus_released"] = rc["released"]
+        s["gpus_released_checked"] = now()          # gpupool frees only GPUs a fresh, good scan released
         s["needs_reconcile"] = rc["pids"]
 
     def release_step(self, board):
@@ -1055,7 +1100,9 @@ class Supervisor:
                     os.unlink(os.path.join(ctl_dir(self.rid), name))
                 elif name.startswith("reconcile-"):
                     d = core.read_private(os.path.join(ctl_dir(self.rid), name)) or {}
-                    s["reconciled"] = sorted(set(s.get("reconciled", [])) | set(d.get("pids") or []))
+                    have = {(r["pid"], r.get("ticks")) for r in s.get("reconciled", []) if isinstance(r, dict)}
+                    s["reconciled"] = [r for r in s.get("reconciled", []) if isinstance(r, dict)] + [
+                        r for r in d.get("identities") or [] if (r.get("pid"), r.get("ticks")) not in have]
                     os.unlink(os.path.join(ctl_dir(self.rid), name))
             rows, entries = [], []
             if with_board:
@@ -1412,13 +1459,25 @@ def cmd_run(a):
             raise Refused("an exclusive scheduled launch needs a user manager (bus doctor)")
         rid = core.new_id(a.slug or a.note or "run", t)
         inbox = board.wdir("inbox")
-        for n in range(2, 50):
-            if core.read_file(board.wdir("agents"), f"{rid}.json") is None and not os.path.exists(state_path(rid)):
-                fd = core.mkdir_own(inbox, rid, 0o3775)
+        for n in range(50):
+            # the id is ours only once its private state file is created with O_EXCL: two launches in the same
+            # second with the same slug never share an id, and nothing overwrites another run's record
+            if core.read_file(board.wdir("agents"), f"{rid}.json") is None and reserve_state(rid):
+                try:
+                    os.mkdir(rid, 0o700, dir_fd=inbox)   # created now, so its mode is set now, on its own descriptor
+                    fd = core.sub(inbox, rid)
+                    if fd is not None and os.fstat(fd).st_uid == core.UID:
+                        os.fchmod(fd, 0o3775)
+                    elif fd is not None:
+                        os.close(fd)
+                        fd = None
+                except FileExistsError:
+                    fd = None                      # an inbox of that name exists already: not ours to reuse
                 if fd is not None:
                     os.close(fd)
                     break
-            rid = core.new_id(f"{a.slug or a.note or 'run'}-{n}", t)
+                os.unlink(state_path(rid))
+            rid = f"{core.new_id(a.slug or a.note or 'run', t)}-{secrets.token_hex(3)}"
         else:
             raise Refused("could not find a free entry id")
         until = b["end"] if cls == "scheduled" else t + int(float(a.hours or 24) * 3600)
@@ -1455,20 +1514,26 @@ def cmd_run(a):
         return run_fallback(rid, a)
     if not handoff:
         rc, out = start_main_unit(rid, s)
+        if os.environ.get("AGENT_BUS_TEST_MAIN_TIMEOUT"):
+            rc, out = 255, "TimeoutExpired (test)"        # tests: systemd accepted it, the client did not hear back
         if rc:
-            s.update(state="ended", end_reason=f"the job's unit did not start: {out.strip()[:200]}")
-            core.write_private(state_path(rid), s)
-            raise Refused(f"systemd-run for the job failed: {out.strip()[:300]}")
-        s["units"]["cgroup_path"] = cgroup_of(s["units"]["slice"], tries=5)
-        s["main_started"] = now()
+            known = main_unit_state(s["units"]["main"])
+            if known == "absent":            # positive evidence that nothing started: the only case that ends it
+                s.update(state="ended", end_reason=f"the job's unit did not start: {out.strip()[:200]}")
+                core.write_private(state_path(rid), s)
+                raise Refused(f"systemd-run for the job failed: {out.strip()[:300]}")
+            print(f"bus: systemd-run for the job reported {out.strip()[:120]!r}; systemd says the unit is {known}: "
+                  f"the supervisor decides from systemd's own state", file=sys.stderr)
+        if not rc or known == "exists":
+            s["units"]["cgroup_path"] = cgroup_of(s["units"]["slice"], tries=5)
+            s["main_started"] = now()
         core.write_private(state_path(rid), s)
     rc, out = systemd_run([f"--unit={s['units']['sup']}", "-p", "Type=exec", *passthrough_env(), "--",
                            sys.executable, "-IB", own_bus(), "supervise", rid])
-    if rc:
-        sysctl("stop", s["units"]["slice"])
-        s.update(state="ended", end_reason=f"the supervisor did not start: {out.strip()[:200]}")
-        core.write_private(state_path(rid), s)
-        raise Refused(f"systemd-run for the supervisor failed: {out.strip()[:300]}")
+    if rc and main_unit_state(s["units"]["sup"]) != "exists":
+        # the job may be running: nothing is stopped or ended here; the adopt timer supervises it
+        print(f"bus: the supervisor did not start ({out.strip()[:160]}); the adopt timer (bus adopt --all) "
+              f"supervises {rid}", file=sys.stderr)
     info = dict(id=rid, run=gen, state_file=state_path(rid), log=log, mode="systemd", slice=s["units"]["slice"],
                 main_unit=s["units"]["main"], **{"class": cls}, booking=s["booking"])
     if a.info_file:
@@ -1554,17 +1619,23 @@ def cmd_release(rid, reason=None, wait=None):
 
 def cmd_reconcile(rid, confirm):
     """The owner's word on processes of theirs a release cannot attribute: list them, or confirm pids that are not this
-    run's (the supervisor then leaves them out). Stopping them instead also completes the release."""
+    run's. A confirmation is kept as the process's identity (pid, start time, boot id), so a later process that reuses
+    the pid inherits nothing; a held process that has left every GPU is confirmed by its recorded identity."""
     s = load_state(rid)
-    clear, mine, other, err = gpu_release_check(rid, s["gpus"], set(s.get("reconciled", [])))
+    confirmed = {r["pid"] for r in s.get("reconciled", []) if isinstance(r, dict) and core.identity_alive(r)}
+    clear, mine, other, err = gpu_release_check(rid, s["gpus"], confirmed)
+    recorded = {int(k): v for k, v in (s.get("unresolved") or {}).items() if core.identity_alive(v)}
+    waiting = sorted(set(mine) | set(recorded))
     if confirm:
-        bad = [p for p in confirm if int(p) not in mine]
+        bad = [p for p in confirm if int(p) not in waiting]
         if bad:
             raise Refused(f"{', '.join(map(str, bad))}: not among the processes waiting on this run's reconciliation")
-        core.write_private(os.path.join(ctl_dir(rid), f"reconcile-{time.time():.3f}.json"),
-                           dict(pids=[int(x) for x in confirm]))
-    return dict(id=rid, state=s.get("state"), candidates=mine, other=other,
-                confirmed=sorted(set(s.get("reconciled", [])) | set(int(x) for x in confirm or [])), error=err)
+        idents = [recorded.get(int(p)) or core.proc_identity(int(p)) for p in confirm]
+        if any(i is None for i in idents):
+            raise Refused("a process to confirm is gone already: nothing to confirm")
+        core.write_private(os.path.join(ctl_dir(rid), f"reconcile-{time.time():.3f}.json"), dict(identities=idents))
+    return dict(id=rid, state=s.get("state"), candidates=waiting, other=other,
+                confirmed=sorted(confirmed | {int(x) for x in confirm or []}), error=err)
 
 
 def cmd_adopt_all():

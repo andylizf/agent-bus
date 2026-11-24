@@ -531,6 +531,11 @@ def parser():
     s.add_argument("--adopt", action="store_true")
     s = p("adopt", lambda a: out(runner.cmd_adopt_all()), "start a supervisor for every unsupervised run here")
     s.add_argument("--all", action="store_true", required=True)
+    s = p("_exec-guard", lambda a: runner.exec_guard(a.id, a.eid, a.run, a.argv))
+    s.add_argument("id")
+    s.add_argument("eid")
+    s.add_argument("run")
+    s.add_argument("argv", nargs="*")
     s = p("_job", lambda a: runner.job_main(a.id))
     s.add_argument("id")
     s = p("gc", cmd_gc, "your orphaned runs and stale entries")
@@ -640,7 +645,7 @@ def main(argv=None):
     os.umask(0o022)
     argv = list(sys.argv[1:] if argv is None else argv)
     tail = None
-    if argv[:1] in (["run"], ["exec"]) and "--" in argv:      # bus run [options] -- '<command>'
+    if argv[:1] in (["run"], ["exec"], ["_exec-guard"]) and "--" in argv:      # bus run [options] -- '<command>'
         i = argv.index("--")
         argv, tail = argv[:i], argv[i + 1:]
     a = parser().parse_args(argv)
@@ -649,7 +654,7 @@ def main(argv=None):
             print("bus: give the command after --", file=sys.stderr)
             return 2
         a.command = (tail[0] if len(tail) == 1 else shlex.join(tail)) if tail is not None else a.command
-    if a.cmd == "exec":
+    if a.cmd in ("exec", "_exec-guard"):
         a.argv = tail if tail is not None else a.argv
         if not a.argv:
             print("bus: give the command after --", file=sys.stderr)

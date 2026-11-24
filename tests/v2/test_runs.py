@@ -403,16 +403,14 @@ class Runs(BusTest):
         self.wait_state(d["id"], "ended", 40)
         self.assertEqual([x["state"] for x in self.intents(d["id"])], ["cancelled"])
 
-    def test_exec_killed_while_launching_is_cancelled(self):
+    def test_exec_client_killed_after_its_launcher_started_is_registered_and_stopped(self):
         d = self.start(SLEEP)
         p = self.exec_bg(d["id"], d["run"], "sleep", "300", pause="launching")
-        wait_for(lambda: [x for x in self.intents(d["id"]) if x["state"] == "launching"], 15, what="launching")
-        self.bus("release", d["id"], check=True)
-        time.sleep(2)
-        self.assertEqual(self.state(d["id"])["state"], "stopping")
+        wait_for(lambda: [x for x in self.intents(d["id"]) if x["state"] == "registered"], 15, what="registered")
         os.killpg(p.pid, signal.SIGKILL)
-        self.wait_state(d["id"], "ended", 40)
-        self.assertEqual([x["state"] for x in self.intents(d["id"])], ["cancelled"])
+        self.bus_json("release", d["id"], "--wait", str(40 * SCALE), "--json")
+        self.assertEqual([x["state"] for x in self.intents(d["id"])], ["registered"])
+        self.assertEqual(runner.slice_state(self.state(d["id"])["units"]["cgroup_path"]), "gone")
 
     def test_paused_exec_holds_leader_exit(self):
         d = self.start("sleep 3")
