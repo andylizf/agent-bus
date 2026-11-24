@@ -74,6 +74,38 @@ gpu7  aaaaaa...........................................
   B book gpus 2-3,5   bob      Tue 11-24 09:00 - Tue 11-24 13:00  eval  [bob-20261124-0900-3c4d]
 ```
 
+## Web view
+
+`tools/board_server.py` serves the board as a web page on the GPU host: who is on each GPU now, a GPU x time calendar
+of board entries and bookings, and a form to book GPUs. Dragging across empty calendar rows fills in the form with
+those GPUs and that time span. The page refreshes itself every minute. The server listens on 127.0.0.1 only, so you
+reach it through ssh:
+
+```
+ssh -N -L 8300:localhost:8300 <gpu-host>
+```
+
+then open http://localhost:8300. If port 8300 is taken on your machine, pick another local one (`-L
+8301:localhost:8300`, then http://localhost:8301). In VS Code connected to the GPU host over Remote-SSH, add port
+8300 in the Ports panel instead.
+
+A booking made on the page is the same record `bus.py book` writes, owned by the unix user that runs the server and
+shown under the name you type. It is information only, like every booking: nothing is stopped or refused because of
+it, and a booking that overlaps another is recorded with a warning, shown under the form, naming who holds the other
+one.
+
+Names are an honor system: the page does not check who you are. A booking made on the page is removed on the page, by
+typing the name on it. A booking made in a terminal has no Remove button on the page; its owner removes it in a
+terminal (`bus.py unbook <id>`). Each booking and removal made on the page is appended to `<board>/bookings-web.log`
+with the time, the name, the booking id and the remote address.
+
+One member runs the server on the GPU host, as a systemd user service with `ConditionHost=` set to that host (home
+directories shared across nodes would otherwise start it on every node):
+
+```
+ExecStart=/usr/bin/python3 <board>/tools/board_server.py --board <board> --port 8300
+```
+
 ## Claude Code: a Stop hook that keeps the watch running
 
 A Claude Code session that registered an entry should not end its turn without a watch on it, or a request to it goes
@@ -142,7 +174,9 @@ is granted; with `keep: <reason>` the job keeps running and the reply says when 
 `python3 tests/test_bus.py` checks, in a throwaway board on Linux or macOS: the sweep's stale-entry removal, one watch
 per entry, a watch exiting on a message and printing it again until it is acked, `--follow`, the stop hook's block and
 allow, and booking (overlap, unbook, `cal`, `ls`, ended bookings dropped). `tests/test_bus.sh <scratch-dir>` runs
-register, watch, request and sweep end to end on Linux.
+register, watch, request and sweep end to end on Linux. `python3 tests/test_board_page.py` checks the page's render on a
+made-up board, and `python3 tests/test_board_server.py` checks the web server: input validation, booking and removal
+through the real `bus.py`, the write log, and the refused methods and content types.
 
 ## License
 
