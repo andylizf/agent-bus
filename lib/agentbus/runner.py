@@ -261,9 +261,8 @@ def slice_state(cg_rel):
     return "populated"
 
 
-def cgroup_pids(cg_rel, strict=False):
-    """Every pid in the cgroup and below. With strict, None when any part of the subtree cannot be read (a caller
-    deciding exclusivity must not mistake an unreadable part for an empty one)."""
+def cgroup_pids(cg_rel):
+    """Every pid in the cgroup and below (for reports)."""
     out, bad = [], []
     base = CG_ROOT + cg_rel
     for d, _, files in os.walk(base, onerror=bad.append):
@@ -275,8 +274,6 @@ def cgroup_pids(cg_rel, strict=False):
                 out += [int(x) for x in f.read().split()]
         except (OSError, ValueError) as e:
             bad.append(e)
-    if strict and bad:
-        return None
     return out
 
 
@@ -313,27 +310,6 @@ def test_unreadable(pid):
     return str(pid) in (os.environ.get("AGENT_BUS_TEST_UNREADABLE_CGROUP") or "").split(",")
 
 
-def gpu_check(gpus, in_job):
-    """(clear, [job pids still on the GPUs], [other processes on them as 'pid:user'], error). `in_job(pid)` says
-    whether a process is the job's (True), not the job's (False)."""
-    ok, idx, apps, _ = nvidia_view()
-    if not ok:
-        return False, [], [], "nvidia-smi failed"
-    uuids = {idx[g] for g in gpus if g in idx}
-    if len(uuids) != len(set(gpus)):
-        return False, [], [], "nvidia-smi does not list every GPU of the entry"
-    mine, other = [], []
-    for uuid, pid in apps:
-        if uuid not in uuids:
-            continue
-        if in_job(pid):
-            mine.append(pid)
-        else:
-            uid = core.proc_uid(pid)
-            other.append(f"{pid}:{core.owner_name(uid) if uid is not None else '?'}")
-    return not mine, sorted(set(mine)), sorted(set(other)), None
-
-
 def other_runs_attribution(rid):
     """pid -> the id of another live run of this user that its own records show the pid belongs to (in its slice, a
     recorded escape of it, or its fallback process group), else None."""
@@ -364,6 +340,12 @@ def other_runs_attribution(rid):
 
 
 def gpu_release_check(rid, gpus, confirmed=()):
+    """confirmed: identities ({pid, boot_id, ticks}) the owner confirmed are not this run's; each is checked against the
+    process on the GPU when it is classified, after the query, so a pid reused meanwhile is not cleared."""
+    return _gpu_release_check(rid, gpus, [c for c in confirmed if isinstance(c, dict)])
+
+
+def _gpu_release_check(rid, gpus, confirmed):
     """The GPU half of a release, conservative: (clear, unattributed pids of this user, other processes as 'pid:who',
     error). Clear only when nvidia-smi answers for every GPU and no process of this user is on them except those another
     live run of this user positively owns by its records, or that the owner confirmed are not this run's."""
@@ -380,12 +362,16 @@ def gpu_release_check(rid, gpus, confirmed=()):
     for uuid, pid in apps:
         if uuid not in uuids:
             continue
-        uid = core.UID if test_unreadable(pid) else core.proc_uid(pid)
-        if uid is None:
-            continue                       # gone between the query and the look
+        uid, why = (core.UID, None) if test_unreadable(pid) else core.proc_owner(pid)
+        if why == "gone":
+            continue                       # positively gone between the query and the look
+        if why == "error":                 # cannot tell whose it is: held like an unattributed one of ours
+            mine.append(pid)
+            gpu_check_result.setdefault(by_uuid[uuid], set()).add(pid)
+            continue
         if uid != core.UID:
             other.append(f"{pid}:{core.owner_name(uid)}")
-        elif pid in confirmed:
+        elif any(c["pid"] == pid and core.identity_state(c) == "alive" for c in confirmed):
             other.append(f"{pid}:{core.USER} (confirmed not this run)")
         elif attr(pid):
             other.append(f"{pid}:{core.USER} ({attr(pid)})")
@@ -474,14 +460,14 @@ def descendants_outside(cg_rel, known=(), procs=None):
 
 def pidfd_signal(rec, sig):
     """Signal a recorded process through a pidfd, only while it is the recorded one. True when signalled."""
-    if not core.identity_alive(rec):
+    if core.identity_state(rec) != "alive":
         return False
     try:
         fd = os.pidfd_open(rec["pid"])
     except (OSError, AttributeError):
         return False
     try:
-        if not core.identity_alive(rec):      # the pidfd pins the process now: check it is still the recorded one
+        if core.identity_state(rec) != "alive":   # the pidfd pins the process now: still the recorded one?
             return False
         signal.pidfd_send_signal(fd, sig)
         return True
@@ -552,7 +538,8 @@ def cmd_exec(rid, run, argv, cwd=None):
         if os.environ.get("AGENT_BUS_TEST_EXEC_PAUSE") == "launcher":   # tests: a launcher that has not yet run
             cmd = ["sh", "-c", 'kill -STOP $$; exec "$@"', "sh", *cmd]
         p = subprocess.Popen(cmd, cwd=cwd or None)
-        it["launcher"] = core.proc_identity(p.pid) or dict(pid=p.pid, boot_id=core.boot_id(), ticks=None)
+        ident = None if os.environ.get("AGENT_BUS_TEST_LAUNCHER_IDENT_FAIL") else core.proc_identity(p.pid)
+        it["launcher"] = ident or dict(pid=p.pid, boot_id=core.boot_id(), ticks=None)   # ticks None: unknown
         admit_write(rid, a)
     if os.environ.get("AGENT_BUS_TEST_EXEC_PAUSE") == "launching":
         os.kill(os.getpid(), signal.SIGSTOP)
@@ -581,6 +568,17 @@ def exec_guard(rid, eid, run, argv):
     os.execvp(argv[0], argv)
 
 
+def close_admission(rid):
+    try:
+        with admit_lock(rid, timeout=10):
+            a = admit_read(rid)
+            if a.get("admission") != "closed":
+                a["admission"] = "closed"
+                admit_write(rid, a)
+    except Refused:
+        pass
+
+
 def resolve_intents(rid):
     """Under the admit lock: an intent is cancelled only when its client and its launcher are both gone and no scope of
     it exists; a scope that exists means registered. Returns the exec ids still outstanding."""
@@ -591,9 +589,11 @@ def resolve_intents(rid):
         for x in a.get("inflight", []):
             if x["state"] in ("registered", "cancelled"):
                 continue
-            client_gone = not core.identity_alive(x.get("client"))
+            client_gone = core.identity_gone(x.get("client"))
             launcher = x.get("launcher")
-            launcher_gone = launcher is None or (launcher.get("ticks") is not None and not core.identity_alive(launcher))
+            launcher_gone = launcher is None if x["state"] == "admitted" else core.identity_gone(launcher)
+            if client_gone and not launcher_gone and core.identity_state(launcher) == "unknown":
+                x["needs_owner"] = True       # its launcher cannot be identified: `bus reconcile --cancel-exec`
             scope = unit_query(scope_unit(rid, x["exec_id"]), "LoadState", "ActiveState")
             if not scope[0]:
                 out.append(x["exec_id"])          # systemd did not answer: nothing is decided
@@ -686,6 +686,8 @@ class Supervisor:
             e["booking_revision"] = s["booking_revision"]
         if s.get("idle_backfill"):
             e["idle"] = True
+        if s.get("gpu_view") == "unknown":
+            e["gpu_view"] = "unknown"      # the last GPU scan failed: every GPU of the run is claimed until a good one
         return e
 
     def write_entry(self, board):
@@ -775,7 +777,7 @@ class Supervisor:
         cg = s["units"].get("cgroup_path")
         if s["mode"] != "systemd" or not cg:
             return {}
-        rec = {k: v for k, v in (s.get("escaped") or {}).items() if core.identity_alive(v)}
+        rec = {k: v for k, v in (s.get("escaped") or {}).items() if not core.identity_gone(v)}
         procs = uid_procs()
         for pid, pcg in descendants_outside(cg, [int(k) for k in rec], procs).items():
             ident = core.proc_identity(pid)
@@ -785,51 +787,36 @@ class Supervisor:
         return rec
 
     def escaped_live(self):
-        return {int(k): v for k, v in (self.s.get("escaped") or {}).items() if core.identity_alive(v)}
+        """Recorded escapes not positively gone (an unreadable /proc entry keeps one)."""
+        return {int(k): v for k, v in (self.s.get("escaped") or {}).items() if not core.identity_gone(v)}
 
     def stop_signal(self, sig):
         s = self.s
         if s["mode"] == "systemd":
             sysctl("kill", f"--signal={sig}", s["units"]["slice"])
-            esc = self.escaped_live()
-            killed_units = set()
-            for pid, rec in esc.items():
-                unit = rec.get("unit")
-                if unit and unit not in killed_units and self.unit_exclusive(rec.get("cgroup"), unit, esc):
-                    sysctl("kill", f"--signal={sig}", unit)   # every process in that unit is a recorded job process
-                    killed_units.add(unit)
-            for pid, rec in esc.items():
+            # the job's processes outside the slice: enumerated again now, then each signalled on its own through a
+            # pidfd checked against its record. No unit is ever signalled whole, so nothing that merely shares a unit
+            # with one of them is touched
+            self.track_escaped()
+            for pid, rec in self.escaped_live().items():
                 pidfd_signal(rec, getattr(signal, f"SIG{sig}"))
         else:
             # the group is signalled only while its leader is the process recorded at launch, checked through a pidfd
             # (a group id is the leader's pid: with the leader verified, the group cannot be someone else's)
             leader = s.get("leader")
-            if not leader or not core.identity_alive(leader):
+            if not leader or core.identity_state(leader) != "alive":
                 return
             try:
                 fd = os.pidfd_open(leader["pid"])
             except (OSError, AttributeError):
                 return
             try:
-                if core.identity_alive(leader):
+                if core.identity_state(leader) == "alive":
                     os.killpg(leader["pid"], getattr(signal, f"SIG{sig}"))
             except OSError:
                 pass
             finally:
                 os.close(fd)
-
-    @staticmethod
-    def unit_exclusive(cg, unit, esc):
-        """True only when every process of the unit (its own cgroup and everything below it, not just the subtree the
-        recorded process sits in) is a recorded process of this run."""
-        if not cg or not unit or not cg.startswith("/"):
-            return False
-        parts = cg.split("/")
-        if unit not in parts:
-            return False
-        top = "/".join(parts[:parts.index(unit) + 1])
-        pids = cgroup_pids(top, strict=True)
-        return bool(pids) and all(p in esc for p in pids)       # None (unreadable somewhere) is never exclusive
 
     def group_state(self):
         """Fallback: 'gone' when the job's process group is empty and the leader has been reaped."""
@@ -885,7 +872,8 @@ class Supervisor:
             if not gone:
                 remains.append("process group still has processes")
         gpus = s["gpus"]            # every one of the run's original GPUs, a partially released one included
-        confirmed = {r["pid"] for r in s.get("reconciled", []) if isinstance(r, dict) and core.identity_alive(r)}
+        confirmed = [r for r in s.get("reconciled", []) if isinstance(r, dict)]
+        confirmed_now = {r["pid"] for r in confirmed if core.identity_state(r) == "alive"}
         clear, mine, other, err = gpu_release_check(self.rid, gpus, confirmed)
         held = dict(getattr(gpu_release_check, "held", {}) or {}) if mine else {}
         unres = s.setdefault("unresolved", {})
@@ -894,7 +882,7 @@ class Supervisor:
             if ident and str(pid) not in unres:
                 unres[str(pid)] = ident
         for k in list(unres):
-            if int(k) in confirmed or not core.identity_alive(unres[k]):
+            if int(k) in confirmed_now or core.identity_gone(unres[k]):   # unknown stays: never read as an exit
                 del unres[k]
         alive_unres = sorted(int(k) for k in unres)
         if alive_unres and not err:
@@ -910,9 +898,14 @@ class Supervisor:
             remains.append(f"unattributed processes of {core.USER} on GPUs {core.gpu_text(s['gpus'])}: "
                            f"{','.join(map(str, mine))} (bus reconcile {self.rid})")
         s["_other_on_gpus"] = other
-        if err:                       # a failed scan proves nothing about any GPU: no GPU counts as released
+        if err:                       # a failed scan proves nothing about any GPU: the entry claims them all again
             s["gpus_released"] = []
             s.pop("gpus_released_checked", None)
+            if s.get("held_gpus") is not None:
+                s["held_gpus"] = list(s["gpus"])
+            s["gpu_view"] = "unknown"
+        else:
+            s.pop("gpu_view", None)
         # everything of the job is gone and only processes nobody's records explain remain: the owner decides
         s["_reconcile"] = dict(pids=mine, held=sorted(held) or sorted(s.get("held_gpus") or gpus),
                                released=sorted(set(gpus) - set(held or s.get("held_gpus") or gpus))) \
@@ -952,6 +945,12 @@ class Supervisor:
             out = resolve_intents(self.rid) if s["mode"] == "systemd" else []
             if out:
                 r["remains"] = [f"exec {e} outstanding" for e in out]
+                stuck = [x["exec_id"] for x in admit_read(self.rid).get("inflight", []) if x.get("needs_owner")]
+                if stuck and not r.get("told_exec_owner"):
+                    r["told_exec_owner"] = True
+                    notice(self.rid, s, self.hooks, "exec-unidentified", execs=stuck,
+                           action=f"its client is gone and its launcher cannot be identified; if no such exec is "
+                                  f"running, clear it: bus reconcile {self.rid} --cancel-exec <exec-id>")
                 return self.tell_stopping(board)
             self.stop_signal("TERM")
             r.update(step="term", term_wall=t)
@@ -1006,6 +1005,7 @@ class Supervisor:
         s["state"] = "ended"
         s["entry_state"] = "ended"
         s["ended"] = now()
+        close_admission(self.rid)
         self.archive_entry(board)
         if s["mode"] == "systemd":
             sysctl("stop", s["units"]["main"])
@@ -1310,9 +1310,9 @@ class Supervisor:
         if known == "exists":
             s["state"] = s["entry_state"] = "running"
         elif known == "absent":
-            s["end_reason"] = "its units never started"
-            s["state"] = s["entry_state"] = "ended"
-            self.save()
+            close_admission(self.rid)
+            s["state"] = s["entry_state"] = "running"
+            self.start_release(s.get("launch_failed") or "its units never started")
         else:
             s["pending_verification"] = "systemd did not answer about the job's unit; still starting"
         return s["state"]
@@ -1518,10 +1518,12 @@ def cmd_run(a):
             rc, out = 255, "TimeoutExpired (test)"        # tests: systemd accepted it, the client did not hear back
         if rc:
             known = main_unit_state(s["units"]["main"])
-            if known == "absent":            # positive evidence that nothing started: the only case that ends it
-                s.update(state="ended", end_reason=f"the job's unit did not start: {out.strip()[:200]}")
+            close_admission(rid)
+            if known == "absent":
+                # nothing started, by systemd's word: the run still ends only through the supervisor's verified
+                # release (slice and GPUs checked), like any other
+                s.update(launch_failed=f"the job's unit did not start: {out.strip()[:200]}")
                 core.write_private(state_path(rid), s)
-                raise Refused(f"systemd-run for the job failed: {out.strip()[:300]}")
             print(f"bus: systemd-run for the job reported {out.strip()[:120]!r}; systemd says the unit is {known}: "
                   f"the supervisor decides from systemd's own state", file=sys.stderr)
         if not rc or known == "exists":
@@ -1554,6 +1556,9 @@ def wait_ended(rid, report_handoff=False):
     while True:
         s = core.read_private(state_path(rid)) or {}
         if s.get("state") == "ended":
+            if s.get("launch_failed"):
+                print(f"bus: {s['launch_failed']}", file=sys.stderr)
+                return 1
             if s.get("ended_by_release") or (s.get("exit_status") is None and s.get("release")):
                 return EXIT_RELEASED
             st = s.get("exit_status")
@@ -1617,14 +1622,31 @@ def cmd_release(rid, reason=None, wait=None):
         time.sleep(1)
 
 
+def cancel_exec(rid, eid):
+    """The owner's word that an exec intent whose launcher cannot be identified is not running: cancelled, so the
+    release can go on. Refused for an intent whose launcher is known alive or whose scope exists."""
+    with admit_lock(rid):
+        a = admit_read(rid)
+        it = next((x for x in a.get("inflight", []) if x["exec_id"] == eid), None)
+        if not it or it["state"] in ("registered", "cancelled"):
+            raise Refused(f"no outstanding exec {eid} in {rid}")
+        if core.identity_state(it.get("launcher")) == "alive" or unit_exists(scope_unit(rid, eid)):
+            raise Refused(f"exec {eid}'s launcher or scope is alive: not cancelled")
+        it["state"] = "cancelled"
+        it["cancelled_by"] = "owner"
+        admit_write(rid, a)
+    return dict(id=rid, cancelled=eid)
+
+
 def cmd_reconcile(rid, confirm):
     """The owner's word on processes of theirs a release cannot attribute: list them, or confirm pids that are not this
     run's. A confirmation is kept as the process's identity (pid, start time, boot id), so a later process that reuses
     the pid inherits nothing; a held process that has left every GPU is confirmed by its recorded identity."""
     s = load_state(rid)
-    confirmed = {r["pid"] for r in s.get("reconciled", []) if isinstance(r, dict) and core.identity_alive(r)}
-    clear, mine, other, err = gpu_release_check(rid, s["gpus"], confirmed)
-    recorded = {int(k): v for k, v in (s.get("unresolved") or {}).items() if core.identity_alive(v)}
+    confirmed_ids = [r for r in s.get("reconciled", []) if isinstance(r, dict)]
+    confirmed = {r["pid"] for r in confirmed_ids if core.identity_state(r) == "alive"}
+    clear, mine, other, err = gpu_release_check(rid, s["gpus"], confirmed_ids)
+    recorded = {int(k): v for k, v in (s.get("unresolved") or {}).items() if not core.identity_gone(v)}
     waiting = sorted(set(mine) | set(recorded))
     if confirm:
         bad = [p for p in confirm if int(p) not in waiting]

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Two-user rehearsal in the container (up.sh first): alice and bob each run the setup block from README.md, then
-# act on one v2 board and one old (v1) board under /shared, as two members of group lab would on the GPU host.
-# Checks authorship, requests across users, booking receipts, objections and conflicts, both users' backfill yielding
-# to a standing booking, and the old board's send/ack/watch/exit between v1 tools and the legacy adapter.
+# act on one board under /shared, as two members of group lab would on the GPU host. Checks authorship, requests
+# across users, booking receipts, objections and conflicts, and both users' backfill yielding to a standing booking.
 # Exits with the number of failed checks; every check prints PASS/FAIL and the values it compared.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -17,24 +16,21 @@ J() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 
 SRC=/src/agent-bus
 V2=/shared/v2
-OLD=/shared/old
 ENVS="export PATH=\$HOME/.local/bin:\$PATH AGENT_BUS_NVIDIA_SMI=/shared/nvidia-smi AGENT_BUS_TEST_GPUS=/shared/gpus.json"
 
 echo "== reset"
 A "systemctl --user list-units --all --plain --no-legend 'agentbus*' | awk '{print \$1}' | xargs -r -n1 systemctl --user kill --signal=KILL 2>/dev/null; systemctl --user list-units --all --plain --no-legend 'agentbus*' | awk '{print \$1}' | xargs -r -n1 systemctl --user stop 2>/dev/null; true" >/dev/null 2>&1
 B "systemctl --user list-units --all --plain --no-legend 'agentbus*' | awk '{print \$1}' | xargs -r -n1 systemctl --user kill --signal=KILL 2>/dev/null; true" >/dev/null 2>&1
-R "rm -rf $V2 $OLD /shared/gpus.json /shared/nvidia-smi /home/alice/.local /home/alice/.config/agent-bus /home/bob/.local /home/bob/.config/agent-bus /home/alice/.agent-bus /home/bob/.agent-bus; cp $SRC/tests/v2/fake_nvidia_smi.py /shared/nvidia-smi; chmod 755 /shared/nvidia-smi; chgrp lab /shared/nvidia-smi"
+R "rm -rf $V2 /shared/gpus.json /shared/nvidia-smi /home/alice/.local /home/alice/.config/agent-bus /home/bob/.local /home/bob/.config/agent-bus /home/alice/.agent-bus /home/bob/.agent-bus; cp $SRC/tests/v2/fake_nvidia_smi.py /shared/nvidia-smi; chmod 755 /shared/nvidia-smi; chgrp lab /shared/nvidia-smi"
 R "python3 -c 'import json; json.dump(dict(gpus=[dict(index=i,uuid=\"GPU-%d\"%i,util=50) for i in range(8)],apps=[]), open(\"/shared/gpus.json\",\"w\"))'; chmod 664 /shared/gpus.json; chgrp lab /shared/gpus.json"
 HOSTS=$(A "hostname -s")
 
-echo "== boards (alice creates both)"
+echo "== the board (alice creates it)"
 A "umask 002; bash $SRC/setup-board.sh $V2 $HOSTS --group lab --blocks 3 && echo min_objection_s=60 >> $V2/config" | tail -1
-A "umask 002; bash $SRC/legacy/setup-board.sh $OLD $HOSTS lab && mkdir -p $OLD/agents/.heartbeat $OLD/.sweep && chmod 2775 $OLD/agents/.heartbeat $OLD/.sweep" | tail -1
 
 echo "== the setup block, as each member's agent runs it"
 for U in A B; do
-  extra=""; [ $U = A ] && extra="--legacy-board $OLD"
-  $U "$ENVS; loginctl enable-linger \$USER; loginctl show-user \$USER -p Linger; $SRC/bin/install.sh --board $V2 $extra | head -2; systemctl --user enable --now bus-adopt.timer 2>&1 | tail -1; systemctl --user list-timers bus-adopt.timer --no-pager | head -2 | tail -1; bus doctor" > /tmp/setup.$U 2>&1
+  $U "$ENVS; loginctl enable-linger \$USER; loginctl show-user \$USER -p Linger; $SRC/bin/install.sh --board $V2 | head -2; systemctl --user enable --now bus-adopt.timer 2>&1 | tail -1; systemctl --user list-timers bus-adopt.timer --no-pager | head -2 | tail -1; bus doctor" > /tmp/setup.$U 2>&1
   u=$([ $U = A ] && echo alice || echo bob)
   sed "s/^/  [$u] /" /tmp/setup.$U
   check "$u: bus doctor passes after the setup block" grep -q "^ok   board pin" /tmp/setup.$U
@@ -127,49 +123,6 @@ B "touch $V2/agents/.heartbeat/$HID"
 occ=$(A "$ENVS; bus ls --json" | J "[e['occupancy'] for e in d['entries'] if e['id']=='$HID'][0]")
 check "a heartbeat bob made for alice's entry does not count (occupancy $occ)" test "$occ" = unknown
 A "rm -f $V2/agents/$HID.json"
-
-echo "== old board: v1 tools and the adapter across users"
-B "cd /tmp && $OLD/bin/run.sh 3 --note 'bob v1 job' --hours 1 -- 'sleep 20'" > /tmp/bobrun.txt
-BID=$(B "ls $OLD/agents | grep '^bob-' | head -1 | sed 's/.json\$//'")
-echo "  bob's v1 entry: $BID"
-seen=$(A "$ENVS; bus legacy ls --json" | J "[(e['id'], e['file_owner'], e['state']) for e in d]")
-check "alice's adapter lists bob's v1 entry: $seen" grep -q "'$BID', 'bob'" <<<"$seen"
-A "$ENVS; bus legacy send $BID 'may I take gpu 3 at 18:00' --from alice --kind request --gpus 1 --minutes 60 >/dev/null"
-w=$(B "timeout 20 python3 $OLD/bin/bus.py watch $BID --interval 1 < /dev/null")
-check "bob's v1 watch prints alice's adapter message and exits" grep -q "may I take gpu 3" <<<"$w"
-MID=$(grep -o 'MSG [^ ]*' <<<"$w" | head -1 | cut -d' ' -f2)
-B "python3 $OLD/bin/bus.py ack $BID $MID && python3 $OLD/bin/bus.py send alice 'yes, after 18:00' --from $BID --kind reply --reply-to $MID >/dev/null"
-inb=$(A "$ENVS; bus legacy inbox alice --all")
-check "alice's adapter reads bob's v1 reply: $(head -c 100 <<<"$inb")" grep -q "yes, after 18:00" <<<"$inb"
-un=$(A "$ENVS; bus legacy inbox $BID --json" | J "len(d)")
-check "bob's ack is honored by the adapter's unread view ($un unread)" test "$un" = 0
-A "$ENVS; bus legacy sweep-own --reply --json" > /tmp/sw.json
-if grep -q bob /tmp/sw.json; then bad "alice's sweep-own touched bob's entry: $(cat /tmp/sw.json)"; else pass "alice's sweep-own leaves bob's entry alone ($(J "d['archived']" < /tmp/sw.json))"; fi
-for i in $(seq 1 30); do B "test -f $OLD/agents/$BID.json" || break; sleep 1; done
-check "bob's v1 job exited and run.sh took its entry down (${i}s)" bash -c "! ./as.sh bob test -f $OLD/agents/$BID.json"
-arch=$(A "ls $OLD/archive | grep -c '^$BID'")
-check "bob's entry is in the archive ($arch)" test "$arch" = 1
-
-A "nohup sleep 300 >/dev/null 2>&1 & echo \$! > /tmp/apid"
-APID=$(A "cat /tmp/apid")
-LID=alice-20261124-000002-legacyjob
-A "$ENVS; bus legacy up $LID --gpus 4 --task 'alice legacy-adapter job' --hours 1 --pid $APID >/dev/null"
-mode=$(A "stat -c %a $OLD/agents/$LID.json")
-v1=$(B "python3 $OLD/bin/bus.py ls --json" | J "[(e['id'], e['user'], e['gpus']) for e in d if e['id']=='$LID']")
-check "bob's v1 ls reads alice's adapter entry ($v1, mode $mode)" grep -q "'$LID', 'alice', '4'" <<<"$v1"
-B "python3 $OLD/bin/bus.py send $LID 'please free gpu4' --from bob-asker --kind request --gpus 1 --minutes 10 >/dev/null"
-A "python3 - <<'PY'
-import json, os, time
-p='$OLD/agents/$LID.json'; a=json.load(open(p)); a['heartbeat']=int(time.time())-600
-os.unlink(p); open(p,'w').write(json.dumps(a)); os.chmod(p, 0o644)
-os.utime('$OLD/agents/.heartbeat/$LID', (time.time()-90, time.time()-90))
-PY"
-A "$ENVS; bus legacy sweep-own --reply --json" > /tmp/sw2.json
-check "sweep-own stops alice's unwatched legacy job through its identity record ($(J "d['stopped']" < /tmp/sw2.json))" grep -q "$LID" /tmp/sw2.json
-gone=$(A "kill -0 $APID 2>/dev/null && echo alive || echo gone")
-check "the recorded process got the TERM ($gone)" test "$gone" = gone
-rb=$(B "python3 $OLD/bin/bus.py inbox bob-asker --all")
-check "bob's v1 inbox has the stop reply: $(head -c 110 <<<"$rb")" grep -q "was stopped" <<<"$rb"
 
 echo "== cleanup"
 for rid in $AID2; do A "$ENVS; bus release $rid --wait 40 --json >/dev/null"; done

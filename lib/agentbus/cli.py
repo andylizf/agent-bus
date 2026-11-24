@@ -2,7 +2,7 @@
 import argparse, hashlib, json, os, secrets, shlex, shutil, subprocess, sys, time
 
 from . import bookings as bk
-from . import core, legacy, runner
+from . import core, runner
 from .core import Refused, now
 
 USAGE = """bus: coordinate a shared GPU host through a board directory (agent-bus v2)
@@ -12,7 +12,6 @@ USAGE = """bus: coordinate a shared GPU host through a board directory (agent-bu
   bookings:  book, unbook, object
   messages:  send, reply, mailbox
   install:   doctor, upgrade, adopt --all, stop-hook, page
-  old board: legacy up|beat|down|send|ack|inbox|ls|cal|sweep-own
 """
 
 
@@ -421,61 +420,16 @@ def cmd_setup_board(a):
 
 
 def cmd_install(a):
-    """`bus _install --board DIR [--legacy-board DIR] [--host H]` (install.sh calls it): copy the build, flip the
-    entry point, pin the board(s) by inode and filesystem id in ~/.config/agent-bus/board.conf."""
+    """`bus _install --board DIR` (install.sh calls it): copy the build, flip the entry point, pin the board by inode
+    and filesystem id in ~/.config/agent-bus/board.conf."""
     build = copy_build(a.src)
     flip(build)
     conf = core.load_conf()
     b = core.Board(os.path.abspath(a.board))
     conf.update(path=b.path, inode=str(b.ino), fsid=str(b.fsid), host=b.host or "")
     b.close()
-    if a.legacy_board:
-        o = legacy.Old(os.path.abspath(a.legacy_board))
-        conf.update(legacy_path=o.path, legacy_inode=str(o.ino), legacy_fsid=str(o.fsid))
-        o.close()
     core.save_conf(conf)
     out(dict(build=os.path.basename(build), bin=core.BIN(), conf=conf))
-
-
-# ------------------------------------------------------------------------------------------------ legacy
-
-def cmd_legacy(a):
-    with legacy.Old(a.board) as o:
-        c = a.lcmd
-        if c == "up":
-            r = legacy.up(o, a.id, a.gpus, a.task, a.hours, a.pid, a.on_request, a.exclusive, a.human, a.session)
-            print(f"agent {a.id} up on the old board: gpus={r['gpus']} pid={r['pid']}")
-        elif c == "beat":
-            o.beat(a.id)
-        elif c == "down":
-            legacy.down(o, a.id, a.reason)
-            print(f"agent {a.id} down ({a.reason})")
-        elif c == "send":
-            text = sys.stdin.read().strip() if a.text == "-" else a.text
-            print(f"sent {o.send(a.to, text, a.sender, a.kind, a.reply_to, a.gpus, a.minutes)} to {a.to}")
-        elif c == "ack":
-            legacy.ack(o, a.id, a.msg)
-        elif c == "inbox":
-            r = o.read("agents", f"{a.id}.json")
-            ent = r[0] if r else {"id": a.id, "seen": [], "started": 0}
-            ms = o.msgs(a.id) if a.all else o.unread(ent)
-            if a.json:
-                return out([{k: v for k, v in m.items() if not k.startswith("_")} for m in ms])
-            for m in ms:
-                text = str(m.get("text", "")).replace("\n", "\\n")
-                print(f"MSG {m['id']} from={m.get('from')} ({m['_owner']}) kind={m.get('kind')}: {text}")
-        elif c == "ls":
-            rows = legacy.ls_json(o, a.mine)
-            if a.json:
-                return out(rows)
-            for x in rows:
-                print(f"{x.get('id'):<40} {x['file_owner']:<8} gpus {x.get('gpus')}  {x['state']}  {x.get('task', '')}")
-        elif c == "cal":
-            out(legacy.cal_json(o, a.days))
-        elif c == "sweep-own":
-            r = legacy.sweep_own(o, a.reply)
-            if a.json:
-                out(r)
 
 
 # ------------------------------------------------------------------------------------------------ parser
@@ -523,9 +477,12 @@ def parser():
     s.add_argument("--json", action="store_true")
     s = p("runs", lambda a: out(runner.cmd_runs()), "your runs' private states")
     s.add_argument("--json", action="store_true")
-    s = p("reconcile", lambda a: out(runner.cmd_reconcile(a.id, a.confirm)), "fallback mode: confirm leftovers")
+    s = p("reconcile", lambda a: out(runner.cancel_exec(a.id, a.cancel_exec) if a.cancel_exec
+                                     else runner.cmd_reconcile(a.id, a.confirm)),
+          "list or confirm processes a release cannot attribute; clear an unidentifiable exec")
     s.add_argument("id")
     s.add_argument("--confirm", nargs="*", type=int, default=[])
+    s.add_argument("--cancel-exec", metavar="EXEC_ID")
     s = p("supervise", lambda a: runner.Supervisor(a.id, adopt=a.adopt).run(), "the per-run supervisor (internal)")
     s.add_argument("id")
     s.add_argument("--adopt", action="store_true")
@@ -603,34 +560,10 @@ def parser():
     s = p("_install", cmd_install)
     s.add_argument("--src", required=True)
     s.add_argument("--board", required=True)
-    s.add_argument("--legacy-board")
     s = p("page", None, "serve the read-only board page")
     s.add_argument("--port", type=int, default=8300)
     s.add_argument("--host", default="127.0.0.1")
     s.set_defaults(f=cmd_page)
-    s = p("legacy", cmd_legacy, "the old board, through the confined adapter")
-    sub = s.add_subparsers(dest="lcmd", required=True)
-
-    class _L:
-        def add_parser(self, name):
-            x = sub.add_parser(name)
-            x.add_argument("--board", help="the old board directory (default: board.conf's legacy_path)")
-            return x
-    ls = _L()
-    x = ls.add_parser("up")
-    x.add_argument("id"); x.add_argument("--gpus"); x.add_argument("--task", default=""); x.add_argument("--hours", type=float)
-    x.add_argument("--pid", type=int); x.add_argument("--on-request", default="agent"); x.add_argument("--exclusive", action="store_true")
-    x.add_argument("--human"); x.add_argument("--session")
-    x = ls.add_parser("beat"); x.add_argument("id")
-    x = ls.add_parser("down"); x.add_argument("id"); x.add_argument("--reason", default="done")
-    x = ls.add_parser("send"); x.add_argument("to"); x.add_argument("text"); x.add_argument("--from", dest="sender")
-    x.add_argument("--kind", default="msg", choices=["msg", "request", "reply", "warn"]); x.add_argument("--reply-to")
-    x.add_argument("--gpus"); x.add_argument("--minutes", type=int)
-    x = ls.add_parser("ack"); x.add_argument("id"); x.add_argument("msg", nargs="+")
-    x = ls.add_parser("inbox"); x.add_argument("id"); x.add_argument("--all", action="store_true"); x.add_argument("--json", action="store_true")
-    x = ls.add_parser("ls"); x.add_argument("--json", action="store_true"); x.add_argument("--mine", action="store_true")
-    x = ls.add_parser("cal"); x.add_argument("--json", action="store_true"); x.add_argument("--days", type=float, default=2)
-    x = ls.add_parser("sweep-own"); x.add_argument("--reply", action="store_true"); x.add_argument("--json", action="store_true")
     return ap
 
 

@@ -38,13 +38,14 @@ class RealGPU(BusTest):
         log = self.state(d["id"])["log"]
         wait_for(lambda: "ctx" in open(log).read(), 60, what="the CUDA context")
         cg = self.state(d["id"])["units"]["cgroup_path"]
-        clear, mine, other, err = runner.gpu_check([g], runner.in_cgroup_fn(cg, os.getuid()))
+        clear, mine, other, err = runner.gpu_release_check(d["id"], [g])
         self.assertIsNone(err)
         self.assertFalse(clear)
         self.assertEqual(len(mine), 1, (mine, other))
+        self.assertTrue(runner.in_cgroup_fn(cg, os.getuid())(mine[0]))       # the context is the job's, in its slice
         r = self.bus_json("release", d["id"], "--wait", "60", "--json")
         self.assertTrue(r["released"], r)
-        clear, mine, other, err = runner.gpu_check([g], runner.in_cgroup_fn(cg, os.getuid()))
+        clear, mine, other, err = runner.gpu_release_check(d["id"], [g])
         self.assertTrue(clear)
         print(f"\n[real GPU {g}] job pid on GPU {self.state(d['id']).get('id')} released; others on it: {other}")
 

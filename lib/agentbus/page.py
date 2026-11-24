@@ -1,8 +1,7 @@
 """`bus page`: the read-only board page, rendered by one's own install (design 3.11).
 
-v2 runs with their class, bookings with their state and objections, the old board's entries as a separate read-only
-section (parsed as untrusted data by the legacy adapter), and the live nvidia-smi view with processes of users not on
-either board shown as off-board use. GET only; nothing is written anywhere. Bounds: 16 handler threads, overload
+Runs with their class, bookings with their state and objections, and the live nvidia-smi view with processes of
+users not on the board shown as off-board use. GET only; nothing is written anywhere. Bounds: 16 handler threads, overload
 answered 503; one 15 s deadline per connection, enforced by shutting the socket down; collection in one refresher
 thread with 20 s subprocess timeouts; the last good page served with a banner when a refresh fails.
 """
@@ -12,14 +11,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
 from . import bookings as bk
-from . import core, legacy, runner
+from . import core, runner
 
 THREADS = 16
 CONN_DEADLINE_S = 15.0
 REFRESH_S = 20.0
 
 
-def collect(conf, legacy_path=None):
+def collect(conf):
     data = dict(t=core.now(), host=core.HOST, errors=[])
     try:
         with core.Board.from_conf(conf) as b:
@@ -31,12 +30,6 @@ def collect(conf, legacy_path=None):
         data["errors"].append(f"v2 board: {e}")
         data.setdefault("entries", [])
         data.setdefault("bookings", [])
-    try:
-        with legacy.Old(legacy_path or conf.get("legacy_path")) as o:
-            data["legacy"] = legacy.ls_json(o)
-    except (OSError, core.Refused) as e:
-        data["legacy"] = []
-        data["errors"].append(f"old board: {e}")
     ok, idx, apps, util = runner.nvidia_view(timeout=20)
     gpus = {i: dict(gpu=i, uuid=u, util=util.get(i), procs=[]) for i, u in idx.items()}
     by_uuid = {u: i for i, u in idx.items()}
@@ -59,7 +52,7 @@ def when(t):
 
 
 def render(d, banner=None):
-    on_board = {e["user"] for e in d.get("entries", [])} | {str(a.get("file_owner")) for a in d.get("legacy", [])}
+    on_board = {e["user"] for e in d.get("entries", [])}
     claimed = {}
     for e in d.get("entries", []):
         for g in e["gpus"]:
@@ -83,10 +76,6 @@ def render(d, banner=None):
         f"<td>{esc(when(b.get('objection_close')))}</td><td>{esc(b['kind'])}</td><td>{esc(b.get('note'))}</td>"
         f"<td>{'<br>'.join(esc(o['user'] + ': ' + o['reason']) for o in b.get('objections', [])) or esc(b.get('why'))}</td></tr>"
         for b in d.get("bookings", []) if b.get("state") != "unpublished")
-    old = "".join(
-        f"<tr><td>{esc(a.get('id'))}</td><td>{esc(a.get('file_owner'))}</td><td>{esc(a.get('gpus'))}</td>"
-        f"<td>{esc(a.get('state'))}</td><td>{esc(when(a.get('until')))}</td><td>{esc(str(a.get('task', ''))[:80])}</td></tr>"
-        for a in d.get("legacy", []))
     notes = "".join(f"<p class=warn>{esc(x)}</p>" for x in (([banner] if banner else []) + d.get("errors", [])
                                                             + d.get("warnings", [])))
     ident = "" if d.get("identity", "ok") == "ok" else "<p class=warn>board identity changed: shown as read</p>"
@@ -103,7 +92,6 @@ th{{color:var(--mute);font-weight:600}}.warn{{color:var(--warn)}}.wrap{{overflow
 <h2>Now on each GPU</h2><div class=wrap><table><tr><th>GPU</th><th>use</th><th>processes of</th><th>v2 entries of</th><th></th></tr>{''.join(rows)}</table></div>
 <h2>v2 runs</h2><div class=wrap><table><tr><th>id</th><th>user</th><th>GPUs</th><th>class</th><th>state</th><th>heartbeat</th><th>until</th><th>kind</th><th>note</th></tr>{ents or '<tr><td colspan=9>none</td></tr>'}</table></div>
 <h2>Bookings</h2><div class=wrap><table><tr><th>id</th><th>user</th><th>GPUs</th><th>window</th><th>state</th><th>objections until</th><th>kind</th><th>note</th><th>objections / why</th></tr>{books or '<tr><td colspan=9>none</td></tr>'}</table></div>
-<h2>Old board (read-only)</h2><div class=wrap><table><tr><th>id</th><th>file owner</th><th>GPUs</th><th>state</th><th>until</th><th>task</th></tr>{old or '<tr><td colspan=6>none</td></tr>'}</table></div>
 </body></html>"""
 
 

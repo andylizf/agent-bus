@@ -8,12 +8,11 @@ from agentbus import page
 def sample():
     return dict(t=int(time.time()), host="gpuhost", errors=[], identity="ok", ngpus=2,
                 entries=[dict(id="alice-20261123-120000-x", user="alice", gpus=[0], state="running", occupancy="live",
-                              until=int(time.time()) + 60, kind="training", note="<b>x</b>", **{"class": "backfill"})],
+                              until=int(time.time()) + 60, kind="training", note="<img src=x onerror=alert(1)>",
+                              **{"class": "backfill"})],
                 bookings=[dict(id="bob-20261123-120000-b", user="bob", gpus=[1], start=1, end=2, state="objected",
                                objection_close=1, kind="eval", note="", why="",
                                objections=[dict(user="carol", reason="deadline <script>")])],
-                legacy=[dict(id="dave-run", file_owner="dave", gpus="1", state="live", until=None,
-                             task="<img src=x onerror=alert(1)>")],
                 gpus=[dict(gpu=0, uuid="G0", util=50, procs=["alice"]), dict(gpu=1, uuid="G1", util=90, procs=["erin"])])
 
 
@@ -39,7 +38,7 @@ class Page(unittest.TestCase):
         port, _ = self.serve()
         code, body = self.get(port)
         self.assertEqual(code, 200)
-        for s in ("backfill", "objected", "carol: deadline", "dave-run", "off-board use: erin"):
+        for s in ("backfill", "objected", "carol: deadline", "off-board use: erin"):
             self.assertIn(s, body)
 
     def test_untrusted_text_escaped(self):
@@ -94,7 +93,7 @@ class Collect(BusTest):
     def test_collect_reads_board_without_writing(self):
         from agentbus import core
         before = sorted(str(p) for p in self.root.rglob("*"))
-        d = page.collect(core.load_conf(), legacy_path=str(self.tmp / "missing-old"))
+        d = page.collect(core.load_conf())
         self.assertEqual(d["identity"], "ok")
         self.assertEqual(len(d["gpus"]), 8)
         self.assertEqual(sorted(str(p) for p in self.root.rglob("*")), before)

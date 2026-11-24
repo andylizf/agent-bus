@@ -157,29 +157,6 @@ class FailedScanAndIdentities(BusTest):
 
 @need_systemd
 class ExclusivityAndFallbackGroups(BusTest):
-    def test_an_unreadable_part_of_a_unit_makes_it_not_exclusive(self):
-        d = self.start(SLEEP)
-        st = self.state(d["id"])
-        cg = st["units"]["cgroup_path"]
-        sub = f"/sys/fs/cgroup{cg}"
-        pids = runner.cgroup_pids(cg)
-        self.assertTrue(pids)
-        esc = {p: {} for p in pids}
-        unit = st["units"]["slice"]
-        self.assertTrue(runner.Supervisor.unit_exclusive(cg, unit, esc))      # all readable, all recorded
-        real = os.walk
-
-        def walk_with_a_hole(top, onerror=None, **kw):
-            for d_, dirs, files in real(top, onerror=onerror, **kw):
-                yield d_, dirs, [f for f in files if f != "cgroup.procs"] if d_ != sub else files
-        orig = runner.os.walk
-        runner.os.walk = walk_with_a_hole
-        try:
-            self.assertIsNone(runner.cgroup_pids(cg, strict=True))
-            self.assertFalse(runner.Supervisor.unit_exclusive(cg, unit, esc))
-        finally:
-            runner.os.walk = orig
-
     def test_fallback_never_signals_a_group_whose_leader_is_not_the_recorded_one(self):
         other = subprocess.Popen(["sleep", "300"], start_new_session=True)   # an unrelated group
         self.procs.append(other)

@@ -104,6 +104,51 @@ def proc_state(pid):
         return None
 
 
+def identity_state(ident):
+    """'alive' (the recorded process, running), 'gone' (positively: no such pid, another start time or boot, or a
+    zombie), or 'unknown' (/proc could not be read). Decisions that would release something treat 'unknown' as alive;
+    decisions that would signal or clear something require 'alive'."""
+    if not isinstance(ident, dict) or not isinstance(ident.get("pid"), int) or ident.get("ticks") is None:
+        return "unknown"
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            boot = f.read().strip()
+    except OSError:
+        return "unknown"                 # a boot id that cannot be read proves no reboot
+    if ident.get("boot_id") != boot:
+        return "gone"
+    try:
+        with open(f"/proc/{ident['pid']}/stat") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return "gone"
+    except OSError:
+        return "unknown"
+    try:
+        rest = data[data.rindex(")") + 2:].split()
+        state, ticks = rest[0], int(rest[19])
+    except (ValueError, IndexError):
+        return "unknown"
+    if ticks != ident["ticks"] or state in ("Z", "X"):
+        return "gone"
+    return "alive"
+
+
+def identity_gone(ident):
+    return identity_state(ident) == "gone"
+
+
+def proc_owner(pid):
+    """(uid, None) for a live process, (None, 'gone') when /proc has no such pid, (None, 'error') when it cannot be
+    read: an error is never taken for an exit."""
+    try:
+        return os.stat(f"/proc/{int(pid)}").st_uid, None
+    except FileNotFoundError:
+        return None, "gone"
+    except (OSError, ValueError):
+        return None, "error"
+
+
 def identity_alive(ident):
     """True while the process named by {pid, boot_id, ticks} is the same process that was recorded and has not
     exited (a zombie keeps its /proc entry and start time until reaped, and counts as gone)."""
@@ -373,7 +418,7 @@ def read_private(path):
 # ------------------------------------------------------------------------------------------------ install config
 
 def load_conf(path=None):
-    """~/.config/agent-bus/board.conf: key=value lines (path, inode, fsid, host, legacy_path, ...)."""
+    """~/.config/agent-bus/board.conf: key=value lines (path, inode, fsid, host)."""
     p = path or os.path.join(CONFIG(), "board.conf")
     out = {}
     try:

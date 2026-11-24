@@ -1,10 +1,10 @@
-"""Regression tests for the round-1 review findings (P0-1 ... P1-7 on the bus side, P0-2's legacy part)."""
+"""Regression tests for the round-1 review findings on the bus side (P0-1, P0-4, P1-5 ... P1-7)."""
 import json, os, secrets, signal, subprocess, sys, time, unittest
 from unittest import mock
 
 from helpers import LINUX, PY, REPO, SCALE, BusTest, FakeBoard, need_systemd, wait_for
 from agentbus import bookings as bk
-from agentbus import core, legacy, runner
+from agentbus import core, runner
 from test_bookings import H, T0, booking, receipt, states
 
 SLEEP = "sleep 300"
@@ -74,59 +74,6 @@ class Escapes(BusTest):
         self.assertEqual(p.wait(10), -signal.SIGTERM)
 
 
-# ------------------------------------------------------------------------------------------------ P0-2 (legacy part)
-
-@unittest.skipUnless(LINUX, "the adapter binds entries to processes through /proc (Linux)")
-class LegacyVerifiedRelease(BusTest):
-    def setUp(self):
-        super().setUp()
-        self.old = self.tmp / "old"
-        r = subprocess.run(["bash", str(REPO / "legacy" / "setup-board.sh"), str(self.old), self.host()],
-                           capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        for d in ("agents/.heartbeat", ".sweep"):
-            (self.old / d).mkdir(parents=True, exist_ok=True)
-        self.oldenv = dict(self.env, AGENT_BUS_ROOT=str(self.old))
-
-    def oldbus(self, *args):
-        return subprocess.run([sys.executable, str(REPO / "legacy" / "bin" / "bus.py"), *args], capture_output=True,
-                              text=True, env=self.oldenv)
-
-    def test_reply_waits_until_the_stopped_task_is_gone(self):
-        p = subprocess.Popen(["bash", "-c", "trap '' TERM; while :; do sleep 0.2; done"], start_new_session=True)
-        self.procs.append(p)
-        aid = f"{core.USER}-20261124-000000-slowstop"
-        r = self.bus("legacy", "up", aid, "--board", str(self.old), "--gpus", "2", "--task", "t", "--hours", "1",
-                     "--pid", str(p.pid))
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.oldbus("send", aid, "please free", "--from", "carol-req", "--kind", "request")
-        ep = self.old / "agents" / f"{aid}.json"
-        a = json.loads(ep.read_text())
-        a["heartbeat"] = int(time.time()) - 600          # unwatched: the sweep stops it
-        os.unlink(ep)
-        ep.write_text(json.dumps(a))
-        old_t = time.time() - 600
-        os.utime(self.old / "agents" / ".heartbeat" / aid, (old_t, old_t))
-        sweep = lambda: json.loads(self.bus("legacy", "sweep-own", "--board", str(self.old), "--reply", "--json").stdout)
-        r1 = sweep()
-        self.assertEqual([x["entry"] for x in r1["stopped"]], [aid])
-        self.assertNotIn("free", self.oldbus("inbox", "carol-req", "--all").stdout)  # TERM sent, nothing verified
-        self.assertIsNone(p.poll())
-        self.assertEqual(sweep()["released"], [])
-        os.killpg(p.pid, signal.SIGKILL)
-        p.wait()
-        r3 = sweep()
-        self.assertEqual(r3["released"], [aid])
-        self.assertIn("gpus 2", self.oldbus("inbox", "carol-req", "--all").stdout)
-
-    def test_no_reply_while_nvidia_smi_fails(self):
-        rec = dict(entry="x", ident=None, gpus="0", task="t", why="w", signalled=int(time.time()))
-        self.set_gpus(fail=True)
-        ok, remains = legacy.legacy_release_check(rec)
-        self.assertFalse(ok)
-        self.assertIn("nvidia-smi failed", remains)
-
-
 # ------------------------------------------------------------------------------------------------ P0-4
 
 class SetupAndIds(BusTest):
@@ -156,7 +103,6 @@ class SetupAndIds(BusTest):
         for bad in ("../x", "a/b", "..", ".", ""):
             self.assertNotEqual(self.bus("state", bad).returncode, 0, bad)
             self.assertNotEqual(self.bus("release", bad).returncode, 0, bad)
-            self.assertNotEqual(self.bus("legacy", "beat", bad, "--board", str(self.root)).returncode, 0, bad)
             self.assertNotEqual(self.bus("unbook", bad).returncode, 0, bad)
         self.assertIn("bad", self.bus("state", "../x").stderr)
 

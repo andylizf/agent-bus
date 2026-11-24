@@ -4,7 +4,7 @@ from unittest import mock
 
 from helpers import LINUX, REPO, SCALE, BusTest, FakeBoard, need_systemd, wait_for
 from agentbus import bookings as bk
-from agentbus import core, legacy, runner
+from agentbus import core, runner
 from test_bookings import H, T0, booking, receipt, states
 
 SLEEP = "sleep 300"
@@ -96,40 +96,10 @@ class ConservativeRelease(BusTest):
         wait_for(lambda: f"{self.prefix}-o2" in (core.proc_cgroup(other.pid) or ""), 10, what="the other scope")
         with open(f"/sys/fs/cgroup{unit_cg}/other/cgroup.procs", "w") as f:
             f.write(str(other.pid))
-        rec = self.state(d["id"])["escaped"][str(child)]
-        esc = {child: rec}
-        self.assertFalse(runner.Supervisor.unit_exclusive(rec["cgroup"], rec["unit"], esc))
         r = self.bus_json("release", d["id"], "--wait", str(40 * SCALE), "--json")
         self.assertTrue(r["released"], r)
         self.assertFalse(alive(child))
         self.assertIsNone(other.poll(), "a process in another part of the unit was signalled")
-
-
-# ------------------------------------------------------------------------------------------------ item 2 (legacy reply)
-
-@unittest.skipUnless(LINUX, "the adapter binds entries to processes through /proc (Linux)")
-class LegacyReplyText(BusTest):
-    def test_reply_speaks_of_our_release_not_of_the_gpus_being_free(self):
-        p = subprocess.Popen(["sleep", "300"], start_new_session=True)
-        self.procs.append(p)
-        rec = dict(entry=f"{core.USER}-x", ident=core.proc_identity(p.pid), gpus="0", task="t", why="no watcher",
-                   signalled=int(time.time()), requesters=[dict(frm="carol-req", msg="m1")])
-        legacy.save_pending({rec["entry"]: rec})
-        other = subprocess.Popen(["sleep", "300"], start_new_session=True)   # another user's work would show here
-        self.procs.append(other)
-        p.kill()
-        p.wait()
-        sent = []
-
-        class O:
-            def send(self, to, text, **kw):
-                sent.append(text)
-
-            def event(self, *a, **k):
-                pass
-        self.assertEqual(legacy.verify_pending(O()), [rec["entry"]])
-        self.assertIn("none of its processes remain on gpus 0", sent[0])
-        self.assertNotIn("are free", sent[0])
 
 
 # ------------------------------------------------------------------------------------------------ item 4 (P0-4)

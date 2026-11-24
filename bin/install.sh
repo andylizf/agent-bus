@@ -1,26 +1,25 @@
 #!/bin/bash
 # Install `bus` for yourself from this checkout, pinned to a v2 board. Run as yourself; rerun to update.
-#   bin/install.sh --board <v2-board-dir> [--legacy-board <old-board-dir>] [--no-timer]
+#   bin/install.sh --board <board-dir> [--no-timer]
 # Copies this checkout's build to ~/.local/share/agent-bus/builds/<commit12>/ (chmod go-w), points ~/.local/bin/bus at
 # it, records the board's path, inode and filesystem id in ~/.config/agent-bus/board.conf, and writes the adopt timer
 # (bus-adopt.timer, every 30 s on the board's host only: home directories may be shared across nodes). Nothing runs
 # from the board itself. Then run the setup block in README.md (enable the timer, `bus doctor`).
 set -eu
 src=$(cd "$(dirname "$0")/.." && pwd)
-board=""; legacy=""; timer=1
+board=""; timer=1
 while [ $# -gt 0 ]; do
   case $1 in
     --board) board=$2; shift 2 ;;
-    --legacy-board) legacy=$2; shift 2 ;;
     --no-timer) timer=""; shift ;;
-    *) echo "usage: $0 --board <v2-board-dir> [--legacy-board <dir>] [--no-timer]"; exit 2 ;;
+    *) echo "usage: $0 --board <board-dir> [--no-timer]"; exit 2 ;;
   esac
 done
 [ -n "$board" ] || { echo "need --board <v2-board-dir>"; exit 2; }
 [ -f "$board/config" ] || { echo "$board is not a v2 board (no config); setup-board.sh creates one"; exit 2; }
 py=/usr/bin/python3
 [ -x "$py" ] || py=$(command -v python3)
-"$py" -IB "$src/bin/bus" _install --src "$src" --board "$board" ${legacy:+--legacy-board "$legacy"} >/dev/null
+"$py" -IB "$src/bin/bus" _install --src "$src" --board "$board" >/dev/null
 bin=${AGENT_BUS_BIN:-$HOME/.local/bin/bus}
 host=$(sed -n 's/^host=//p' "$board/config")
 here=$(hostname -s)
