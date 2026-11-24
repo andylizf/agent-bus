@@ -636,7 +636,6 @@ class Supervisor:
         self.adopt = adopt
         self.child = fallback_child      # fallback: (pid, pgid, pidfd) of the job the client forked
         self.lock = Locked(os.path.join(runs_dir(), f"{rid}.lock"))
-        self.cache = {}
         self.passes = 0
         self.enoent = 0
         self.hooks = None
@@ -845,9 +844,26 @@ class Supervisor:
             gone = self.group_state() == "gone"
             if not gone:
                 remains.append("process group still has processes")
-        gpus = s.get("held_gpus") or s["gpus"]       # after a partial release only the held GPUs are checked
-        clear, mine, other, err = gpu_release_check(self.rid, gpus, set(s.get("reconciled", [])))
+        gpus = s["gpus"]            # every one of the run's original GPUs, a partially released one included
+        confirmed = set(s.get("reconciled", []))
+        clear, mine, other, err = gpu_release_check(self.rid, gpus, confirmed)
         held = dict(getattr(gpu_release_check, "held", {}) or {}) if mine else {}
+        unres = s.setdefault("unresolved", {})
+        for pid in mine:                     # remembered by identity until it exits or the owner confirms it
+            ident = core.proc_identity(pid)
+            if ident and str(pid) not in unres:
+                unres[str(pid)] = ident
+        for k in list(unres):
+            if int(k) in confirmed or not core.identity_alive(unres[k]):
+                del unres[k]
+        alive_unres = sorted(int(k) for k in unres)
+        if alive_unres and not err:
+            clear = False                   # alive anywhere, on a GPU now or not: the run is not released
+            if not mine:
+                remains.append(f"unresolved processes of {core.USER} still alive: {','.join(map(str, alive_unres))}"
+                               f" (bus reconcile {self.rid})")
+                held = {g: [] for g in (s.get("held_gpus") or [])}
+            mine = sorted(set(mine) | set(alive_unres))
         if err:
             remains.append(err)
         elif mine:
@@ -855,7 +871,8 @@ class Supervisor:
                            f"{','.join(map(str, mine))} (bus reconcile {self.rid})")
         s["_other_on_gpus"] = other
         # everything of the job is gone and only processes nobody's records explain remain: the owner decides
-        s["_reconcile"] = dict(pids=mine, held=sorted(held), released=sorted(set(gpus) - set(held))) \
+        s["_reconcile"] = dict(pids=mine, held=sorted(held) or sorted(s.get("held_gpus") or gpus),
+                               released=sorted(set(gpus) - set(held or s.get("held_gpus") or gpus))) \
             if (gone and not err and mine) else None
         return gone and clear, remains
 
@@ -867,10 +884,11 @@ class Supervisor:
         if not rc:
             return
         newly = [g for g in rc["released"] if g not in (s.get("gpus_released") or [])]
-        if s["state"] != "needs-reconcile" or newly:
+        reheld = [g for g in rc["held"] if g in (s.get("gpus_released") or [])]
+        if s["state"] != "needs-reconcile" or newly or reheld or rc["held"] != s.get("held_gpus"):
             s["state"] = s["entry_state"] = "needs-reconcile"
             s["held_gpus"] = rc["held"]
-            s["gpus_released"] = sorted(set(s.get("gpus_released") or []) | set(rc["released"]))
+            s["gpus_released"] = rc["released"]     # a GPU an unresolved process moved onto is held again
             notice(self.rid, s, self.hooks, "needs-reconcile", pids=rc["pids"], gpus_held=rc["held"],
                    gpus_released=s["gpus_released"],
                    action=f"stop them, or confirm they are not this run's: bus reconcile {self.rid} --confirm <pid>")
@@ -1057,6 +1075,7 @@ class Supervisor:
                 s["arrival_recorded"] = False       # a new revision of the booking needs its own arrival
             if (with_board and own and s["class"] == "scheduled" and own["user"] == core.USER
                     and own.get("state") == "standing" and not s.get("arrival_recorded")
+                    and set(s["gpus"]) <= set(own["gpus"]) and s.get("booking_revision") == own["revision"]
                     and s["state"] in ("running", "waiting-handoff")
                     and max(own["start"], own["objection_close"]) <= t <= own.get("lapse_at", t)):
                 s["arrival_recorded"] = bk.record_arrival(board, own["id"], own["revision"], self.rid, s["run"], t)
@@ -1070,7 +1089,9 @@ class Supervisor:
             # handoff: an exclusive scheduled run waits for the booked GPUs to be free of everyone
             if s["state"] == "waiting-handoff":
                 known = main_unit_state(s["units"]["main"])      # the unit's real state comes first
-                booking_over = own is None or t >= own.get("end", 0)
+                # the booking is over only on evidence: a readable board showing it gone or past its end. An
+                # unreadable or replaced board defers every decision; absence of evidence stops nothing
+                booking_over = with_board and (own is None or t >= own.get("end", 0))
                 if known == "exists":
                     # started by a supervisor that died before saving it: the job runs, so it is finished as a
                     # handoff and, if its booking is gone, stopped through the verified release, never just ended
@@ -1081,6 +1102,8 @@ class Supervisor:
                 elif known == "absent" and booking_over:
                     s["end_reason"] = "the booking ended before the GPUs were handed over"
                     return self.finish(board if with_board else _NoBoard(), released=False)
+                elif known == "absent" and not with_board:
+                    s["handoff_waits"] = ["board unreadable or its identity changed: waiting"]
                 elif known == "absent":
                     # a first start, or one a crash interrupted: either way the GPUs are checked again first
                     waits = handoff_waits(board, entries, s) if with_board else ["board identity changed"]
@@ -1156,21 +1179,9 @@ class Supervisor:
                 board.close()
 
     def board_rows(self, board, t, entries, msgs):
-        """Booking states for this pass. Before a stop, a yield, a start or a protection decision (a new request, a
-        possible yield, a handoff, a scheduled run's protection) every receipt is read and hashed again, with no cache,
-        and that read replaces the cache; the cache serves routine passes only."""
-        s = self.s
-        sticky = set(s.get("lapsed", []))
-        rows = bk.evaluate(board, t, entries=entries, sticky_lapsed=sticky, cache=self.cache)
-        consequential = (s["state"] == "waiting-handoff" or s["class"] == "scheduled"
-                         or any(m["kind"] == "request" and m["request_id"] not in s["requests"] for m in msgs)
-                         or bk.standing_active_on(rows, s.get("held_gpus") or s["gpus"], t, exclude=s.get("booking"))
-                         or self.passes % 12 == 0)
-        if consequential:
-            fresh = {}
-            rows = bk.evaluate(board, t, entries=entries, sticky_lapsed=sticky, cache=fresh)
-            self.cache = fresh
-        return rows
+        """Booking states for this pass, from every receipt read and hashed now. Each pass decides whether the run
+        continues (a backfill run yields to a standing booking it must see), so no pass trusts a cache."""
+        return bk.evaluate(board, t, entries=entries, sticky_lapsed=set(self.s.get("lapsed", [])), cache=None)
 
     def sample(self):
         """Every SAMPLE_EVERY passes: the GPUs' utilization, kept privately; under 5% for 30 min marks idle backfill."""

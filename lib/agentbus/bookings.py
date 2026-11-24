@@ -267,7 +267,7 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
                 r.update(state="lapsed", why="no run of its owner on it within the no-show limit")
             elif t >= lapse_at and entries is not None and not any(
                     e.get("booking") == r["id"] and e["user"] == r["user"] and e["state"] in ("running", "waiting-handoff")
-                    and e.get("booking_revision") in revs
+                    and e.get("booking_revision") in revs and set(e.get("gpus") or []) <= set(r["gpus"])
                     and e.get("occupancy") == "live" and e["started"] <= lapse_at for e in entries) and not any(
                     x["user"] == r["user"] and x["revision"] in [r["revision"]] + (r.get("lineage") or [])
                     and max(r["start"], r["objection_close"]) - lim["lapse_s"] <= x["arrived"] <= lapse_at

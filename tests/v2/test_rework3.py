@@ -105,8 +105,6 @@ class ConsequentialReads(BusTest):
             core.RACY_NS = 5 * 10 ** 9
         row = next(r for r in rows if r["id"] == bid)
         self.assertEqual(row["state"], "standing", (row, time.time()))
-        self.assertNotEqual(sup.cache, stale)                              # the stale entry is gone
-        self.assertTrue(all(v["revision"] != "0" * 64 for v in sup.cache.values()))
         self.assertLess(time.time_ns() - old_ns, 30 * 10 ** 9)
 
 
