@@ -90,6 +90,7 @@ def cmd_book(a):
 
 
 def cmd_unbook(a):
+    core.component(a.id, "booking id")
     with board() as b:
         bk.unbook(b, a.id)
     print(f"removed booking {a.id}")
@@ -111,7 +112,7 @@ def cmd_object(a):
 # ------------------------------------------------------------------------------------------------ messages
 
 def own_mailbox(b, name="mail"):
-    box = f"{core.USER}-{name}"
+    box = core.component(f"{core.USER}-{name}", "mailbox")
     fd = core.mkdir_own(b.wdir("inbox"), box, 0o3775)
     if fd is None:
         raise Refused(f"inbox/{box} exists and is not yours")
@@ -136,6 +137,7 @@ def cmd_send(a):
         reply_to = a.reply_to or own_mailbox(b)
         if b.inbox_owner(reply_to) != core.USER:
             raise Refused(f"--reply-to {reply_to} is not a mailbox of yours (`bus mailbox <name>`)")
+        core.component(a.to, "recipient")
         fd = b.dir("inbox", a.to)
         if fd is None:
             raise Refused(f"no inbox {a.to} on the board")
@@ -185,6 +187,7 @@ def fmt_msg(m):
 
 def cmd_watch(a):
     """Print new messages to an entry or mailbox, and the run's notices; writes nothing on the board."""
+    core.component(a.id)
     wdir = core.private_dir("watch")
     lk = runner.Locked(os.path.join(wdir, f"{a.id}.lock"))
     if not lk.acquire():
@@ -402,6 +405,20 @@ def cmd_upgrade(a):
     print(f"installed {res['installed']} (was {before}); {len(live)} supervisor(s) exec it at their next pass")
 
 
+def cmd_setup_board(a):
+    from . import setup
+    readme = open(a.readme, "rb").read() if a.readme else None
+    if a.add_blocks is not None:
+        r = setup.setup_board(a.board, add_blocks=a.add_blocks, group=a.group)
+        print(f"seq blocks now {r['blocks']}")
+        return
+    if not a.target:
+        raise Refused("usage: setup-board.sh <board-dir> <gpu-host> [--group G] [--gpus N] [--blocks N]")
+    r = setup.setup_board(a.board, host=a.target, group=a.group, gpus=a.gpus, blocks=a.blocks, readme=readme)
+    print(f"v2 board ready at {r['root']} for host {a.target} ({a.blocks} receipt blocks)")
+    print(f"each member: install bus privately (bin/install.sh --board {r['root']}) and run `bus doctor`")
+
+
 def cmd_install(a):
     """`bus _install --board DIR [--legacy-board DIR] [--host H]` (install.sh calls it): copy the build, flip the
     entry point, pin the board(s) by inode and filesystem id in ~/.config/agent-bus/board.conf."""
@@ -569,6 +586,14 @@ def parser():
     s = p("upgrade", cmd_upgrade, "install a build and flip ~/.local/bin/bus; supervisors exec it")
     s.add_argument("--build", required=True)
     s.add_argument("--json", action="store_true")
+    s = p("_setup-board", cmd_setup_board)
+    s.add_argument("board")
+    s.add_argument("target", nargs="?", default=None)
+    s.add_argument("--add-blocks", type=int)
+    s.add_argument("--group")
+    s.add_argument("--gpus", type=int, default=8)
+    s.add_argument("--blocks", type=int, default=1000)
+    s.add_argument("--readme")
     s = p("_install", cmd_install)
     s.add_argument("--src", required=True)
     s.add_argument("--board", required=True)

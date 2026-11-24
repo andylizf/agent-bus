@@ -25,6 +25,20 @@ SYSTEMD = have_systemd()
 LINUX = sys.platform.startswith("linux")
 
 
+def default_root():
+    """Where test boards go without AGENT_BUS_TEST_ROOT: the temp directory, unless it is mounted noexec (Docker's
+    --tmpfs /tmp is), where the fake nvidia-smi could not run; then a directory under the home."""
+    tmp = tempfile.gettempdir()
+    try:
+        if os.statvfs(tmp).f_flag & getattr(os, "ST_NOEXEC", 8):
+            d = os.path.expanduser("~/.cache/agent-bus-tests")
+            os.makedirs(d, exist_ok=True)
+            return d
+    except OSError:
+        pass
+    return None
+
+
 def need_systemd(cls):
     if not SYSTEMD and not os.environ.get("AGENT_BUS_TEST_REQUIRE_SYSTEMD"):
         return unittest.skip("no systemd user manager here")(cls)
@@ -57,7 +71,7 @@ class BusTest(unittest.TestCase):
     pass_s = 0.5
 
     def setUp(self):
-        base = os.environ.get("AGENT_BUS_TEST_ROOT")
+        base = os.environ.get("AGENT_BUS_TEST_ROOT") or default_root()
         if base:
             os.makedirs(base, exist_ok=True)
             self.tmp = Path(tempfile.mkdtemp(prefix="t-", dir=base)).resolve()
@@ -177,12 +191,16 @@ class BusTest(unittest.TestCase):
 class FakeBoard:
     """Stands in for core.Board in pure booking-state tests: records given directly, no filesystem."""
 
-    def __init__(self, bookings=(), objections=(), receipts=None, **limits):
+    def __init__(self, bookings=(), objections=(), receipts=None, arrivals=(), **limits):
         from agentbus import core
         self.limits = dict(core.DEFAULT_LIMITS, **limits)
         self.ngpus = self.limits["gpus"]
         self._b, self._o = list(bookings), list(objections)
         self._r = receipts or {}
+        self._a = list(arrivals)
+
+    def arrivals(self):
+        return list(self._a)
 
     def bookings_raw(self):
         return [dict(b) for b in self._b]

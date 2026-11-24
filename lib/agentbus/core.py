@@ -264,17 +264,25 @@ def replace(dirfd, name, data, mode=0o644):
 
 
 def touch(dirfd, name, mode=0o644):
-    """Touch one's own file through an O_NOFOLLOW descriptor. False when the file there is not ours or not regular."""
+    """Touch one's own file through an O_NOFOLLOW descriptor; the mode is set only on a file this call creates. False
+    when the file there is not ours or not regular."""
+    flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    created = False
     try:
-        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
-                     mode, dir_fd=dirfd)
+        fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dirfd)
+        created = True
+    except FileExistsError:
+        try:
+            fd = os.open(name, flags, dir_fd=dirfd)
+        except OSError:
+            return False
     except OSError:
         return False
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != UID:
             return False
-        if stat.S_IMODE(st.st_mode) != mode:
+        if created:
             os.fchmod(fd, mode)
         os.utime(fd)
         return True
@@ -325,7 +333,7 @@ def mkdir_own(dirfd, name, mode):
     if st.st_uid != UID:
         os.close(fd)
         return None
-    if created or stat.S_IMODE(st.st_mode) != mode:
+    if created:                        # an existing directory keeps its mode: nothing is chmodded after creation
         os.fchmod(fd, mode)
     return fd
 
@@ -416,6 +424,13 @@ def is_int(v):
     return type(v) is int
 
 
+def component(v, what="id"):
+    """A single, safe path component: refuses empty, '.', '..', separators, NUL and anything outside STAMP_ID."""
+    if not isinstance(v, str) or v in (".", "..") or "/" in v or "\0" in v or STAMP_ID.fullmatch(v) is None:
+        raise Refused(f"bad {what} {v!r}: one name of letters, digits, '.', '_' or '-'")
+    return v
+
+
 def owned_id(v, user):
     return isinstance(v, str) and STAMP_ID.fullmatch(v) is not None and v.startswith(user + "-") and len(v) > len(user) + 1
 
@@ -452,6 +467,11 @@ def check_objection(o):
             and isinstance(o.get("booking_revision"), str) and HEX64.fullmatch(o["booking_revision"]) is not None
             and isinstance(o.get("reason"), str) and 1 <= len(o["reason"].strip()) and len(o["reason"]) <= REASON_MAX
             and is_int(o.get("created")))
+
+
+def check_arrival(x):
+    return (isinstance(x.get("user"), str) and owned_id(x.get("id"), x["user"]) and isinstance(x.get("entry"), str)
+            and owned_id(x["entry"], x["user"]) and is_int(x.get("arrived")) and x.get("schema") == SCHEMA)
 
 
 def check_receipt(r):
@@ -622,9 +642,13 @@ class Board:
     def objections(self):
         return self.records("objections", check_objection)
 
+    def arrivals(self):
+        return self.records("arrivals", check_arrival)
+
     def receipts(self, cache=None):
         """{slot: receipt} from seq/<k>/<n>, only in blocks owned by the board's creator. `cache` (a dict) keeps
-        parsed receipts by (slot, inode) across passes of one process."""
+        parsed receipts across passes of one process, keyed by slot, inode, ctime and size, so a receipt rewritten in
+        place is read again (and its new content then differs from what slots-seen recorded for it)."""
         seq = self.dir("seq")
         if seq is None:
             return {}
@@ -639,7 +663,15 @@ class Board:
             n = 0
             dup = os.dup(bfd)
             with os.scandir(dup) as it:
-                ents = [(e.name, e.inode()) for e in it if not e.name.startswith(".")]
+                ents = []
+                for e in it:
+                    if e.name.startswith("."):
+                        continue
+                    try:   # ctime moves on any write or chmod and cannot be set back by its owner
+                        st = e.stat(follow_symlinks=False)
+                        ents.append((e.name, (e.inode(), st.st_ctime_ns, st.st_size)))
+                    except OSError:
+                        continue
             try:
                 os.close(dup)
             except OSError:

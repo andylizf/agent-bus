@@ -142,6 +142,8 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
                 got.append(dict(id=o["id"], user=o["user"], reason=o["reason"], slot=o["_slot"]))
         return got
 
+    revoked = set()   # bookings whose predecessor turned out not to have been standing: no inheritance
+
     def base(b, rev, depth=0):
         """Receipt facts of one revision: slot, receipt time, close, order slot, objections, inherited."""
         slot, repl = receipt_of("booking", b["id"], rev)
@@ -151,7 +153,7 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
         info = dict(slot=slot, order=slot, receipt_time=rt, objection_close=rt + b["objection_s"], replaced=repl,
                     inherited=False)
         prev = b.get("previous")
-        if isinstance(prev, str) and depth < CHAIN_MAX:
+        if isinstance(prev, str) and depth < CHAIN_MAX and not (depth == 0 and b["id"] in revoked):
             try:
                 pb = json.loads(prev)
             except ValueError:
@@ -163,60 +165,93 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
                 if (pi and pi["slot"] < slot and not pi["replaced"] and pi["objection_close"] <= rt
                         and not objections_for(pb, prev_rev, pi["objection_close"]) and narrows(b, pb)):
                     info.update(order=pi["order"], objection_close=pi["objection_close"], inherited=True,
-                                inherits=prev_rev)
+                                inherits=prev_rev, pred=pb, pred_info=pi)
         return info
 
-    rows = []
-    for b in board.bookings_raw():
-        rev = b["_sha"]
-        info = base(b, rev)
-        row = dict(core.clean(b), revision=rev)
-        row.pop("previous", None)
-        if info is None:
-            row.update(state="unpublished", why="no receipt names this revision", slot=None, order=None)
-            rows.append(row)
-            continue
-        row.update(slot=info["slot"], order=info["order"], receipt_time=info["receipt_time"],
-                   objection_close=info["objection_close"], inherited=info["inherited"])
-        if info["replaced"]:
-            row.update(state="invalid", why=f"receipt slot {info['slot']} was replaced since this reader saw it")
-        elif b["end"] <= b["start"]:
-            row.update(state="invalid", why="ends before it starts")
-        elif b["end"] - b["start"] > lim["max_len_s"]:
-            row.update(state="invalid", why=f"longer than {lim['max_len_s'] // 3600} h")
-        elif b["start"] > info["receipt_time"] + lim["horizon_s"]:
-            row.update(state="invalid", why=f"starts more than {lim['horizon_s'] // 86400} days after its receipt")
-        elif b["objection_s"] < lim["min_objection_s"]:
-            row.update(state="invalid", why=f"objection window under {lim['min_objection_s'] // 60} min")
-        rows.append(row)
+    def invalid_why(b, receipt_time):
+        if b["end"] <= b["start"]:
+            return "ends before it starts"
+        if b["end"] - b["start"] > lim["max_len_s"]:
+            return f"longer than {lim['max_len_s'] // 3600} h"
+        if b["start"] > receipt_time + lim["horizon_s"]:
+            return f"starts more than {lim['horizon_s'] // 86400} days after its receipt"
+        if b["objection_s"] < lim["min_objection_s"]:
+            return f"objection window under {lim['min_objection_s'] // 60} min"
+        return None
 
-    # receipt order: conflicts and the budget are decided earliest first
-    live = sorted([r for r in rows if "state" not in r], key=lambda r: (r["order"], r["slot"]))
-    counted = {}      # user -> bookings counted against the budget
-    blockers = []     # earlier bookings that make later overlapping ones conflicting
-    for r in live:
-        r["objections"] = [] if r.get("inherited") else objections_for(r, r["revision"], r["objection_close"])
-        if r.get("inherited"):  # inherited objections never count: the narrowed revision was standing
-            r["objections"] = []
-        conflict = next((o for o in blockers if o["user"] != r["user"] and overlap(o, r)), None)
-        if conflict:
-            r.update(state="conflicting", why=f"overlaps {conflict['id']} ({conflict['user']}), received earlier")
+    def compute():
+        rows = []
+        for b in board.bookings_raw():
+            rev = b["_sha"]
+            info = base(b, rev)
+            row = dict(core.clean(b), revision=rev)
+            row.pop("previous", None)
+            if info is None:
+                row.update(state="unpublished", why="no receipt names this revision", slot=None, order=None)
+                rows.append(row)
+                continue
+            row.update(slot=info["slot"], order=info["order"], receipt_time=info["receipt_time"],
+                       objection_close=info["objection_close"], inherited=info["inherited"],
+                       _pred=info.get("pred"), _pred_info=info.get("pred_info"))
+            if info["replaced"]:
+                row.update(state="invalid", why=f"receipt slot {info['slot']} was replaced since this reader saw it")
+            elif invalid_why(b, info["receipt_time"]):
+                row.update(state="invalid", why=invalid_why(b, info["receipt_time"]))
+            rows.append(row)
+
+        # receipt order: conflicts and the budget are decided earliest first
+        live = sorted([r for r in rows if "state" not in r], key=lambda r: (r["order"], r["slot"]))
+        counted = {}      # user -> bookings counted against the budget
+        blockers = []     # earlier bookings that make later overlapping ones conflicting
+        for r in live:
+            r["objections"] = [] if r.get("inherited") else objections_for(r, r["revision"], r["objection_close"])
+            if r.get("inherited"):  # inherited objections never count: the narrowed revision was standing
+                r["objections"] = []
+            conflict = next((o for o in blockers if o["user"] != r["user"] and overlap(o, r)), None)
+            if conflict:
+                r.update(state="conflicting", why=f"overlaps {conflict['id']} ({conflict['user']}), received earlier")
+                blockers.append(r)
+                continue
+            if r["objections"]:
+                o = r["objections"][0]
+                r.update(state="objected", why=f"objection by {o['user']}: {o['reason']}")
+                continue
+            mine = counted.setdefault(r["user"], [])
+            if over_budget(mine, r, lim):
+                r.update(state="over-budget", why=f"over {lim['budget_gpu_h']:g} GPU-h in a 7-day span")
+                continue
+            mine.append(r)
             blockers.append(r)
-            continue
-        if r["objections"]:
-            o = r["objections"][0]
-            r.update(state="objected", why=f"objection by {o['user']}: {o['reason']}")
-            continue
-        mine = counted.setdefault(r["user"], [])
-        if over_budget(mine, r, lim):
-            r.update(state="over-budget", why=f"over {lim['budget_gpu_h']:g} GPU-h in a 7-day span")
-            continue
-        mine.append(r)
-        blockers.append(r)
-        if t < r["objection_close"]:
-            r.update(state="pending", why="objection window open")
-        else:
-            r.update(state="standing", why="")
+            if t < r["objection_close"]:
+                r.update(state="pending", why="objection window open")
+            else:
+                r.update(state="standing", why="")
+        return rows
+
+    def predecessor_standing(r, rows):
+        """A narrowing revision inherits only from a predecessor that was standing in full: valid under the limits,
+        not objected (checked in base), not conflicting with another user's earlier booking, within the budget."""
+        pb, pi = r["_pred"], r["_pred_info"]
+        if invalid_why(pb, pi["receipt_time"]):
+            return False
+        for o in rows:
+            if (o["id"] != r["id"] and o["user"] != r["user"] and o.get("order") is not None
+                    and o["order"] < pi["order"] and o.get("state") in ("standing", "pending", "lapsed", "conflicting")
+                    and overlap(o, pb)):
+                return False
+        mine = [o for o in rows if o["user"] == r["user"] and o["id"] != r["id"]
+                and o.get("state") in ("standing", "pending", "lapsed")]
+        return not over_budget(mine, pb, lim)
+
+    for _ in range(CHAIN_MAX + 2):
+        rows = compute()
+        bad = [r["id"] for r in rows if r.get("inherited") and not predecessor_standing(r, rows)]
+        if not bad:
+            break
+        revoked.update(bad)
+    arrived = {}
+    for x in (board.arrivals() if hasattr(board, "arrivals") else []):
+        arrived.setdefault(x["id"], []).append(x)
     for r in rows:
         r.setdefault("objections", [])
         if r.get("state") == "standing":
@@ -225,10 +260,14 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
                 r.update(state="lapsed", why="no run of its owner on it within the no-show limit")
             elif t >= lapse_at and entries is not None and not any(
                     e.get("booking") == r["id"] and e["user"] == r["user"] and e["state"] in ("running", "waiting-handoff")
-                    and e.get("occupancy") == "live" and e["started"] <= lapse_at for e in entries):
+                    and e.get("occupancy") == "live" and e["started"] <= lapse_at for e in entries) and not any(
+                    x["user"] == r["user"] and x["arrived"] <= lapse_at for x in arrived.get(r["id"], [])):
                 r.update(state="lapsed", why=f"no run of its owner on it by {time.strftime('%H:%M', time.localtime(lapse_at))}")
             r["lapse_at"] = lapse_at
         r["active"] = r.get("state") == "standing" and max(r["start"], r["objection_close"]) <= t < r["end"]
+    for r in rows:
+        r.pop("_pred", None)
+        r.pop("_pred_info", None)
     return sorted(rows, key=lambda r: (r.get("order") or 1 << 60, r["id"]))
 
 
@@ -301,6 +340,7 @@ def publish_booking(board, gpus, start, end, objection_s=None, kind="other", not
     fd = board.wdir("bookings")
     previous = None
     if revise:
+        core.component(revise, "booking id")
         r = core.read_file(fd, f"{revise}.json")
         if r is None or r[1].st_uid != core.UID:
             raise Refused(f"no booking {revise} of yours")
@@ -350,8 +390,24 @@ def publish_booking(board, gpus, start, end, objection_s=None, kind="other", not
                 overlaps=[dict(id=o["id"], user=o["user"], state=o["state"]) for o in others])
 
 
+def record_arrival(board, booking_id, entry_id, run, t=None):
+    """The owner's persisted fact that a run of theirs was on the booking by its no-show limit, so a reader after the
+    run ended does not read the booking as lapsed. One file per booking (arrivals/<booking-id>.json), published once."""
+    board.writable()
+    fd = board.dir("arrivals")
+    if fd is None:
+        return False
+    rec = dict(id=booking_id, user=core.USER, entry=entry_id, run=run, arrived=int(t or now()), schema=core.SCHEMA)
+    try:
+        core.publish(fd, f"{core.component(booking_id, 'booking id')}.json", dumps(rec))
+    except FileExistsError:
+        pass
+    return True
+
+
 def publish_objection(board, booking_id, reason):
     board.writable()
+    core.component(booking_id, "booking id")
     reason = " ".join(str(reason or "").split())
     if not reason:
         raise Refused("an objection needs a reason (--reason)")
@@ -377,6 +433,7 @@ def publish_objection(board, booking_id, reason):
 
 def withdraw_objection(board, oid):
     board.writable()
+    core.component(oid, "objection id")
     fd = board.wdir("objections")
     if not core.unlink_own(fd, f"{oid}.json"):
         raise Refused(f"no objection {oid} of yours")
@@ -388,6 +445,7 @@ def withdraw_objection(board, oid):
 
 def unbook(board, bid):
     board.writable()
+    core.component(bid, "booking id")
     if not core.unlink_own(board.wdir("bookings"), f"{bid}.json"):
         raise Refused(f"no booking {bid} of yours")
     board.log("unbook", booking=bid)

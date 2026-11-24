@@ -132,6 +132,7 @@ class Old:
         return "expired" if isinstance(u, (int, float)) and u < now() else "live"
 
     def msgs(self, aid):
+        check_id(aid)
         out = []
         for box in (aid, "all"):
             fd = self.dir("inbox", box)
@@ -184,6 +185,7 @@ class Old:
 
     def own_entry(self, aid):
         """(entry, fd of agents/) when agents/<aid>.json is ours, else Refused."""
+        check_id(aid)
         fd = self.wdir("agents")
         r = core.read_json(fd, f"{aid}.json")
         if r is None:
@@ -193,6 +195,7 @@ class Old:
         return r[0], fd
 
     def write_entry(self, aid, a):
+        check_id(aid)
         fd = self.wdir("agents")
         try:
             st = os.stat(f"{aid}.json", dir_fd=fd, follow_symlinks=False)
@@ -203,12 +206,14 @@ class Old:
         core.replace(fd, f"{aid}.json", json.dumps(a, indent=1, ensure_ascii=False).encode(), mode=0o644)
 
     def beat(self, aid):
+        check_id(aid)
         fd = self.wdir("agents", ".heartbeat")
         if not core.touch(fd, aid):
             raise Refused(f"heartbeat {aid} on the old board is not a regular file of ours; not touched")
 
     def inbox_dir(self, box):
         """The inbox directory, created (mode 2775, once) when it does not exist yet; never chmodded afterwards."""
+        check_id(box, "inbox")
         ifd = self.wdir("inbox")
         fd = core.sub(ifd, box)
         if fd is None:
@@ -228,8 +233,7 @@ class Old:
         return fd
 
     def send(self, to, text, sender=None, kind="msg", reply_to=None, gpus=None, minutes=None):
-        if not LEGACY_ID.fullmatch(to):
-            raise Refused(f"bad recipient {to!r}")
+        check_id(to, "recipient")
         if kind != "reply" and to != "all" and self.read("agents", f"{to}.json") is None and self.dir("inbox", to) is None:
             raise Refused(f"no agent or inbox {to} on the old board")
         mid = f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
@@ -260,14 +264,23 @@ class Old:
         return True
 
 
+def check_id(aid, what="entry id"):
+    """An old-board id names exactly one path component."""
+    if not isinstance(aid, str) or aid in (".", "..") or not LEGACY_ID.fullmatch(aid):
+        raise Refused(f"bad {what} {aid!r}")
+    return aid
+
+
 def ident_path(aid):
+    check_id(aid)
     return os.path.join(core.private_dir("legacy"), f"{aid}.json")
 
 
 # ------------------------------------------------------------------------------------------------ commands
 
 def up(o, aid, gpus, task, hours, pid, on_request="agent", exclusive=False, human=None, session=None, host=None):
-    if not LEGACY_ID.fullmatch(aid) or not aid.startswith(core.USER + "-"):
+    check_id(aid)
+    if not aid.startswith(core.USER + "-"):
         raise Refused(f"entry ids start with {core.USER}-")
     old = {}
     r = o.read("agents", f"{aid}.json")
@@ -358,6 +371,92 @@ def signal_by_record(aid, sig=signal.SIGTERM):
         os.close(fd)
 
 
+PENDING_TELL_S = 600   # a stop still unverified this long gets one "stopping, not yet free" reply
+
+
+def load_pending():
+    return core.read_private(os.path.join(core.private_dir("legacy"), "pending.json")) or {}
+
+
+def save_pending(p):
+    core.write_private(os.path.join(core.private_dir("legacy"), "pending.json"), p)
+
+
+def legacy_release_check(rec):
+    """(released, remains) for a stopped old-board task: the recorded process is gone, and nvidia-smi answers and shows
+    no process of this user on the entry's GPUs other than those of a live v2 run's slice or of another recorded
+    old-board process tree. A failed query is not released."""
+    from . import runner
+    remains = []
+    if core.identity_alive(rec.get("ident")):
+        remains.append(f"pid {rec['ident']['pid']} still running")
+    try:
+        gpus = [int(g) for g in rec.get("gpus", "").split(",") if g.strip().isdigit()]
+    except ValueError:
+        gpus = []
+    if not gpus:
+        remains.append("the entry names no GPU indices to check")
+        return False, remains
+    others = []   # this user's other live recorded old-board processes and v2 slices
+    d = core.private_dir("legacy")
+    for n in os.listdir(d):
+        if n.endswith(".json") and n not in ("pending.json", "noted.json") and n[:-5] != rec["entry"]:
+            r = core.read_private(os.path.join(d, n))
+            if r and core.identity_alive(r):
+                others.append(r["pid"])
+    slices = [st.get("units", {}).get("cgroup_path") for st in
+              (core.read_private(runner.state_path(x["id"])) or {} for x in runner.cmd_runs()
+               if x.get("state") in runner.NONTERMINAL)]
+
+    def ours(pid):
+        if core.proc_uid(pid) != core.UID:
+            return False
+        cg = core.proc_cgroup(pid) or ""
+        if any(c and runner.in_tree(cg, c) for c in slices):
+            return False
+        p, n = pid, 0
+        while p and p > 1 and n < 64:
+            if p in others:
+                return False
+            p, n = runner._ppid(p), n + 1
+        return True
+    clear, mine, other, err = runner.gpu_check(gpus, ours)
+    if err:
+        remains.append(err)
+    elif mine:
+        remains.append(f"processes of {core.USER} on GPUs {rec['gpus']}: {','.join(map(str, mine))}")
+    return not remains, remains
+
+
+def verify_pending(o):
+    """Reply to the requesters of each stopped task once its release is verified; once, after PENDING_TELL_S, that it
+    is stopping and not yet free."""
+    pend, done = load_pending(), []
+    for aid, rec in list(pend.items()):
+        ok, remains = legacy_release_check(rec)
+        if ok:
+            text = f"{rec['why']}; task '{rec['task']}' was stopped and gpus {rec['gpus']} on {core.HOST} are free"
+        elif now() - rec["signalled"] >= PENDING_TELL_S and not rec.get("told_stopping"):
+            text = f"{rec['why']}; stopping, not yet free: {'; '.join(remains)}"
+            rec["told_stopping"] = True
+        else:
+            rec["remains"] = remains
+            continue
+        for r in rec.get("requesters", []):
+            frm = r.get("frm")
+            if isinstance(frm, str) and LEGACY_ID.fullmatch(frm):
+                try:
+                    o.send(frm, text, sender=aid, kind="reply", reply_to=r["msg"])
+                except (OSError, Refused):
+                    pass
+        if ok:
+            o.event("released", agent=aid, gpus=rec["gpus"], by="sweep-own")
+            done.append(aid)
+            del pend[aid]
+    save_pending(pend)
+    return done
+
+
 def sweep_own(o, reply=False):
     """The repointed sweep (design 6.1 step 2): only this user's own old-board entries.
 
@@ -417,10 +516,15 @@ def sweep_own(o, reply=False):
                 report["advisory"].append(dict(entry=aid, msgs=new, why=why))
             continue
         ok, detail = signal_by_record(aid)
-        text = (f"{why}; task '{a.get('task')}' was stopped and gpus {a.get('gpus')} on {core.HOST} are free" if ok
-                else f"{why}; could not stop it: {detail}")
-        if reply:
-            for m in reqs:
+        if ok:   # the reply waits for a verified release (verify_pending, this sweep and the next ones)
+            pend = load_pending()
+            pend[aid] = dict(entry=aid, ident=core.read_private(ident_path(aid)), gpus=str(a.get("gpus") or ""),
+                             task=str(a.get("task", ""))[:80], why=why, signalled=now(), told_stopping=False,
+                             requesters=[dict(frm=m.get("from"), msg=m["id"]) for m in reqs if reply])
+            save_pending(pend)
+        else:
+            text = f"{why}; could not stop it: {detail}"
+            for m in reqs if reply else []:
                 frm = m.get("from")
                 if isinstance(frm, str) and LEGACY_ID.fullmatch(frm):
                     try:
@@ -431,7 +535,14 @@ def sweep_own(o, reply=False):
         a["sweep_noted"] = ids
         o.write_entry(aid, {k: v for k, v in a.items() if not k.startswith("_")})
         o.event("sweep", agent=aid, stopped=ok, why=why, policy=policy, pid=a.get("pid"), gpus=a.get("gpus"),
-                msgs=ids, replied=reply, text=text, by="sweep-own")
+                msgs=ids, replied=False, text=detail, by="sweep-own")
         report["stopped" if ok else "noted"].append(dict(entry=aid, detail=detail))
+    if report["stopped"]:     # a task that stops promptly is answered in this same sweep
+        end = time.monotonic() + 3
+        pend = load_pending()
+        while time.monotonic() < end and any(core.identity_alive(pend[x["entry"]].get("ident"))
+                                             for x in report["stopped"] if x["entry"] in pend):
+            time.sleep(0.1)
+    report["released"] = verify_pending(o)
     core.write_private(os.path.join(core.private_dir("legacy"), "noted.json"), noted)
     return report

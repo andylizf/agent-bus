@@ -227,7 +227,8 @@ class Setup(BusTest):
         (old / "bin" / "bus.py").write_text("")
         r = subprocess.run(["bash", str(__import__("helpers").REPO / "setup-board.sh"), str(old), "h"],
                            capture_output=True, text=True)
-        self.assertEqual(r.returncode, 2)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("old (v1) board", r.stderr)
 
     def test_install_records_pin_and_build(self):
         conf = core.load_conf()

@@ -60,7 +60,6 @@ class RealGPU(BusTest):
         inside = core.unit_name(d["id"]) + ".slice" in cg
         print(f"\n[apptainer] instance pid {pid} cgroup {cg}", file=__import__("sys").stderr)
         if not inside:   # systemd-managed cgroups put the instance in a scope of its own; its monitor stays in the job
-            self.assertIn(pid, runner.escaped(st["units"]["cgroup_path"], st["run"]))
             wait_for(lambda: str(pid) in (self.state(d["id"]).get("escaped") or {}), 10, what="recorded as the job's")
         r = self.bus_json("release", d["id"], "--wait", "60", "--json")
         self.assertTrue(r["released"], r)

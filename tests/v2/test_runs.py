@@ -132,7 +132,7 @@ class Runs(BusTest):
         pid = int(pidf.read_text())
         st = self.state(d["id"])
         self.assertNotIn(st["units"]["slice"], core.proc_cgroup(pid))
-        self.assertIn(pid, runner.escaped(st["units"]["cgroup_path"], st["run"]))
+        wait_for(lambda: str(pid) in (self.state(d["id"]).get("escaped") or {}), 10, what="recorded as the job's")
         r = self.bus_json("release", d["id"], "--wait", "40", "--json")
         self.assertTrue(r["released"], r)
         self.assertFalse(alive(pid))

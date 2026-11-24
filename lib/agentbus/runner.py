@@ -50,14 +50,17 @@ def runs_dir():
 
 
 def state_path(rid):
+    core.component(rid, "run id")
     return os.path.join(runs_dir(), f"{rid}.json")
 
 
 def job_path(rid):
+    core.component(rid, "run id")
     return os.path.join(runs_dir(), f"{rid}.job.json")
 
 
 def ctl_dir(rid):
+    core.component(rid, "run id")
     return core.private_dir("ctl", rid)
 
 
@@ -144,13 +147,18 @@ def sysctl(*args, timeout=20):
 
 
 def unit_props(unit, *props):
+    return unit_query(unit, *props)[1]
+
+
+def unit_query(unit, *props):
+    """(ok, {prop: value}): ok False when systemctl itself failed, so an answer is never read from a failed query."""
     rc, out, _ = sysctl("show", unit, *[f"-p{p}" for p in props])
     d = {}
     for line in out.splitlines():
         if "=" in line:
             k, v = line.split("=", 1)
             d[k] = v
-    return d
+    return rc == 0 and bool(d), d
 
 
 def user_manager_ok():
@@ -177,15 +185,36 @@ def passthrough_env():
 CG_ROOT = "/sys/fs/cgroup"
 
 
-def cgroup_of(unit):
-    cg = unit_props(unit, "ControlGroup").get("ControlGroup") or ""
-    return cg if cg.startswith("/") else None
+def cgroup_of(unit, tries=1):
+    for i in range(tries):
+        cg = unit_props(unit, "ControlGroup").get("ControlGroup") or ""
+        if cg.startswith("/"):
+            return cg
+        time.sleep(0.2 * (i + 1)) if i + 1 < tries else None
+    return None
+
+
+def recover_cgroup(slice_unit):
+    """The slice's cgroup path from systemd: its ControlGroup while active; when systemd positively reports it
+    inactive or unknown, the path a slice of that name has (where nothing can be any more). None when the query
+    fails: the caller then stays unverified rather than read the slice as gone."""
+    ok, p = unit_query(slice_unit, "ControlGroup", "ActiveState", "LoadState")
+    if not ok:
+        return None
+    if (p.get("ControlGroup") or "").startswith("/"):
+        return p["ControlGroup"]
+    if p.get("ActiveState") in ("inactive", "failed") or p.get("LoadState") == "not-found":
+        uid = core.UID
+        parent = slice_unit.split("-", 1)[0] + ".slice"
+        return f"/user.slice/user-{uid}.slice/user@{uid}.service/{parent}/{slice_unit}"
+    return None
 
 
 def slice_state(cg_rel):
-    """'gone' (ENOENT at the openat walk), 'empty' (cgroup.events populated 0) or 'populated'."""
+    """'gone' (ENOENT at the openat walk), 'empty' (cgroup.events populated 0), 'populated', or 'unknown' when no
+    path is known (never read as gone)."""
     if not cg_rel:
-        return "gone"
+        return "unknown"
     try:
         fd = core.walk(CG_ROOT + cg_rel)
     except FileNotFoundError:
@@ -273,26 +302,20 @@ def gpu_check(gpus, in_job):
     return not mine, sorted(set(mine)), sorted(set(other)), None
 
 
-def in_cgroup_fn(cg_rel, uid, gen=None):
-    """Whether a process is the job's: in the slice's cgroup or below; or ours with an unreadable cgroup; or ours,
-    outside the slice, carrying this run's generation in its environment (a launcher that moved itself into a scope
-    of its own, as Apptainer instances do where systemd manages cgroups)."""
+def in_cgroup_fn(cg_rel, uid):
+    """Whether a process is the job's by its cgroup: in the slice's cgroup or below, or ours with an unreadable cgroup
+    (another user's process cannot be in this user's slice). Processes that left the slice are the supervisor's
+    recorded escapes (Supervisor.track_escaped), not decided here."""
     def f(pid):
         cg = None if test_unreadable(pid) else core.proc_cgroup(pid)
         if cg is None:
             return core.proc_uid(pid) == uid or test_unreadable(pid)  # unreadable and ours: counts as the job's
-        if cg == cg_rel or cg.startswith(cg_rel.rstrip("/") + "/"):
-            return True
-        return gen is not None and core.proc_uid(pid) == uid and carries_run(pid, gen)
+        return in_tree(cg, cg_rel)
     return f
 
 
-def carries_run(pid, gen):
-    try:
-        with open(f"/proc/{int(pid)}/environ", "rb") as f:
-            return f"AGENT_BUS_RUN={gen}".encode() in f.read().split(b"\0")
-    except (OSError, ValueError):
-        return False
+def in_tree(cg, cg_rel):
+    return bool(cg_rel) and (cg == cg_rel or cg.startswith(cg_rel.rstrip("/") + "/"))
 
 
 def _ppid(pid):
@@ -306,18 +329,14 @@ def _ppid(pid):
     return None
 
 
-def escaped(cg_rel, gen, uid=None, recorded=None):
-    """{pid: unit} of this user's processes outside the slice that are the job's: a descendant of a process in the
-    slice (an Apptainer instance's init moves into a scope of its own while its monitor stays in the job), one carrying
-    the run's generation in its environment, or one recorded so on an earlier pass whose identity still matches.
-    `unit` is the systemd unit its cgroup belongs to (the last .scope or .service component of its path)."""
+def uid_procs(uid=None):
+    """{pid: cgroup path} of every process of this uid whose cgroup can be read."""
     uid = core.UID if uid is None else uid
-    out, procs = {}, {}
+    out = {}
     try:
         names = os.listdir("/proc")
     except OSError:
         return out
-    inside = lambda cg: bool(cg_rel) and (cg == cg_rel or cg.startswith(cg_rel.rstrip("/") + "/"))
     for n in names:
         if not n.isdigit():
             continue
@@ -328,45 +347,60 @@ def escaped(cg_rel, gen, uid=None, recorded=None):
             continue
         cg = core.proc_cgroup(n)
         if cg is not None:
-            procs[int(n)] = cg
+            out[int(n)] = cg
+    return out
+
+
+def unit_of(cg):
+    """The systemd unit a cgroup path belongs to (its last .scope or .service component), or None."""
+    return next((c for c in reversed((cg or "").split("/")) if c.endswith((".scope", ".service"))), None)
+
+
+def descendants_outside(cg_rel, known=(), procs=None):
+    """Processes of this user outside the slice whose parent chain, as /proc shows it now, reaches a process inside
+    the slice or one of `known` (pids already recorded as the job's). An Apptainer instance's init is one: systemd
+    moves it into a scope of its own while the monitor that started it is still in the job."""
+    procs = uid_procs() if procs is None else procs
+    known = set(known)
+    out = {}
     for pid, cg in procs.items():
-        if inside(cg):
+        if in_tree(cg, cg_rel) or pid in known:
             continue
-        job = carries_run(pid, gen)
-        p, seen = pid, 0
-        while not job and seen < 64:
+        p, n = pid, 0
+        while n < 64:
             p = _ppid(p)
             if not p or p <= 1:
                 break
-            if p in procs and inside(procs[p]):
-                job = True
-            seen += 1
-        if not job and recorded:
-            r = recorded.get(str(pid))
-            job = bool(r) and r.get("ticks") == core.proc_ticks(pid)
-        if job:
-            out[pid] = next((c for c in reversed(cg.split("/")) if c.endswith((".scope", ".service"))), None)
+            if (p in procs and in_tree(procs[p], cg_rel)) or p in known:
+                out[pid] = cg
+                break
+            n += 1
     return out
-    for n in names:
-        if not n.isdigit():
-            continue
-        try:
-            if os.stat(f"/proc/{n}").st_uid != uid:
-                continue
-        except OSError:
-            continue
-        cg = core.proc_cgroup(n)
-        if cg is None or (cg_rel and (cg == cg_rel or cg.startswith(cg_rel.rstrip("/") + "/"))):
-            continue
-        if carries_run(n, gen):
-            unit = next((c for c in reversed(cg.split("/")) if c.endswith((".scope", ".service"))), None)
-            out[int(n)] = unit
-    return out
+
+
+def pidfd_signal(rec, sig):
+    """Signal a recorded process through a pidfd, only while it is the recorded one. True when signalled."""
+    if not core.identity_alive(rec):
+        return False
+    try:
+        fd = os.pidfd_open(rec["pid"])
+    except (OSError, AttributeError):
+        return False
+    try:
+        if not core.identity_alive(rec):      # the pidfd pins the process now: check it is still the recorded one
+            return False
+        signal.pidfd_send_signal(fd, sig)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
 
 
 # ------------------------------------------------------------------------------------------------ admission
 
 def admit_paths(rid):
+    core.component(rid, "run id")
     d = runs_dir()
     return os.path.join(d, f"{rid}.admit.json"), os.path.join(d, f"{rid}.admit.lock")
 
@@ -625,10 +659,30 @@ class Supervisor:
         s["state"] = "stopping"
         notice(self.rid, s, self.hooks, "release-started", reason=reason)
 
+    def track_escaped(self):
+        """Record, with their identity, the job's processes that left the slice (design 3.3 assumed none could): a
+        process outside the slice whose parent chain reaches the slice or an already recorded escape. Only these
+        records make a process outside the slice the job's; records whose process is gone are dropped."""
+        s = self.s
+        cg = s["units"].get("cgroup_path")
+        if s["mode"] != "systemd" or not cg:
+            return {}
+        rec = {k: v for k, v in (s.get("escaped") or {}).items() if core.identity_alive(v)}
+        procs = uid_procs()
+        for pid, pcg in descendants_outside(cg, [int(k) for k in rec], procs).items():
+            ident = core.proc_identity(pid)
+            if ident:
+                rec[str(pid)] = dict(ident, unit=unit_of(pcg), cgroup=pcg, seen=now())
+        s["escaped"] = rec
+        return rec
+
+    def escaped_live(self):
+        return {int(k): v for k, v in (self.s.get("escaped") or {}).items() if core.identity_alive(v)}
+
     def in_job(self):
         if self.s["mode"] == "systemd":
-            base = in_cgroup_fn(self.s["units"]["cgroup_path"], core.UID, self.s["run"])
-            esc = set(escaped(self.s["units"]["cgroup_path"], self.s["run"], recorded=self.s.get("escaped")))
+            base = in_cgroup_fn(self.s["units"]["cgroup_path"], core.UID)
+            esc = set(self.escaped_live())
             return lambda pid: pid in esc or base(pid)
         others = other_run_groups(self.rid)
         confirmed = set(self.s.get("reconciled", []))
@@ -646,20 +700,29 @@ class Supervisor:
         s = self.s
         if s["mode"] == "systemd":
             sysctl("kill", f"--signal={sig}", s["units"]["slice"])
-            for pid, unit in escaped(s["units"]["cgroup_path"], s["run"], recorded=s.get("escaped")).items():
-                # the job's processes that moved into a unit of their own: that unit, or the process itself
-                if unit and unit not in (s["units"]["main"], s["units"].get("sup")) and "-sup" not in unit:
-                    sysctl("kill", f"--signal={sig}", unit)
-                else:
-                    try:
-                        os.kill(pid, getattr(signal, f"SIG{sig}"))
-                    except OSError:
-                        pass
+            esc = self.escaped_live()
+            killed_units = set()
+            for pid, rec in esc.items():
+                unit = rec.get("unit")
+                if unit and unit not in killed_units and self.unit_exclusive(rec.get("cgroup"), esc):
+                    sysctl("kill", f"--signal={sig}", unit)   # every process in that unit is a recorded job process
+                    killed_units.add(unit)
+            for pid, rec in esc.items():
+                pidfd_signal(rec, getattr(signal, f"SIG{sig}"))
         else:
             try:
                 os.killpg(self.child[1], getattr(signal, f"SIG{sig}"))
             except (OSError, TypeError):
                 pass
+
+    @staticmethod
+    def unit_exclusive(cg, esc):
+        """True only when every process in the unit's cgroup (and below) is a recorded job process; a unit that
+        also holds anything else is never signalled as a whole."""
+        if not cg or not cg.startswith("/"):
+            return False
+        pids = cgroup_pids(cg)
+        return bool(pids) and all(p in esc for p in pids)
 
     def group_state(self):
         """Fallback: 'gone' when the job's process group is empty and the leader has been reaped."""
@@ -690,21 +753,25 @@ class Supervisor:
         remains = []
         if s["mode"] == "systemd":
             st = slice_state(s["units"]["cgroup_path"])
-            if st == "gone":
+            if st == "unknown":
+                remains.append("slice cgroup path unknown (systemd query failed); not verified")
+                gone = False
+            elif st == "gone":
                 self.enoent += 1
                 gone = self.enoent >= 2
                 if not gone:
                     remains.append("slice gone once; confirming next pass")
-            else:
+            if st not in ("gone", "unknown"):
                 self.enoent = 0
                 gone = st == "empty"
                 if not gone:
                     pids = cgroup_pids(s["units"]["cgroup_path"])
                     remains.append(f"slice populated (pids {','.join(map(str, pids[:8])) or '?'})")
-            esc = escaped(s["units"]["cgroup_path"], s["run"], recorded=s.get("escaped"))
-            if esc:
+            self.track_escaped()
+            esc = self.escaped_live()
+            if esc:   # a recorded process of the job still lives: not released (ambiguity keeps the run stopping)
                 gone = False
-                remains.append("job processes outside the slice: " + ", ".join(f"{p} ({u})" for p, u in
+                remains.append("job processes outside the slice: " + ", ".join(f"{p} ({r.get('unit')})" for p, r in
                                                                                 sorted(esc.items())[:8]))
         else:
             gone = self.group_state() == "gone"
@@ -722,6 +789,7 @@ class Supervisor:
         s, r = self.s, self.s["release"]
         t = time.time()
         if r["step"] == "close":
+            self.track_escaped()     # before the stop: the processes that link an escape to the slice die with it
             out = resolve_intents(self.rid) if s["mode"] == "systemd" else []
             if out:
                 r["remains"] = [f"exec {e} outstanding" for e in out]
@@ -730,9 +798,10 @@ class Supervisor:
             r.update(step="term", term_wall=t)
             return
         if r["step"] == "term":
-            gone = (slice_state(s["units"]["cgroup_path"]) != "populated"
-                    and not escaped(s["units"]["cgroup_path"], s["run"], recorded=s.get("escaped"))) if s["mode"] == "systemd" \
-                else self.group_state() == "gone"
+            if s["mode"] == "systemd":
+                self.track_escaped()
+            gone = (slice_state(s["units"]["cgroup_path"]) in ("gone", "empty") and not self.escaped_live()) \
+                if s["mode"] == "systemd" else self.group_state() == "gone"
             if not gone and t - r["term_wall"] < core.TERM_GRACE_S():
                 return
             if not gone:
@@ -742,12 +811,10 @@ class Supervisor:
             r.update(step="verify", kill_wall=t)
         if r["step"] == "verify":
             if s["mode"] == "systemd" and t - (r["kill_wall"] or t) > 1 and (
-                    slice_state(s["units"]["cgroup_path"]) == "populated" or escaped(s["units"]["cgroup_path"], s["run"], recorded=s.get("escaped"))):
+                    slice_state(s["units"]["cgroup_path"]) == "populated" or self.escaped_live()):
                 self.stop_signal("KILL")        # anything placed in the slice after the stop is the run's too
             ok, remains = self.verify()
             r["remains"] = remains
-            if s["mode"] == "fallback" and ok is False and not remains and s.get("_other_on_gpus") is not None:
-                pass
             if ok:
                 return self.finish(board, released=True)
             self.tell_stopping(board)
@@ -812,9 +879,14 @@ class Supervisor:
         rc, out = start_main_unit(self.rid, s)
         if rc:
             raise Refused(f"systemd-run for the job failed: {out.strip()[:300]}")
-        s["units"]["cgroup_path"] = cgroup_of(s["units"]["slice"])
+        s["units"]["cgroup_path"] = cgroup_of(s["units"]["slice"], tries=5)
         s["state"] = s["entry_state"] = "running"
         s["main_started"] = now()
+        with admit_lock(self.rid):       # exec opens only once the handoff is done and the job runs
+            a = admit_read(self.rid)
+            if a.get("admission") == "handoff":
+                a["admission"] = "open"
+                admit_write(self.rid, a)
 
     # --- one pass
 
@@ -839,6 +911,13 @@ class Supervisor:
             s.pop("identity_alarm")
             notice(self.rid, s, self.hooks, "board-identity-restored")
         try:
+            if s["mode"] == "systemd" and s["state"] in ("running", "leader-exited", "stopping") \
+                    and not s["units"].get("cgroup_path"):
+                s["units"]["cgroup_path"] = recover_cgroup(s["units"]["slice"])
+                if not s["units"]["cgroup_path"]:
+                    s["pending_verification"] = "the slice's cgroup path is unknown and systemd did not answer"
+                else:
+                    s.pop("pending_verification", None)
             # owner's release (private, not a board record)
             for name in sorted(os.listdir(ctl_dir(self.rid))):
                 if name.startswith("release-"):
@@ -860,6 +939,11 @@ class Supervisor:
                 if time.monotonic() - t0 > core.PASS_BUDGET_S():
                     raise TimeoutError("board work over its deadline")
             prot, own = self.protected(rows, t)
+            if (with_board and own and s["class"] == "scheduled" and own["user"] == core.USER
+                    and own.get("state") == "standing" and not s.get("arrival_recorded")
+                    and s["state"] in ("running", "waiting-handoff")
+                    and max(own["start"], own["objection_close"]) <= t <= own.get("lapse_at", t)):
+                s["arrival_recorded"] = bk.record_arrival(board, own["id"], self.rid, s["run"], t)
             s["protected_until"] = own["end"] if prot else None
             if own and s["class"] == "scheduled" and own.get("state") == "objected" and not s.get("told_objected"):
                 s["told_objected"] = True
@@ -919,9 +1003,8 @@ class Supervisor:
                         s["state"] = s["entry_state"] = "leader-exited"
                         notice(self.rid, s, self.hooks, "leader-exited", exit_status=st, remains=remains)
                     s["leader_remains"] = remains
-            if s["mode"] == "systemd" and s["state"] in ("running", "leader-exited") and s["units"].get("cgroup_path"):
-                esc = escaped(s["units"]["cgroup_path"], s["run"], recorded=s.get("escaped"))
-                s["escaped"] = {str(p): dict(ticks=core.proc_ticks(p), unit=u) for p, u in esc.items()}
+            if s["mode"] == "systemd" and s["state"] in ("running", "leader-exited"):
+                self.track_escaped()
             self.passes += 1
             if self.passes % core.SAMPLE_EVERY() == 1 % core.SAMPLE_EVERY() and s["state"] == "running":
                 self.sample()
@@ -1048,16 +1131,22 @@ class _NoBoard:
 
 
 def handoff_waits(board, entries, s):
-    """What an exclusive scheduled launch still waits for: other entries on its GPUs, any process on them."""
+    """What an exclusive scheduled launch still waits for: every other entry on its GPUs (an entry is on the board until
+    its owner's release has been verified and it is archived, so a stale heartbeat does not end the wait), every GPU
+    that nvidia-smi does not identify, and any process of anyone on them."""
     waits = []
     for e in entries:
-        if e["id"] != s["id"] and e["state"] != "ended" and set(e["gpus"]) & set(s["gpus"]) and e["occupancy"] == "live":
-            waits.append(f"entry {e['id']} ({e['user']}, {e['state']})")
+        if e["id"] != s["id"] and set(e["gpus"]) & set(s["gpus"]):
+            occ = "" if e.get("occupancy") == "live" else ", occupancy unknown"
+            waits.append(f"entry {e['id']} ({e['user']}, {e['state']}{occ})")
     ok, idx, apps, _ = nvidia_view()
     if not ok:
         waits.append("nvidia-smi failed")
     else:
-        uuids = {idx.get(g) for g in s["gpus"]}
+        missing = [g for g in s["gpus"] if not idx.get(g)]
+        if missing:
+            waits.append(f"GPUs {core.gpu_text(missing)} not identified by nvidia-smi")
+        uuids = {idx.get(g) for g in s["gpus"] if idx.get(g)}
         for uuid, pid in apps:
             if uuid in uuids:
                 uid = core.proc_uid(pid)
@@ -1190,7 +1279,7 @@ def cmd_run(a):
                  checkpoint_dir=a.checkpoint_dir, requests={}, release=None, lapsed=[],
                  session=os.environ.get("CLAUDE_CODE_SESSION_ID"), supervisor=None, notices=[])
         core.write_private(state_path(rid), s)
-        admit_write(rid, dict(run=gen, admission="open", inflight=[]))
+        admit_write(rid, dict(run=gen, admission="handoff" if handoff else "open", inflight=[]))
         if os.path.exists(log) is False:
             open(log, "a").close()
             os.chmod(log, 0o600)
@@ -1205,7 +1294,7 @@ def cmd_run(a):
             s.update(state="ended", end_reason=f"the job's unit did not start: {out.strip()[:200]}")
             core.write_private(state_path(rid), s)
             raise Refused(f"systemd-run for the job failed: {out.strip()[:300]}")
-        s["units"]["cgroup_path"] = cgroup_of(s["units"]["slice"])
+        s["units"]["cgroup_path"] = cgroup_of(s["units"]["slice"], tries=5)
         s["main_started"] = now()
         core.write_private(state_path(rid), s)
     rc, out = systemd_run([f"--unit={s['units']['sup']}", "-p", "Type=exec", *passthrough_env(), "--",
