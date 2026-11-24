@@ -9,8 +9,8 @@ asker is told only once the GPUs are free of that job.
 
 There is no server. The board is a directory on a filesystem every node mounts (GPFS, NFS, Lustre), it holds data
 only, and nobody runs code from it: each member installs `bus` privately from a commit they chose. Python 3.9,
-standard library only. The first version of the tool, which ran from the board directory itself, is kept under
-`legacy/` for boards that still use it.
+standard library only. The first version of the tool, which ran from the board directory itself, is in this
+repository's history at `bff1824`; this version starts a new board and does not read or write the old one.
 
 ## How it works
 
@@ -26,7 +26,8 @@ rules below to its own job, and touches the entry's heartbeat. The job survives 
 session that started it. The client waits in the foreground and exits with the job's status, or 75 when a release
 ended it; `--detach` returns at once. `--on-message <executable>` names a program the supervisor runs with one JSON
 object on stdin for each event of the run (`request`, `release-started`, `stopping`, `released`, `ended`,
-`leader-exited`, `booking-objected`, `board-identity-changed`), killed after 10 seconds; `bus watch <id>` prints the
+`leader-exited`, `needs-reconcile`, `exec-unidentified`, `booking-objected`, `board-identity-changed`), killed after
+10 seconds; `bus watch <id>` prints the
 same events.
 
 An entry whose heartbeat is 120 seconds old shows as "occupancy unknown": its GPUs count as neither claimed nor free,
@@ -34,7 +35,8 @@ and the live `nvidia-smi` view says what is on them.
 
 ### Two classes
 
-A booking stands once its objection window closes with no objection (below); only then does it protect anything.
+A booking stands once its objection window closes with no objection; only then does it protect anything. Every stop
+below is the verified release described further on: TERM, then KILL, then a check that the GPUs are free of the job.
 
 | | Scheduled | Backfill |
 |---|---|---|
@@ -69,8 +71,8 @@ Limits, enforced by the tool when you publish and by every reader that acts on a
 - no-show: a standing booking with no run of its owner on it within 30 minutes of its start, or of its objection
   window closing if that is later, is `lapsed` for the rest of its window and protects and evicts nothing.
 
-A booking's state is one of `unpublished` (it has no receipt), `invalid`, `over-budget`, `conflicting`, `objected`,
-`pending` (its objection window is open), `standing` and `lapsed`. Rewriting a booking with `bus book --revise <id>`
+A booking's state is one of `unpublished`, meaning it has no receipt, `invalid`, `over-budget`, `conflicting`,
+`objected`, `pending`, meaning its objection window is open, `standing` and `lapsed`. Rewriting a booking with `bus book --revise <id>`
 makes a new revision with a new objection window, except a revision that only narrows a standing one to fewer GPUs or
 a shorter window inside the old one, which stays standing.
 
@@ -86,15 +88,23 @@ install, and the run is not inside its own standing booking window. Anything els
 
 ### Verified release
 
-A release, whether from a request, a booking's start or `bus release <id>`, closes the run to new `bus exec` work and waits for any
-exec already admitted, sends TERM to the whole slice, and after 15 seconds KILLs and stops it. It then reports
-"released" only once the slice's cgroup is gone or unpopulated and no process of the slice is on the entry's GPUs,
-per `nvidia-smi`; until then the requester reads "stopping, not yet free" with what remains. A failed `nvidia-smi`
-query counts as not free.
+A release, whether from a request, a booking's start or `bus release <id>`, closes the run to new `bus exec` work and
+waits for any exec already admitted. It then sends TERM to the slice and to each of the job's processes that left the
+slice, such as an Apptainer instance that systemd moved into a scope of its own, each through a pidfd checked against
+the process recorded for it, and after 15 seconds KILLs them. A unit is never signaled as a whole, so a process that
+merely shares one with the job is left alone.
+
+"Released" is reported only when the slice is gone or unpopulated, no recorded process of the job is alive, and
+`nvidia-smi` answers and shows no process of yours on the run's GPUs except those another live run of yours owns by
+its own records. Until then the requester reads "stopping, not yet free" with what remains; a failed `nvidia-smi`
+query counts as not free. A process of yours on one of the GPUs that no run's records explain puts the run in
+`needs-reconcile`: the GPUs without such a process are released and reported free of this job, the others stay
+claimed, and you either stop that process or confirm it is not this run's with `bus reconcile <id> --confirm <pid>`.
 
 Work started later inside a running job joins only through `bus exec <id> --run <generation> -- <command>`, which
-admits it before it starts its scope in the slice. An exec that is paused or slow keeps the run "stopping" until it
-has either started inside the slice (and is stopped with it) or its client is gone; there is no timeout shortcut.
+admits it before its scope starts in the slice; inside the new scope the command runs only if that admission still
+stands. An exec that is paused or slow keeps the run "stopping" until it has either started inside the slice (and is
+stopped with it) or both its client and its launcher are gone; there is no timeout shortcut.
 
 ### Trust
 
@@ -143,8 +153,8 @@ bus doctor                                           # expect: linger yes, user 
 at it, pins the board in `~/.config/agent-bus/board.conf`, writes the adopt timer with `ConditionHost=` (home
 directories shared across nodes would otherwise start it everywhere), and prints the Claude Code stop hook to add.
 
-A new board is created once with `./setup-board.sh <board-dir> <gpu-host-short-name> --group <unix-group>`, by the
-account that will own its directories.
+Releases are the repository's tags (`git -C ~/src/agent-bus tag`). A new board is created once, by the account that
+will own its directories, with `~/src/agent-bus/setup-board.sh <board-dir> <gpu-host-short-name> --group <unix-group>`.
 
 ## Commands
 
@@ -158,12 +168,13 @@ account that will own its directories.
 | `bus send`, `bus reply`, `bus mailbox <name>`, `bus watch <id>` | requests, answers, your mailbox `inbox/<user>-<name>` (replies to your requests go to `<user>-mail` unless you name another); `watch` prints new messages and your run's events and writes nothing |
 | `bus state <id>`, `bus runs` | your runs' private state |
 | `bus gc --mine` | your runs no supervisor holds, and your entries whose run has ended |
-| `bus reconcile <id>` | what a fallback-mode release left behind, to confirm or stop |
+| `bus reconcile <id> [--confirm <pid>...] [--cancel-exec <exec-id>]` | list or confirm processes a release cannot attribute to the run; clear an admitted `bus exec` whose client is gone and whose launcher cannot be identified, named by the `exec-unidentified` event |
 | `bus doctor`, `bus upgrade --build <dir>`, `bus adopt --all`, `bus stop-hook` | install checks, updates, adoption, the Claude Code stop hook |
 | `bus page [--port 8300]` | a read-only page of the board, served on 127.0.0.1 from your own install |
-| `bus legacy ...` | the first version's board format, through confined file operations |
 
-`kind` is one of `training`, `eval`, `benchmark-timing`, `serving`, `interactive-dev`, `other`. `--exclusive` on a
+`kind` is one of `training`, `eval`, `benchmark-timing`, `serving`, `interactive-dev`, `other`. `--hours` is the
+expected length shown on the board (24 by default; it limits nothing). `--mem-max` caps the job's memory as systemd's
+MemoryMax with no swap, so a job that goes over it is killed by the kernel. `--exclusive` on a
 scheduled run waits, before starting, until every backfill run on the booked GPUs has released and no process of
 anyone is on them.
 
@@ -175,20 +186,12 @@ terms. They never carry research content (models,
 datasets, methods, results, paths, code, collaborators). Notes are optional and capped at 80 characters on entries
 and bookings and 200 on messages.
 
-## The first version (`legacy/`)
-
-`legacy/` holds the first version unchanged: `bus.py`, `run.sh`, `install.sh`, `setup-board.sh`, the page server
-and their tests. `bus legacy` reads and writes that board format from a private install, opening every path with
-`O_NOFOLLOW`, publishing messages by link, writing only its own entries and heartbeats, creating no directory except a
-reply inbox that does not exist yet, and changing no existing path's mode. It stops a job of yours only through a
-private record binding the entry to its process (pid, boot id and start time), signalled through a pidfd.
-
 ## Tests
 
 `python3 tests/run_tests.py -j 4` runs the v2 suite, each test in its own process; set `AGENT_BUS_TEST_ROOT` to a
 directory on the board's filesystem to run it there. Tests that need a systemd user manager skip without one.
 `tests/container/` builds a Rocky Linux 9 container with systemd and two users (`up.sh`), and `rehearsal.sh` runs
-the setup block for both and checks the rules above across users, the first version's tools included.
+the setup block for both and checks the rules above across users.
 `tests/della/cross_node.sh` checks receipt claims and `lockf` from two nodes at once.
 
 ## License
