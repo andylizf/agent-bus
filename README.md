@@ -1,182 +1,195 @@
 # agent-bus
 
-A message board for coding agents that share a GPU machine with no scheduler.
+A shared board for people and coding agents who use one GPU host with no scheduler. Each member starts jobs with
+`bus run`, which runs the job under their own systemd user manager and puts an entry on the board: which GPUs, until
+when, and whether the job is protected by a booking. Anyone can book GPUs ahead with a public notice, object to a
+booking with a reason, or ask a running job for its GPUs. The tool enforces the outcome on each member's own jobs: a
+job started without a booking stops when someone asks for its GPUs or when someone's booking of them begins, and the
+asker is told only once the GPUs are free of that job.
 
-When several people point Claude Code or Codex at the same 8-GPU box, the agents start jobs, forget them, and hold
-GPUs nobody can reclaim without finding the person who launched them. agent-bus gives every running job an entry
-on a shared directory: which GPUs it holds, until when, and what should happen if someone asks for them. Each entry
-has an inbox. The agent that started the job watches that inbox and answers requests from other people's agents,
-and a request nobody acknowledges gets the job stopped.
-
-There is no server. The board is a directory on a filesystem every node mounts (GPFS, NFS, Lustre); every write is
-a new file or an atomic rename. The tool is one Python 3.9 file with no dependencies.
+There is no server. The board is a directory on a filesystem every node mounts (GPFS, NFS, Lustre), it holds data
+only, and nobody runs code from it: each member installs `bus` privately from a commit they chose. Python 3.9,
+standard library only. The first version of the tool, which ran from the board directory itself, is kept under
+`legacy/` for boards that still use it.
 
 ## How it works
 
-- Entries: `bin/run.sh` starts a job on the GPU host in its own process group, registers it on the board with
-  its pid, and takes the entry down when the job exits. The entry records the job's GPUs, expected end, request
-  policy, and whether it claims its GPUs exclusively.
-- Inboxes: anyone writes a request (`--kind request --gpus N --minutes M`) or a question into an entry's inbox.
-- Watching: the agent that started the job runs `bus.py watch <id>` as a background task. It refreshes the entry's
-  heartbeat every 5 seconds while it waits, and when messages arrive it prints the unacknowledged ones, one line
-  each, and exits; that exit wakes the agent, which answers, acks each message with `bus.py ack`, and starts the watch
-  again. A message left unacked is printed again by the next watch. Only one watch runs per entry (a lock on the
-  board, held across nodes): a second exits with code 3. `watch.sh <id>` streams instead (`bus.py watch --follow`),
-  for Claude Code's Monitor tool, or for Codex, which queues each message into its own session with
-  `codex queue --thread $CODEX_THREAD_ID`.
-- The sweep: each person who joins runs a systemd user timer on the GPU host (`bin/install.sh`). Every 30 seconds it stops
-  that person's jobs that have a request addressed to them and no answer: no heartbeat for 60 seconds, or no
-  acknowledgement within 5 minutes. It replies to the requester and logs the stop. Only a job's owner can signal its
-  processes, which is why everyone runs their own sweep.
-- Stale entries: each sweep also takes down, for every member, the entries that no longer stand for anything: one
-  whose pid is not running on the GPU host, and one past its expected end with no watcher and no live pid. Each goes
-  to `archive/` with its reason, and a `down` line with `by=sweep` goes to `log.jsonl`. An entry whose pid is alive or
-  whose watcher beats is never taken down this way. Every sweep touches `.sweep/<user>@<host>`, so a monitor can tell
-  that a member's timer still fires.
-- Idle warnings: when every GPU of an entry stays under 5% utilization for 30 minutes, the sweep leaves a `warn`
-  message in that entry's own inbox, so the agent that started the job is woken to release the GPUs or explain them.
-- Logs: `log.jsonl` records every registration, message, acknowledgement and stop; `usage.jsonl` records each
-  GPU's utilization, memory and processes every 2 minutes. `bus.py log [--usage]` prints them.
+### Runs and their supervisor
 
-## Booking GPUs ahead
+`bus run --gpus 2,3 -- '<command>'` starts the job as a transient systemd user service in a slice of its own, so
+every process the job forks stays accounted for, through `setsid`, double forks and daemonizing launchers such as Ray
+alike. An Apptainer instance that systemd moves into a scope of its own is still found, through its parent in the
+slice, and released with the job. A run's record on the board is its entry; run and entry share one id. Each run also
+gets a generation, a random hex id that `bus run` prints (`bus: entry <id> run <generation>`) and the entry carries as
+`run`, so a message meant for an earlier run under the same id is told apart. A per-run supervisor, another user service, checks the board every 5 seconds, applies the
+rules below to its own job, and touches the entry's heartbeat. The job survives the client, the supervisor and the ssh
+session that started it. The client waits in the foreground and exits with the job's status, or 75 when a release
+ended it; `--detach` returns at once. `--on-message <executable>` names a program the supervisor runs with one JSON
+object on stdin for each event of the run (`request`, `release-started`, `stopping`, `released`, `ended`,
+`leader-exited`, `booking-objected`, `board-identity-changed`), killed after 10 seconds; `bus watch <id>` prints the
+same events.
 
-Instead of asking in chat "can I take GPUs 0-3 from 10pm to 1am", say it on the board:
+An entry whose heartbeat is 120 seconds old shows as "occupancy unknown": its GPUs count as neither claimed nor free,
+and the live `nvidia-smi` view says what is on them.
 
-```
-bus.py book --gpus 0-3 --from 22:00 --to 01:00 --note "kernel timing"    # a bare --to before --from is the next day
-bus.py book --gpus 2,5 --from "tomorrow 09:00" --to "tomorrow 13:00" --note eval --as alice
-bus.py cal [--days N] [--json]      # per GPU: who is on it now (a-z) and the bookings ahead (A-Z), N days (default 2)
-bus.py unbook <id>                  # yours only
-```
+### Two classes
 
-Times are local Eastern time (`AGENT_BUS_TZ` changes it): `HH:MM`, `today HH:MM`, `tomorrow HH:MM`, `MM-DD HH:MM`,
-or ISO. A booking that overlaps another on the same GPUs is recorded anyway, with a warning naming who holds the other
-one. `bus.py ls` lists the bookings of the next 24 hours under the entries, and the sweep drops bookings that have
-ended. A booking is information only: nothing is stopped or refused because of one. `cal --json` gives the same data
-for a page.
+A booking stands once its objection window closes with no objection (below); only then does it protect anything.
 
-Sample `bus.py cal` (one column per hour):
+| | Scheduled | Backfill |
+|---|---|---|
+| Started as | `bus run --scheduled <booking-id>` | `bus run` (the default) |
+| Needs | your own standing booking covering the job's GPUs and now | nothing |
+| Protected | inside its booking's window: nothing on the board stops it | never |
+| Stops when | you release it; once its window ends it is backfill | an authorized request; a standing booking's window starting on its GPUs |
+| Limits | its booking's (below) | none: any free GPUs, for any length |
 
-```
-GPUs of gpu-host, America/New_York; one column = 1 h from Mon 11-23 17:00; A-Z bookings, a-z board entries (until their expected end), . free
-             Tue 11-24               Wed 11-25
-       18    00    06    12    18    00    06    12
-gpu0  .....AAA.........................................
-gpu1  .....AAA.........................................
-gpu2  .....AAA........BBBB.............................
-gpu3  .....AAA........BBBB.............................
-gpu4  .................................................
-gpu5  ................BBBB.............................
-gpu6  aaaaaa...........................................
-gpu7  aaaaaa...........................................
-  a now  gpus 6-7     carol    live       until Mon 11-23 22:51 carol-20261123-170000-train
-  A book gpus 0-3     alice    Mon 11-23 22:00 - Tue 11-24 01:00  kernel timing  [alice-20261123-2200-1a2b]
-  B book gpus 2-3,5   bob      Tue 11-24 09:00 - Tue 11-24 13:00  eval  [bob-20261124-0900-3c4d]
-```
+A scheduled run whose booking is pending, objected, lapsed or past its window is treated as backfill until the booking
+stands again; it never yields to its own booking. A new backfill run is refused only on GPUs that are inside another
+booking's standing window right now; a pending booking does not block it.
 
-## Web view
+### Bookings as public notices
 
-`tools/board_server.py` serves the board as a web page on the GPU host: who is on each GPU now, a GPU x time calendar
-of board entries and bookings, and a form to book GPUs. Dragging across empty calendar rows fills in the form with
-those GPUs and that time span. The page refreshes itself every minute. The server listens on 127.0.0.1 only, so you
-reach it through ssh:
+`bus book --gpus 0-3 --from 2026-11-24T22:00-05:00 --to 2026-11-25T01:00-05:00` publishes a booking. Silence is
+consent: the booking stands once its objection window closes (30 minutes by default, never under 10) unless someone
+publishes an objection with a reason, `bus object <booking-id> --reason "<why>"`. No message goes to anyone; the
+board and its read-only page (`bus page`, below) are the notice. When a standing booking's window starts, every backfill run on its GPUs releases,
+the booker's own included.
 
-```
-ssh -N -L 8300:localhost:8300 <gpu-host>
-```
+Every booking revision and every objection gets a receipt in an append-only sequence under `seq/`. The slot is claimed
+by `link(2)`, so the filesystem's `EEXIST` decides the order and no writer picks its place. An earlier receipt wins an
+overlap: a later booking of another member on the same GPUs and time is `conflicting`. A booking's objection window
+counts from its receipt, so a writer cannot shorten it by backdating the booking.
 
-then open http://localhost:8300. If port 8300 is taken on your machine, pick another local one (`-L
-8301:localhost:8300`, then http://localhost:8301). In VS Code connected to the GPU host over Remote-SSH, add port
-8300 in the Ports panel instead.
+Limits, enforced by the tool when you publish and by every reader that acts on a booking:
 
-A booking made on the page is the same record `bus.py book` writes, owned by the unix user that runs the server and
-shown under the name you type. It is information only, like every booking: nothing is stopped or refused because of
-it, and a booking that overlaps another is recorded with a warning, shown under the form, naming who holds the other
-one.
+- a booking starts at most 7 days ahead and covers at most 24 hours, with an objection window of at least 10 minutes;
+- budget: at most 96 GPU-hours of your pending, standing or lapsed bookings in any 7-day span; bookings past it are
+  `over-budget`;
+- no-show: a standing booking with no run of its owner on it within 30 minutes of its start, or of its objection
+  window closing if that is later, is `lapsed` for the rest of its window and protects and evicts nothing.
 
-Names are an honor system: the page does not check who you are. A booking made on the page is removed on the page, by
-typing the name on it. A booking made in a terminal has no Remove button on the page; its owner removes it in a
-terminal (`bus.py unbook <id>`). Each booking and removal made on the page is appended to `<board>/bookings-web.log`
-with the time, the name, the booking id and the remote address.
+A booking's state is one of `unpublished` (it has no receipt), `invalid`, `over-budget`, `conflicting`, `objected`,
+`pending` (its objection window is open), `standing` and `lapsed`. Rewriting a booking with `bus book --revise <id>`
+makes a new revision with a new objection window, except a revision that only narrows a standing one to fewer GPUs or
+a shorter window inside the old one, which stays standing.
 
-One member runs the server on the GPU host, as a systemd user service with `ConditionHost=` set to that host (home
-directories shared across nodes would otherwise start it on every node):
+Booking times are ISO 8601 with a UTC offset, or epoch seconds.
 
-```
-ExecStart=/usr/bin/python3 <board>/tools/board_server.py --board <board> --port 8300
-```
+### Requests
 
-## Claude Code: a Stop hook that keeps the watch running
+`bus send <entry-id> --kind request --gpus 1 --minutes 30 --note "eval before the deadline"` asks a run for its GPUs.
+A request stops a run only when all of these hold: the message file is `0644` and owned by the user it names as
+sender, its `reply_to` is a mailbox that sender owns, it names the run's current generation (so a request meant for an
+earlier run with the same id does nothing), its id has not been seen before, the board is the one the owner pinned at
+install, and the run is not inside its own standing booking window. Anything else is shown and acts on nothing.
 
-A Claude Code session that registered an entry should not end its turn without a watch on it, or a request to it goes
-unanswered and the job is stopped. `bus.py stop-hook` enforces that: `bus.py up` (and so `run.sh`) records the
-session from `$CLAUDE_CODE_SESSION_ID` (or `--session`), and when that session tries to end its turn while one of its
-entries has no watch, the hook blocks the stop and tells it to start `bus.py watch <id>` as a background task. It
-blocks at most 3 times in a row within one turn, and never blocks another session. Add it to
-`~/.claude/settings.json` on the machine where Claude Code runs, which must mount the board:
+### Verified release
 
-```json
-{
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "f=<board>/bin/bus.py; [ -f \"$f\" ] && python3 \"$f\" stop-hook || true",
-            "timeout": 15
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+A release, whether from a request, a booking's start or `bus release <id>`, closes the run to new `bus exec` work and waits for any
+exec already admitted, sends TERM to the whole slice, and after 15 seconds KILLs and stops it. It then reports
+"released" only once the slice's cgroup is gone or unpopulated and no process of the slice is on the entry's GPUs,
+per `nvidia-smi`; until then the requester reads "stopping, not yet free" with what remains. A failed `nvidia-smi`
+query counts as not free.
 
-If you register entries over ssh from another machine, pass `--session $CLAUDE_CODE_SESSION_ID` to `bus.py up`
-yourself; the hook still has to run where the board is mounted.
+Work started later inside a running job joins only through `bus exec <id> --run <generation> -- <command>`, which
+admits it before it starts its scope in the slice. An exec that is paused or slow keeps the run "stopping" until it
+has either started inside the slice (and is stopped with it) or its client is gone; there is no timeout shortcut.
 
-## Rules the tool enforces
+### Trust
 
-- A request nobody acknowledges stops the job, unless the entry was registered with `--on-request "keep: <reason>"`.
-  A job whose agent session has ended is therefore stopped by the first request that arrives.
-- Broadcasts to `all` never stop anything.
-- GPUs are shared unless an entry declares `--exclusive`. A GPU running a process that has no entry is treated as not
-  shareable, since its owner never had the chance to declare.
+- A record's author is its file owner. An entry, booking, objection, receipt or message counts only when its owner's
+  name equals its `user` (or `sender`) field and its id starts with `<user>-`. Records are `0644`, one writer each, in
+  setgid sticky directories, so only their author changes or removes them.
+- Every path on the board is opened by an `openat` walk from `/` with `O_NOFOLLOW`; readers take only regular files
+  of at most 64 KiB, skip dot names and symlinks, and skip a directory of more than 20,000 entries.
+- Each install records the board directory's inode and filesystem id. If the directory at that path is ever
+  replaced, every `bus` command still reads it (shown as "board identity changed"), and supervisors write nothing to
+  it and let nothing on it act on their jobs; the jobs keep running and their owners are told.
+- Nothing read from the board becomes a path to write, a signal target, an ssh host or a shell word.
 
-Request policies: `agent` is the default, and the watching agent decides each request; with `release` any request
-is granted; with `keep: <reason>` the job keeps running and the reply says when the GPUs free up.
+What any member can cause, by design: a request stops a backfill run within one supervisor pass; a standing, unlapsed
+booking stops every backfill run on its GPUs when its window starts; a reasoned objection during a booking's
+objection window keeps it from standing. Nothing stops a scheduled run inside its standing window.
+
+### Adoption and updates
+
+A per-user timer (`bus-adopt.timer`, every 30 seconds, on the board's host only) starts a supervisor for any run of
+yours that has none, so a killed supervisor is replaced within about 30 seconds while its job keeps running.
+`bus upgrade --build <dir>` installs a new build and points `~/.local/bin/bus` at it; each supervisor saves its state
+and execs the new build at the end of its next pass. Rolling back is the same command with the previous build.
+
+Without a user manager, as when linger is off, `bus run` supervises the job itself in the foreground. This fallback
+mode has no adoption, no updates and no `bus exec`, and a release that finds a descendant which left the job's
+process group waits until `bus reconcile <id>` confirms or the owner stops it. `bus doctor` says which mode you are
+in. Rolling back from a build that does not start uses the previous build's own entry point:
+`~/.local/share/agent-bus/builds/<previous>/bin/bus upgrade --build ~/.local/share/agent-bus/builds/<previous>`.
 
 ## Setup
 
-1. Create the board on a node that mounts the shared directory:
-   `./setup-board.sh /shared/lab/agent-bus <gpu-host-short-name> [unix-group]`. It copies the tool, renders the agent
-   skill with the board's path and host, and makes the directories group-writable. Rerun it to update.
-2. Each person joins by running `<board>/bin/install.sh` once on the GPU host. Joining means accepting that the
-   sweep stops your unanswered jobs, so it is each person's own step. It prints how to install the skill.
-3. Give each agent the skill in `<board>/skill/agent-bus/`: link it into `~/.claude/skills/` or
-   `~/.codex/skills/` where the board is mounted, or copy it to a laptop and put the cluster's ssh alias in
-   `~/.agent-bus/ssh-host`. `watch.sh` reports when a copied skill is out of date.
+Run once, on the GPU host, as yourself (or let your agent run it):
 
-## Design notes
+```
+loginctl enable-linger "$USER"
+loginctl show-user "$USER" -p Linger                 # expect: Linger=yes
+git clone https://github.com/andylizf/agent-bus ~/src/agent-bus && git -C ~/src/agent-bus checkout <release tag>
+~/src/agent-bus/bin/install.sh --board /scratch/gpfs/TRIDAO/agent-bus-v2
+systemctl --user enable --now bus-adopt.timer
+systemctl --user list-timers bus-adopt.timer --no-pager   # expect a NEXT time
+bus doctor                                           # expect: linger yes, user manager yes, cgroup2 yes, slice test ok, board pin ok
+```
 
-- The watch lock is a POSIX lock (`lockf`), not `flock`: on GPFS, `flock` is local to one node, so a watch on another
-  node would not see it.
-- `watch.sh` polls instead of using inotify: on GPFS, inotify on one node does not report files created from another
-  node. `tests/inotify_gpfs.py` checks this on your filesystem.
-- A stop is a `SIGTERM` to `run.sh`'s wrapper, which forwards it to the job's process group, waits, and records
-  whether the job was stopped or exited on its own.
-- Whether a queued `codex queue` message wakes an idle Codex session has not been verified; until it is, treat a
-  Codex-started job as unattended between turns.
+`install.sh` copies the checkout's build to `~/.local/share/agent-bus/builds/<commit>/`, points `~/.local/bin/bus`
+at it, pins the board in `~/.config/agent-bus/board.conf`, writes the adopt timer with `ConditionHost=` (home
+directories shared across nodes would otherwise start it everywhere), and prints the Claude Code stop hook to add.
+
+A new board is created once with `./setup-board.sh <board-dir> <gpu-host-short-name> --group <unix-group>`, by the
+account that will own its directories.
+
+## Commands
+
+| Command | Does |
+|---|---|
+| `bus run --gpus I [--scheduled B \| --hours H] [--exclusive] [--kind K] [--note T] [--stop-cost-min M] [--on-message E] [--mem-max MB] -- '<cmd>'` | start a job (backfill unless `--scheduled`) |
+| `bus exec <id> --run <gen> -- <cmd>` | run a command inside a running job's slice, through admission |
+| `bus release <id> [--wait S]` | release your own run, verified |
+| `bus ls [--json]`, `bus cal [--days N] [--json]` | runs on the board, bookings and their states |
+| `bus book ...`, `bus unbook <id>`, `bus object <id> --reason ...` | bookings and objections |
+| `bus send`, `bus reply`, `bus mailbox <name>`, `bus watch <id>` | requests, answers, your mailbox `inbox/<user>-<name>` (replies to your requests go to `<user>-mail` unless you name another); `watch` prints new messages and your run's events and writes nothing |
+| `bus state <id>`, `bus runs` | your runs' private state |
+| `bus gc --mine` | your runs no supervisor holds, and your entries whose run has ended |
+| `bus reconcile <id>` | what a fallback-mode release left behind, to confirm or stop |
+| `bus doctor`, `bus upgrade --build <dir>`, `bus adopt --all`, `bus stop-hook` | install checks, updates, adoption, the Claude Code stop hook |
+| `bus page [--port 8300]` | a read-only page of the board, served on 127.0.0.1 from your own install |
+| `bus legacy ...` | the first version's board format, through confined file operations |
+
+`kind` is one of `training`, `eval`, `benchmark-timing`, `serving`, `interactive-dev`, `other`. `--exclusive` on a
+scheduled run waits, before starting, until every backfill run on the booked GPUs has released and no process of
+anyone is on them.
+
+## What goes on the board
+
+Entries, bookings, objections and messages carry coordination facts only: GPUs, times, the kind from the list above,
+class, the owner's estimate of minutes of work a stop would lose (`--stop-cost-min`), and reasons in coordination
+terms. They never carry research content (models,
+datasets, methods, results, paths, code, collaborators). Notes are optional and capped at 80 characters on entries
+and bookings and 200 on messages.
+
+## The first version (`legacy/`)
+
+`legacy/` holds the first version unchanged: `bus.py`, `run.sh`, `install.sh`, `setup-board.sh`, the page server
+and their tests. `bus legacy` reads and writes that board format from a private install, opening every path with
+`O_NOFOLLOW`, publishing messages by link, writing only its own entries and heartbeats, creating no directory except a
+reply inbox that does not exist yet, and changing no existing path's mode. It stops a job of yours only through a
+private record binding the entry to its process (pid, boot id and start time), signalled through a pidfd.
 
 ## Tests
 
-`python3 tests/test_bus.py` checks, in a throwaway board on Linux or macOS: the sweep's stale-entry removal, one watch
-per entry, a watch exiting on a message and printing it again until it is acked, `--follow`, the stop hook's block and
-allow, and booking (overlap, unbook, `cal`, `ls`, ended bookings dropped). `tests/test_bus.sh <scratch-dir>` runs
-register, watch, request and sweep end to end on Linux. `python3 tests/test_board_page.py` checks the page's render on a
-made-up board, and `python3 tests/test_board_server.py` checks the web server: input validation, booking and removal
-through the real `bus.py`, the write log, and the refused methods and content types.
+`python3 tests/run_tests.py -j 4` runs the v2 suite, each test in its own process; set `AGENT_BUS_TEST_ROOT` to a
+directory on the board's filesystem to run it there. Tests that need a systemd user manager skip without one.
+`tests/container/` builds a Rocky Linux 9 container with systemd and two users (`up.sh`), and `rehearsal.sh` runs
+the setup block for both and checks the rules above across users, the first version's tools included.
+`tests/della/cross_node.sh` checks receipt claims and `lockf` from two nodes at once.
 
 ## License
 
