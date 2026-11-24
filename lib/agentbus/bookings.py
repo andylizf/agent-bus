@@ -165,7 +165,8 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
                 if (pi and pi["slot"] < slot and not pi["replaced"] and pi["objection_close"] <= rt
                         and not objections_for(pb, prev_rev, pi["objection_close"]) and narrows(b, pb)):
                     info.update(order=pi["order"], objection_close=pi["objection_close"], inherited=True,
-                                inherits=prev_rev, pred=pb, pred_info=pi)
+                                inherits=prev_rev, pred=pb, pred_info=pi,
+                                lineage=[prev_rev] + pi.get("lineage", []))
         return info
 
     def invalid_why(b, receipt_time):
@@ -192,7 +193,8 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
                 continue
             row.update(slot=info["slot"], order=info["order"], receipt_time=info["receipt_time"],
                        objection_close=info["objection_close"], inherited=info["inherited"],
-                       _pred=info.get("pred"), _pred_info=info.get("pred_info"))
+                       _pred=info.get("pred"), _pred_info=info.get("pred_info"),
+                       lineage=info.get("lineage", []) if info["inherited"] else [])
             if info["replaced"]:
                 row.update(state="invalid", why=f"receipt slot {info['slot']} was replaced since this reader saw it")
             elif invalid_why(b, info["receipt_time"]):
@@ -231,17 +233,21 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
     def predecessor_standing(r, rows):
         """A narrowing revision inherits only from a predecessor that was standing in full: valid under the limits,
         not objected (checked in base), not conflicting with another user's earlier booking, within the budget."""
-        pb, pi = r["_pred"], r["_pred_info"]
-        if invalid_why(pb, pi["receipt_time"]):
-            return False
-        for o in rows:
-            if (o["id"] != r["id"] and o["user"] != r["user"] and o.get("order") is not None
-                    and o["order"] < pi["order"] and o.get("state") in ("standing", "pending", "lapsed", "conflicting")
-                    and overlap(o, pb)):
-                return False
+        links, pb, pi = [], r["_pred"], r["_pred_info"]
+        while pb is not None:              # every ancestor in the chain, each with its own receipt slot
+            links.append((pb, pi))
+            pb, pi = (pi.get("pred"), pi.get("pred_info")) if pi.get("inherited") else (None, None)
         mine = [o for o in rows if o["user"] == r["user"] and o["id"] != r["id"]
                 and o.get("state") in ("standing", "pending", "lapsed")]
-        return not over_budget(mine, pb, lim)
+        for pb, pi in links:
+            if invalid_why(pb, pi["receipt_time"]) or over_budget(mine, pb, lim):
+                return False
+            for o in rows:
+                if (o["id"] != r["id"] and o["user"] != r["user"] and o.get("order") is not None
+                        and o["order"] < pi["slot"] and o.get("state") in ("standing", "pending", "lapsed", "conflicting")
+                        and overlap(o, pb)):
+                    return False
+        return True
 
     for _ in range(CHAIN_MAX + 2):
         rows = compute()
@@ -261,7 +267,9 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
             elif t >= lapse_at and entries is not None and not any(
                     e.get("booking") == r["id"] and e["user"] == r["user"] and e["state"] in ("running", "waiting-handoff")
                     and e.get("occupancy") == "live" and e["started"] <= lapse_at for e in entries) and not any(
-                    x["user"] == r["user"] and x["arrived"] <= lapse_at for x in arrived.get(r["id"], [])):
+                    x["user"] == r["user"] and x["revision"] in [r["revision"]] + (r.get("lineage") or [])
+                    and max(r["start"], r["objection_close"]) - lim["lapse_s"] <= x["arrived"] <= lapse_at
+                    for x in arrived.get(r["id"], [])):
                 r.update(state="lapsed", why=f"no run of its owner on it by {time.strftime('%H:%M', time.localtime(lapse_at))}")
             r["lapse_at"] = lapse_at
         r["active"] = r.get("state") == "standing" and max(r["start"], r["objection_close"]) <= t < r["end"]
@@ -390,16 +398,19 @@ def publish_booking(board, gpus, start, end, objection_s=None, kind="other", not
                 overlaps=[dict(id=o["id"], user=o["user"], state=o["state"]) for o in others])
 
 
-def record_arrival(board, booking_id, entry_id, run, t=None):
-    """The owner's persisted fact that a run of theirs was on the booking by its no-show limit, so a reader after the
-    run ended does not read the booking as lapsed. One file per booking (arrivals/<booking-id>.json), published once."""
+def record_arrival(board, booking_id, revision, entry_id, run, t=None):
+    """The owner's persisted fact that a run of theirs was on this revision of the booking by its no-show limit, so a
+    reader after the run ended does not read it as lapsed. Bound to the revision (arrivals/<id>@<revision16>.json): a
+    rescheduled booking is a new revision and needs its own arrival."""
     board.writable()
     fd = board.dir("arrivals")
     if fd is None:
         return False
-    rec = dict(id=booking_id, user=core.USER, entry=entry_id, run=run, arrived=int(t or now()), schema=core.SCHEMA)
+    key = f"{core.component(booking_id, 'booking id')}@{revision[:16]}"
+    rec = dict(id=booking_id, key=key, revision=revision, user=core.USER, entry=entry_id, run=run,
+               arrived=int(t or now()), schema=core.SCHEMA)
     try:
-        core.publish(fd, f"{core.component(booking_id, 'booking id')}.json", dumps(rec))
+        core.publish(fd, f"{key}.json", dumps(rec))
     except FileExistsError:
         pass
     return True

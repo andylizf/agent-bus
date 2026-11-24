@@ -169,8 +169,9 @@ def cmd_reply(a):
                 break
         else:
             raise Refused(f"no message {a.msg} in your inboxes")
-        if not m.get("reply_to") or b.inbox_owner(m["reply_to"]) != m["sender"]:
-            raise Refused("that message names no mailbox of its sender to reply to")
+        rt = m.get("reply_to")
+        if not (isinstance(rt, str) and core.owned_id(rt, m["sender"])) or b.inbox_owner(rt) != m["sender"]:
+            raise Refused("that message names no mailbox of its sender to reply to")   # checked before any path use
         if a.answer == "no" and not (a.reason or "").strip():
             raise Refused("a no needs a reason (--reason)")
         mid = core.new_id(f"re-{secrets.token_hex(3)}")

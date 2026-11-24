@@ -203,7 +203,7 @@ class Runs(BusTest):
         self.wait_state(d["id"], "ended", 30)   # the process dies with the slice; then the GPU check passes
         self.assertFalse(alive(pid))
 
-    def test_unreadable_cgroup_of_own_uid_counts_as_job(self):
+    def test_unreadable_cgroup_of_own_uid_needs_reconcile_not_stopping_forever(self):
         other = subprocess.Popen(["sleep", "300"], start_new_session=True)
         self.procs.append(other)
         env = dict(self.env, AGENT_BUS_TEST_UNREADABLE_CGROUP=str(other.pid))
@@ -213,11 +213,13 @@ class Runs(BusTest):
         rid = json.loads(info.read_text())["id"]
         self.set_gpus(apps=[(0, other.pid)])
         self.bus("release", rid, check=True)
-        st = wait_for(lambda: (lambda s: s if s.get("release") and any("job processes on GPUs" in x for x in
-                                                                    s["release"].get("remains") or []) else None)(
-            self.state(rid)), 30, what="the unreadable pid counted as the job's")
-        self.assertIn(str(other.pid), " ".join(st["release"]["remains"]))
-        self.set_gpus()
+        st = self.wait_state(rid, "needs-reconcile", 30)
+        self.assertEqual(st["needs_reconcile"], [other.pid])
+        self.assertIn("needs-reconcile", [n["event"] for n in st["notices"]])
+        self.assertTrue(self.entry_file(rid).exists())          # the GPUs stay claimed
+        r = self.bus_json("reconcile", rid, env=env)
+        self.assertEqual(r["candidates"], [other.pid])
+        self.bus("reconcile", rid, "--confirm", str(other.pid), env=env, check=True)
         self.wait_state(rid, "ended", 20)
 
     # --- requests (design 3.10)
@@ -690,7 +692,7 @@ class Fallback(BusTest):
         self.set_gpus(apps=[(0, esc)])
         self.bus("release", rid, env=env, check=True)
         st = wait_for(lambda: (lambda s: s if s.get("release") and s["release"]["step"] == "verify" and
-                               any("job processes" in x for x in s["release"].get("remains") or []) else None)(
+                               any("unattributed" in x for x in s["release"].get("remains") or []) else None)(
             self.state(rid)), 30, what="waiting for reconciliation")
         r = json.loads(self.bus("reconcile", rid, env=env).stdout)
         self.assertEqual(r["candidates"], [esc])

@@ -18,7 +18,7 @@ from . import core
 from .core import Refused, now
 
 STATE_VERSION = int(os.environ.get("AGENT_BUS_TEST_STATE_VERSION") or 1)
-NONTERMINAL = ("starting", "running", "waiting-handoff", "stopping", "leader-exited")
+NONTERMINAL = ("starting", "running", "waiting-handoff", "stopping", "leader-exited", "needs-reconcile")
 EXIT_RELEASED = 75
 
 
@@ -139,6 +139,9 @@ def lock_free(path):
 # ------------------------------------------------------------------------------------------------ systemd and cgroups
 
 def sysctl(*args, timeout=20):
+    f = os.environ.get("AGENT_BUS_TEST_SYSTEMCTL_FAIL")
+    if f and os.path.exists(f):            # tests: the user manager does not answer
+        return 1, "", "test: systemctl failing"
     try:
         r = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout, r.stderr
@@ -192,6 +195,20 @@ def cgroup_of(unit, tries=1):
             return cg
         time.sleep(0.2 * (i + 1)) if i + 1 < tries else None
     return None
+
+
+def main_unit_state(unit):
+    """'exists' (systemd knows a started unit of that name), 'absent' (systemd positively reports none) or 'unknown'
+    (the query failed)."""
+    ok, p = unit_query(unit, "LoadState", "ActiveState", "ExecMainStartTimestampMonotonic")
+    if not ok:
+        return "unknown"
+    if p.get("LoadState") == "not-found":
+        return "absent"
+    if p.get("LoadState") == "loaded" and (p.get("ActiveState") not in ("inactive", "") or
+                                           int(p.get("ExecMainStartTimestampMonotonic") or 0) > 0):
+        return "exists"
+    return "absent"
 
 
 def recover_cgroup(slice_unit):
@@ -299,6 +316,64 @@ def gpu_check(gpus, in_job):
         else:
             uid = core.proc_uid(pid)
             other.append(f"{pid}:{core.owner_name(uid) if uid is not None else '?'}")
+    return not mine, sorted(set(mine)), sorted(set(other)), None
+
+
+def other_runs_attribution(rid):
+    """pid -> the id of another live run of this user that its own records show the pid belongs to (in its slice, a
+    recorded escape of it, or its fallback process group), else None."""
+    others = []
+    for name in os.listdir(runs_dir()):
+        if not name.endswith(".json") or name.endswith((".job.json", ".admit.json")) or name[:-5] == rid:
+            continue
+        st = core.read_private(os.path.join(runs_dir(), name)) or {}
+        if st.get("state") in NONTERMINAL and st.get("host") == core.HOST:
+            others.append(st)
+
+    def attr(pid):
+        cg = None if test_unreadable(pid) else core.proc_cgroup(pid)
+        for st in others:
+            if st.get("mode") == "systemd" and cg and in_tree(cg, (st.get("units") or {}).get("cgroup_path")):
+                return st["id"]
+            rec = (st.get("escaped") or {}).get(str(pid))
+            if rec and core.identity_alive(rec):
+                return st["id"]
+            if st.get("mode") == "fallback" and st.get("pgid"):
+                try:
+                    if os.getpgid(pid) == st["pgid"]:
+                        return st["id"]
+                except OSError:
+                    pass
+        return None
+    return attr
+
+
+def gpu_release_check(rid, gpus, confirmed=()):
+    """The GPU half of a release, conservative: (clear, unattributed pids of this user, other processes as 'pid:who',
+    error). Clear only when nvidia-smi answers for every GPU and no process of this user is on them except those another
+    live run of this user positively owns by its records, or that the owner confirmed are not this run's."""
+    ok, idx, apps, _ = nvidia_view()
+    if not ok:
+        return False, [], [], "nvidia-smi failed"
+    uuids = {idx[g] for g in gpus if g in idx}
+    if len(uuids) != len(set(gpus)):
+        return False, [], [], "nvidia-smi does not list every GPU of the entry"
+    attr = other_runs_attribution(rid)
+    mine, other = [], []
+    for uuid, pid in apps:
+        if uuid not in uuids:
+            continue
+        uid = core.UID if test_unreadable(pid) else core.proc_uid(pid)
+        if uid is None:
+            continue                       # gone between the query and the look
+        if uid != core.UID:
+            other.append(f"{pid}:{core.owner_name(uid)}")
+        elif pid in confirmed:
+            other.append(f"{pid}:{core.USER} (confirmed not this run)")
+        elif attr(pid):
+            other.append(f"{pid}:{core.USER} ({attr(pid)})")
+        else:
+            mine.append(pid)
     return not mine, sorted(set(mine)), sorted(set(other)), None
 
 
@@ -553,7 +628,7 @@ def notice(rid, s, hooks, event, **kw):
 
 class Supervisor:
     def __init__(self, rid, adopt=False, fallback_child=None):
-        self.rid = rid
+        self.rid = core.component(rid, "run id")      # before any path is built from it
         self.adopt = adopt
         self.child = fallback_child      # fallback: (pid, pgid, pidfd) of the job the client forked
         self.lock = Locked(os.path.join(runs_dir(), f"{rid}.lock"))
@@ -679,23 +754,6 @@ class Supervisor:
     def escaped_live(self):
         return {int(k): v for k, v in (self.s.get("escaped") or {}).items() if core.identity_alive(v)}
 
-    def in_job(self):
-        if self.s["mode"] == "systemd":
-            base = in_cgroup_fn(self.s["units"]["cgroup_path"], core.UID)
-            esc = set(self.escaped_live())
-            return lambda pid: pid in esc or base(pid)
-        others = other_run_groups(self.rid)
-        confirmed = set(self.s.get("reconciled", []))
-
-        def f(pid):
-            if pid in confirmed or core.proc_uid(pid) != core.UID:
-                return False
-            try:
-                return os.getpgid(pid) not in others
-            except OSError:
-                return False
-        return f
-
     def stop_signal(self, sig):
         s = self.s
         if s["mode"] == "systemd":
@@ -704,7 +762,7 @@ class Supervisor:
             killed_units = set()
             for pid, rec in esc.items():
                 unit = rec.get("unit")
-                if unit and unit not in killed_units and self.unit_exclusive(rec.get("cgroup"), esc):
+                if unit and unit not in killed_units and self.unit_exclusive(rec.get("cgroup"), unit, esc):
                     sysctl("kill", f"--signal={sig}", unit)   # every process in that unit is a recorded job process
                     killed_units.add(unit)
             for pid, rec in esc.items():
@@ -716,12 +774,16 @@ class Supervisor:
                 pass
 
     @staticmethod
-    def unit_exclusive(cg, esc):
-        """True only when every process in the unit's cgroup (and below) is a recorded job process; a unit that
-        also holds anything else is never signalled as a whole."""
-        if not cg or not cg.startswith("/"):
+    def unit_exclusive(cg, unit, esc):
+        """True only when every process of the unit (its own cgroup and everything below it, not just the subtree the
+        recorded process sits in) is a recorded process of this run."""
+        if not cg or not unit or not cg.startswith("/"):
             return False
-        pids = cgroup_pids(cg)
+        parts = cg.split("/")
+        if unit not in parts:
+            return False
+        top = "/".join(parts[:parts.index(unit) + 1])
+        pids = cgroup_pids(top)
         return bool(pids) and all(p in esc for p in pids)
 
     def group_state(self):
@@ -777,13 +839,25 @@ class Supervisor:
             gone = self.group_state() == "gone"
             if not gone:
                 remains.append("process group still has processes")
-        clear, mine, other, err = gpu_check(s["gpus"], self.in_job())
+        clear, mine, other, err = gpu_release_check(self.rid, s["gpus"], set(s.get("reconciled", [])))
         if err:
             remains.append(err)
         elif mine:
-            remains.append(f"job processes on GPUs: {','.join(map(str, mine))}")
+            remains.append(f"unattributed processes of {core.USER} on GPUs {core.gpu_text(s['gpus'])}: "
+                           f"{','.join(map(str, mine))} (bus reconcile {self.rid})")
         s["_other_on_gpus"] = other
+        # everything of the job is gone and only processes nobody's records explain remain: the owner decides
+        s["_reconcile"] = mine if (gone and not err and mine) else None
         return gone and clear, remains
+
+    def mark_reconcile(self):
+        s = self.s
+        if s.get("_reconcile"):
+            if s["state"] != "needs-reconcile":
+                s["state"] = s["entry_state"] = "needs-reconcile"
+                notice(self.rid, s, self.hooks, "needs-reconcile", pids=s["_reconcile"],
+                       action=f"stop them, or confirm they are not this run's: bus reconcile {self.rid} --confirm <pid>")
+            s["needs_reconcile"] = s["_reconcile"]
 
     def release_step(self, board):
         s, r = self.s, self.s["release"]
@@ -817,6 +891,7 @@ class Supervisor:
             r["remains"] = remains
             if ok:
                 return self.finish(board, released=True)
+            self.mark_reconcile()
             self.tell_stopping(board)
 
     def tell_stopping(self, board):
@@ -879,9 +954,16 @@ class Supervisor:
         rc, out = start_main_unit(self.rid, s)
         if rc:
             raise Refused(f"systemd-run for the job failed: {out.strip()[:300]}")
-        s["units"]["cgroup_path"] = cgroup_of(s["units"]["slice"], tries=5)
+        self.handoff_done()
+
+    def handoff_done(self):
+        s = self.s
+        s["units"]["cgroup_path"] = s["units"].get("cgroup_path") or cgroup_of(s["units"]["slice"], tries=5) \
+            or recover_cgroup(s["units"]["slice"])
+        s.pop("handoff_starting", None)
+        s.pop("handoff_waits", None)
         s["state"] = s["entry_state"] = "running"
-        s["main_started"] = now()
+        s["main_started"] = s.get("main_started") or now()
         with admit_lock(self.rid):       # exec opens only once the handoff is done and the job runs
             a = admit_read(self.rid)
             if a.get("admission") == "handoff":
@@ -911,7 +993,13 @@ class Supervisor:
             s.pop("identity_alarm")
             notice(self.rid, s, self.hooks, "board-identity-restored")
         try:
-            if s["mode"] == "systemd" and s["state"] in ("running", "leader-exited", "stopping") \
+            if s["state"] == "starting" and self.resolve_starting() != "running":
+                if s["state"] == "ended":
+                    return
+                s["last_pass"] = t
+                self.save()
+                return
+            if s["mode"] == "systemd" and s["state"] in ("running", "leader-exited", "stopping", "needs-reconcile") \
                     and not s["units"].get("cgroup_path"):
                 s["units"]["cgroup_path"] = recover_cgroup(s["units"]["slice"])
                 if not s["units"]["cgroup_path"]:
@@ -932,18 +1020,23 @@ class Supervisor:
             rows, entries = [], []
             if with_board:
                 entries = bk.entries_with_occupancy(board)
-                rows = bk.evaluate(board, t, entries=entries, sticky_lapsed=set(s.get("lapsed", [])), cache=self.cache)
+                full = self.passes % 12 == 0      # every minute, every receipt is read and hashed again
+                rows = bk.evaluate(board, t, entries=entries, sticky_lapsed=set(s.get("lapsed", [])),
+                                   cache=None if full else self.cache)
                 for r in rows:
                     if r.get("state") == "lapsed" and r["id"] not in s.setdefault("lapsed", []):
                         s["lapsed"].append(r["id"])
                 if time.monotonic() - t0 > core.PASS_BUDGET_S():
                     raise TimeoutError("board work over its deadline")
             prot, own = self.protected(rows, t)
+            if own and s.get("arrival_recorded") and s.get("arrival_revision") != own["revision"]:
+                s["arrival_recorded"] = False       # a new revision of the booking needs its own arrival
             if (with_board and own and s["class"] == "scheduled" and own["user"] == core.USER
                     and own.get("state") == "standing" and not s.get("arrival_recorded")
                     and s["state"] in ("running", "waiting-handoff")
                     and max(own["start"], own["objection_close"]) <= t <= own.get("lapse_at", t)):
-                s["arrival_recorded"] = bk.record_arrival(board, own["id"], self.rid, s["run"], t)
+                s["arrival_recorded"] = bk.record_arrival(board, own["id"], own["revision"], self.rid, s["run"], t)
+                s["arrival_revision"] = own["revision"]
             s["protected_until"] = own["end"] if prot else None
             if own and s["class"] == "scheduled" and own.get("state") == "objected" and not s.get("told_objected"):
                 s["told_objected"] = True
@@ -955,13 +1048,26 @@ class Supervisor:
                 if own is None or t >= (own or {}).get("end", 0):
                     s["end_reason"] = "the booking ended before the GPUs were handed over"
                     return self.finish(board if with_board else _NoBoard(), released=False)
-                waits = handoff_waits(board, entries, s) if with_board else ["board identity changed"]
-                s["handoff_waits"] = waits
-                if not waits:
+                known = main_unit_state(s["units"]["main"])
+                if known == "exists":     # started by a supervisor that died before saving it: finish the handoff
+                    self.handoff_done()
+                    notice(self.rid, s, self.hooks, "started", note="handoff complete (recovered after adoption)")
+                elif known == "absent" and not s.get("handoff_starting"):
+                    waits = handoff_waits(board, entries, s) if with_board else ["board identity changed"]
+                    s["handoff_waits"] = waits
+                    if not waits:
+                        s["handoff_starting"] = True
+                        self.save()          # progress first: a crash from here on finds the unit, not a new start
+                        self.start_main()
+                        notice(self.rid, s, self.hooks, "started", note="handoff complete")
+                elif known == "absent":   # the start was begun and no unit came of it: start it now
                     self.start_main()
                     notice(self.rid, s, self.hooks, "started", note="handoff complete")
+                else:
+                    s["pending_verification"] = "systemd did not answer about the job's unit"
             # requests and bookings (board records): only with the board's identity intact
-            if with_board and s["state"] in ("running", "leader-exited", "waiting-handoff") and not s.get("release"):
+            if with_board and s["state"] in ("running", "leader-exited", "waiting-handoff", "needs-reconcile") \
+                    and not s.get("release"):
                 for m in board.messages(self.rid):
                     if m["kind"] != "request" or m["request_id"] in s["requests"]:
                         continue
@@ -981,6 +1087,10 @@ class Supervisor:
                         notice(self.rid, s, self.hooks, "request", sender=m["sender"], msg=m["id"], refused=why)
                 if not s.get("release") and not prot:
                     yield_to = bk.standing_active_on(rows, s["gpus"], t, exclude=s.get("booking"))
+                    if yield_to:   # a consequential read: confirm with every receipt read and hashed again
+                        rows = bk.evaluate(board, t, entries=entries, sticky_lapsed=set(s.get("lapsed", [])),
+                                           cache=None)
+                        yield_to = bk.standing_active_on(rows, s["gpus"], t, exclude=s.get("booking"))
                     if yield_to:
                         b = yield_to[0]
                         self.start_release(f"yielded to booking {b['id']}")
@@ -990,7 +1100,7 @@ class Supervisor:
                 if s["state"] == "ended":
                     return
             # the main service and the slice
-            if s["state"] in ("running", "leader-exited") and not s.get("release"):
+            if s["state"] in ("running", "leader-exited", "needs-reconcile") and not s.get("release"):
                 st = self.main_status()
                 if st is not None:
                     s["exit_status"] = st if st >= 0 else s.get("exit_status")
@@ -999,9 +1109,11 @@ class Supervisor:
                     if ok:
                         s["end_reason"] = f"exited rc={s.get('exit_status')}"
                         return self.finish(board if with_board else _NoBoard(), released=False)
-                    if s["state"] != "leader-exited":
+                    if s["state"] not in ("leader-exited", "needs-reconcile"):
                         s["state"] = s["entry_state"] = "leader-exited"
                         notice(self.rid, s, self.hooks, "leader-exited", exit_status=st, remains=remains)
+                    if not out:
+                        self.mark_reconcile()
                     s["leader_remains"] = remains
             if s["mode"] == "systemd" and s["state"] in ("running", "leader-exited"):
                 self.track_escaped()
@@ -1065,16 +1177,8 @@ class Supervisor:
             if self.adopt:
                 s.setdefault("adoptions", []).append(dict(t=time.time(), code=build_id(), previous=prev.get("code")))
                 s["adoptions"] = s["adoptions"][-20:]
-            if s["state"] == "starting" and s["mode"] == "systemd":
-                if s.get("handoff"):
-                    s["state"] = s["entry_state"] = "waiting-handoff"
-                elif s.get("main_started") or unit_props(s["units"]["main"], "LoadState").get("LoadState") == "loaded":
-                    s["state"] = s["entry_state"] = "running"
-                else:
-                    s["end_reason"] = "its units never started"
-                    s["state"] = s["entry_state"] = "ended"
-                    self.save()
-                    return 0
+            if self.resolve_starting() == "ended":
+                return 0
             self.save()
             while s["state"] in NONTERMINAL:
                 start = time.monotonic()
@@ -1094,6 +1198,26 @@ class Supervisor:
             return 0
         finally:
             self.lock.release()
+
+    def resolve_starting(self):
+        """A run found in `starting` (its client died early): running when systemd shows its main unit, ended only when
+        systemd positively reports there is none; a failed query leaves it starting, to be asked again next pass."""
+        s = self.s
+        if s["state"] != "starting" or s["mode"] != "systemd":
+            return s["state"]
+        if s.get("handoff"):
+            s["state"] = s["entry_state"] = "waiting-handoff"
+            return s["state"]
+        known = "exists" if s.get("main_started") else main_unit_state(s["units"]["main"])
+        if known == "exists":
+            s["state"] = s["entry_state"] = "running"
+        elif known == "absent":
+            s["end_reason"] = "its units never started"
+            s["state"] = s["entry_state"] = "ended"
+            self.save()
+        else:
+            s["pending_verification"] = "systemd did not answer about the job's unit; still starting"
+        return s["state"]
 
     def maybe_upgrade(self):
         """Hot update: when the installed build differs from this one, save, drop the lock and exec it."""
@@ -1152,17 +1276,6 @@ def handoff_waits(board, entries, s):
                 uid = core.proc_uid(pid)
                 waits.append(f"process {pid} ({core.owner_name(uid) if uid is not None else '?'})")
     return waits
-
-
-def other_run_groups(rid):
-    """Process groups of this user's other live fallback runs (for the fallback GPU check)."""
-    out = set()
-    for name in os.listdir(runs_dir()):
-        if name.endswith(".json") and not name.endswith((".job.json", ".admit.json")) and name[:-5] != rid:
-            s = core.read_private(os.path.join(runs_dir(), name)) or {}
-            if s.get("state") in NONTERMINAL and s.get("mode") == "fallback" and s.get("pgid"):
-                out.add(s["pgid"])
-    return out
 
 
 # ------------------------------------------------------------------------------------------------ starting a run
@@ -1388,17 +1501,18 @@ def cmd_release(rid, reason=None, wait=None):
 
 
 def cmd_reconcile(rid, confirm):
+    """The owner's word on processes of theirs a release cannot attribute: list them, or confirm pids that are not this
+    run's (the supervisor then leaves them out). Stopping them instead also completes the release."""
     s = load_state(rid)
-    if s.get("mode") != "fallback":
-        raise Refused(f"{rid} runs under systemd: its release needs no reconciliation")
-    clear, mine, other, err = gpu_check(s["gpus"], lambda pid: core.proc_uid(pid) == core.UID
-                                        and pid not in set(s.get("reconciled", [])))
+    clear, mine, other, err = gpu_release_check(rid, s["gpus"], set(s.get("reconciled", [])))
     if confirm:
-        d = ctl_dir(rid)
-        p = os.path.join(d, f"reconcile-{time.time():.3f}.json")
-        core.write_private(p, dict(pids=[int(x) for x in confirm]))
-    return dict(id=rid, candidates=mine, confirmed=sorted(set(s.get("reconciled", [])) | set(int(x) for x in confirm or [])),
-                error=err)
+        bad = [p for p in confirm if int(p) not in mine]
+        if bad:
+            raise Refused(f"{', '.join(map(str, bad))}: not among the processes waiting on this run's reconciliation")
+        core.write_private(os.path.join(ctl_dir(rid), f"reconcile-{time.time():.3f}.json"),
+                           dict(pids=[int(x) for x in confirm]))
+    return dict(id=rid, state=s.get("state"), candidates=mine, other=other,
+                confirmed=sorted(set(s.get("reconciled", [])) | set(int(x) for x in confirm or [])), error=err)
 
 
 def cmd_adopt_all():

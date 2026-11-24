@@ -56,10 +56,12 @@ class Escapes(BusTest):
         other = subprocess.Popen(["sleep", "300"], env=env, start_new_session=True)
         self.procs.append(other)
         self.set_gpus(apps=[(1, other.pid)])
-        r = self.bus_json("release", d["id"], "--wait", str(40 * SCALE), "--json")
-        self.assertTrue(r["released"], r)
+        self.bus("release", d["id"], check=True)
+        st = self.wait_state(d["id"], "needs-reconcile", 40)   # ours, on the GPU, attributed to nothing: held
         self.assertIsNone(other.poll(), "a process that only claims the generation was signalled")
-        self.assertIn(f"{other.pid}:", " ".join(self.state(d["id"]).get("_other_on_gpus") or []))
+        self.assertNotIn(str(other.pid), st.get("escaped") or {})
+        self.bus("reconcile", d["id"], "--confirm", str(other.pid), check=True)
+        self.wait_state(d["id"], "ended", 20)
 
     @unittest.skipUnless(LINUX, "pidfd")
     def test_pidfd_signal_refuses_a_changed_identity(self):
@@ -317,7 +319,8 @@ class InheritanceAndArrival(unittest.TestCase):
 
     def test_on_time_arrival_keeps_a_finished_scheduled_booking_from_lapsing(self):
         b = booking("alice-1-a", "alice", [0], T0 + H, T0 + 5 * H)
-        arr = dict(id="alice-1-a", user="alice", entry="alice-1-run", run="a" * 32, arrived=T0 + H + 60, schema=2)
+        arr = dict(id="alice-1-a", user="alice", entry="alice-1-run", run="a" * 32, arrived=T0 + H + 60, schema=2,
+                   revision=b["_sha"], key=f"alice-1-a@{b['_sha'][:16]}")
         fb = FakeBoard([b], [], {1: receipt(1, b)}, arrivals=[arr])
         self.assertEqual(states(fb, T0 + 3 * H, entries=[])["alice-1-a"]["state"], "standing")
         late = dict(arr, arrived=T0 + H + 40 * 60)
@@ -326,7 +329,8 @@ class InheritanceAndArrival(unittest.TestCase):
 
     def test_arrival_by_another_user_does_not_count(self):
         b = booking("alice-1-a", "alice", [0], T0 + H, T0 + 5 * H)
-        arr = dict(id="alice-1-a", user="bob", entry="bob-1-run", run="a" * 32, arrived=T0 + H + 60, schema=2)
+        arr = dict(id="alice-1-a", user="bob", entry="bob-1-run", run="a" * 32, arrived=T0 + H + 60, schema=2,
+                   revision=b["_sha"], key=f"alice-1-a@{b['_sha'][:16]}")
         fb = FakeBoard([b], [], {1: receipt(1, b)}, arrivals=[arr])
         self.assertEqual(states(fb, T0 + 3 * H, entries=[])["alice-1-a"]["state"], "lapsed")
 
@@ -342,8 +346,9 @@ class ArrivalOnTheBoard(BusTest):
         wait_for(lambda: any(b["id"] == bid and b["state"] == "standing" for b in self.bus_json("cal", "--json")[
             "bookings"]), 15, what="standing")
         d = self.start(SLEEP, "3", "--scheduled", bid)
-        wait_for(lambda: (self.root / "arrivals" / f"{bid}.json").exists(), 15, what="the arrival record")
-        self.assertEqual(os.stat(self.root / "arrivals" / f"{bid}.json").st_mode & 0o777, 0o644)
+        arr = wait_for(lambda: next(iter((self.root / "arrivals").glob(f"{bid}@*.json")), None), 15,
+                       what="the arrival record")
+        self.assertEqual(os.stat(arr).st_mode & 0o777, 0o644)
         self.bus_json("release", d["id"], "--wait", str(40 * SCALE), "--json")
         time.sleep(4)   # past the no-show limit with no run on the booking
         b = next(b for b in self.bus_json("cal", "--json")["bookings"] if b["id"] == bid)

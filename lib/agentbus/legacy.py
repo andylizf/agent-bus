@@ -435,7 +435,9 @@ def verify_pending(o):
     for aid, rec in list(pend.items()):
         ok, remains = legacy_release_check(rec)
         if ok:
-            text = f"{rec['why']}; task '{rec['task']}' was stopped and gpus {rec['gpus']} on {core.HOST} are free"
+            # only about our own release: other users' work on those GPUs is not ours to report on
+            text = (f"{rec['why']}; task '{rec['task']}' was stopped and none of its processes remain on gpus "
+                    f"{rec['gpus']} on {core.HOST}")
         elif now() - rec["signalled"] >= PENDING_TELL_S and not rec.get("told_stopping"):
             text = f"{rec['why']}; stopping, not yet free: {'; '.join(remains)}"
             rec["told_stopping"] = True

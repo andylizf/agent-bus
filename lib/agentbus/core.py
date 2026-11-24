@@ -34,11 +34,12 @@ SAMPLE_EVERY = lambda: env_num("AGENT_BUS_SAMPLE_EVERY", 24)  # passes between G
 IDLE_S = lambda: env_num("AGENT_BUS_IDLE_S", 1800)           # under 5% this long: idle backfill
 
 MAX_RECORD = 64 * 1024
+RACY_NS = 5 * 10 ** 9      # receipts changed this recently are always re-read (ctime granularity)
 MAX_LISTING = 20000
 NOTE_MAX, MSG_NOTE_MAX, REASON_MAX = 80, 200, 200
 KINDS = ("training", "eval", "benchmark-timing", "serving", "interactive-dev", "other")
 CLASSES = ("scheduled", "backfill")
-ENTRY_STATES = ("running", "stopping", "leader-exited", "ended", "waiting-handoff")
+ENTRY_STATES = ("running", "stopping", "leader-exited", "ended", "waiting-handoff", "needs-reconcile")
 SCHEMA = 2
 
 USER = pwd.getpwuid(os.getuid()).pw_name
@@ -471,7 +472,9 @@ def check_objection(o):
 
 def check_arrival(x):
     return (isinstance(x.get("user"), str) and owned_id(x.get("id"), x["user"]) and isinstance(x.get("entry"), str)
-            and owned_id(x["entry"], x["user"]) and is_int(x.get("arrived")) and x.get("schema") == SCHEMA)
+            and owned_id(x["entry"], x["user"]) and is_int(x.get("arrived")) and x.get("schema") == SCHEMA
+            and isinstance(x.get("revision"), str) and HEX64.fullmatch(x["revision"]) is not None
+            and x.get("key") == f"{x['id']}@{x['revision'][:16]}")
 
 
 def check_receipt(r):
@@ -565,7 +568,11 @@ class Board:
         return self.ok
 
     def dir(self, *parts):
-        """A descriptor for a directory under the board (cached for this Board's life), or None when missing."""
+        """A descriptor for a directory under the board (cached for this Board's life), or None when missing. Every
+        part must be one plain name: no record field ever becomes a path here."""
+        for p in parts:
+            if not isinstance(p, str) or not p or p in (".", "..") or "/" in p or "\0" in p:
+                raise Refused(f"bad name {p!r} on the board")
         key = "/".join(parts)
         if key not in self._dirs:
             fd, owned = self.fd, False
@@ -643,7 +650,7 @@ class Board:
         return self.records("objections", check_objection)
 
     def arrivals(self):
-        return self.records("arrivals", check_arrival)
+        return self.records("arrivals", check_arrival, stem_field="key")
 
     def receipts(self, cache=None):
         """{slot: receipt} from seq/<k>/<n>, only in blocks owned by the board's creator. `cache` (a dict) keeps
@@ -681,7 +688,10 @@ class Board:
                     continue
                 slot = int(name)
                 key = (slot, ino)
-                if cache is not None and key in cache:
+                # a receipt changed within RACY_NS of now may have kept its (inode, ctime, size) key on a coarse
+                # clock: it is read and hashed again rather than trusted from the cache
+                racy = time.time_ns() - ino[1] < RACY_NS
+                if cache is not None and key in cache and not racy:
                     out[slot] = cache[key]
                     n += 1
                     continue
@@ -706,6 +716,10 @@ class Board:
         return self.records(f"inbox/{box}", check_message, owner_field="sender")
 
     def inbox_owner(self, box):
+        try:
+            component(box, "inbox")
+        except Refused:
+            return None
         fd = self.dir("inbox")
         if fd is None:
             return None
