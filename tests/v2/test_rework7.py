@@ -88,6 +88,21 @@ class GcUnderTheRunLock(BusTest):
         self.assertTrue((self.root / "agents" / f"{rid}.json").exists())
 
 
+class ArchiveWithoutTheFlag(BusTest):
+    def test_an_entry_written_before_the_state_was_saved_is_still_archived(self):
+        """The first supervisor wrote its entry and was SIGKILLed before saving entry_on_board; the adopter ends the
+        run and must archive the entry that is on the board."""
+        rid = f"{core.USER}-20261125-000000-flag"
+        sup = runner.Supervisor(rid)
+        sup.s = dict(id=rid, host="h", gpus=[0], run="a" * 32, started=1, until=2, kind="other", entry_state="ended",
+                     end_reason="exited rc=0", **{"class": "backfill"})          # no entry_on_board
+        (self.root / "agents" / f"{rid}.json").write_text("{}")
+        with core.Board(str(self.root)) as b:
+            sup.archive_entry(b)
+        self.assertFalse((self.root / "agents" / f"{rid}.json").exists())
+        self.assertTrue(list((self.root / "archive").glob(f"{rid}-*.json")))
+
+
 class ArchiveRewrite(BusTest):
     def test_a_failed_end_record_rewrite_is_recorded(self):
         rid = f"{core.USER}-20261124-000000-arc"

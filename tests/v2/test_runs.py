@@ -576,7 +576,12 @@ class Runs(BusTest):
         wait_for(lambda: runner.slice_state(st["units"]["cgroup_path"]) != "populated", 10, what="slice empty")
         self.bus_json("adopt", "--all")
         st = self.wait_state(d["id"], "ended", 30)
-        self.assertFalse(self.entry_file(d["id"]).exists())
+        self.assertFalse(self.entry_file(d["id"]).exists(), json.dumps(dict(
+            state={k: st.get(k) for k in ("end_reason", "archive_error", "entry_on_board", "supervisor", "adoptions",
+                                          "pass_errors")},
+            notices=[n["event"] for n in st.get("notices", [])], agents=os.listdir(self.root / "agents"),
+            archive=os.listdir(self.root / "archive"), entry=self.entry_file(d["id"]).read_text()
+            if self.entry_file(d["id"]).exists() else None), default=str))
         self.assertTrue(list((self.root / "archive").glob(f"{d['id']}-*.json")))
 
     def test_run_whose_units_never_started_recorded_ended(self):

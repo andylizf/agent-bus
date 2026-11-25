@@ -702,12 +702,24 @@ class Supervisor:
             self.s["entry_on_board"] = True
 
     def archive_entry(self, board):
-        if not board.ok or not self.s.get("entry_on_board"):
+        """Archive the run's entry if it is on the board. Decided by the board, not by the state's entry_on_board: a
+        supervisor killed between writing its first entry and saving its state leaves that flag unset."""
+        if not board.ok:
             return
         afd, gfd = board.dir("agents"), board.dir("archive")
+        try:
+            st = os.stat(f"{self.rid}.json", dir_fd=afd, follow_symlinks=False)
+        except FileNotFoundError:
+            self.s["entry_on_board"] = False
+            return
+        if st.st_uid != core.UID:
+            return
         dest = f"{self.rid}-{now()}.json"
         try:
             os.rename(f"{self.rid}.json", dest, src_dir_fd=afd, dst_dir_fd=gfd)
+        except FileNotFoundError:
+            self.s["entry_on_board"] = False
+            return
         except OSError as e:          # left on the board and said so; `bus gc --mine` archives it later
             self.s["archive_error"] = f"{core.errno_name(e)}: {e}"
             return
