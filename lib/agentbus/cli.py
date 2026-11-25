@@ -292,6 +292,11 @@ def cmd_gc(a):
                         if not st:
                             res["unknown"].append(e["id"])
                         continue
+                    pinned = st.get("board") or {}
+                    if (st.get("run") != e.get("run") or str(pinned.get("inode")) != str(b.ino)
+                            or str(pinned.get("fsid")) != str(b.fsid)):
+                        res["unknown"].append(e["id"])   # another generation or another board: not this run's entry
+                        continue
                     afd, gfd = b.dir("agents"), b.dir("archive")
                     try:
                         os.rename(f"{e['id']}.json", f"{e['id']}-{now()}.json", src_dir_fd=afd, dst_dir_fd=gfd)
@@ -349,6 +354,15 @@ def cmd_doctor(a):
                   f"board host {b.host}, this host {core.HOST}")
     except (OSError, Refused) as e:
         check("board pin", False, str(e))
+    try:
+        fd = os.pidfd_open(os.getpid())
+        import signal as _sig
+        _sig.pidfd_send_signal(fd, 0)
+        os.close(fd)
+        check("pidfd", True, "pidfd_open and pidfd_send_signal work")
+    except (AttributeError, OSError) as e:
+        check("pidfd", False, f"unavailable ({e!r}): bus can signal no process of a run, so releases never complete "
+                              f"and GPUs stay held; needs Linux 5.3+ and Python 3.9+")
     rc, o, _ = runner.sysctl("is-enabled", "bus-adopt.timer")
     check("adopt timer", o.strip() == "enabled", o.strip() or "not installed")
     check("build", os.path.exists(core.BIN()), f"{core.BIN()} -> {runner.installed_build()}; this {runner.build_id()}")

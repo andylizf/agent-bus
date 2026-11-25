@@ -442,23 +442,38 @@ def descendants_outside(cg_rel, known=(), procs=None):
     the slice or one of `known` (pids already recorded as the job's). An Apptainer instance's init is one: systemd
     moves it into a scope of its own while the monitor that started it is still in the job."""
     procs = uid_procs() if procs is None else procs
-    known = set(known)
+    known = dict(known) if isinstance(known, dict) else {}
     return {pid: cg for pid, cg in procs.items()
             if not in_tree(cg, cg_rel) and pid not in known and _reaches(pid, cg_rel, known, procs)}
 
 
 def _reaches(pid, cg_rel, known, procs):
-    """Whether the parent chain of `pid`, read from /proc now, reaches a process in the slice or a known one."""
+    """Whether the parent chain of `pid`, read from /proc now, reaches a process in the slice or a recorded escape.
+    `known` maps pid -> its recorded identity: an ancestor vouches only while the process now at that pid is the
+    recorded one (a pid recycled after its process died, or pruned, vouches for nothing)."""
     p, n = pid, 0
     while n < 64:
         p = _ppid(p)
         if not p or p <= 1:
             return False
         cg = procs.get(p) or core.proc_cgroup(p)
-        if (cg and in_tree(cg, cg_rel)) or p in known:
+        if cg and in_tree(cg, cg_rel):
+            return True
+        rec = known.get(p) if isinstance(known, dict) else None
+        if rec is not None and core.identity_state(rec) == "alive":
             return True
         n += 1
     return False
+
+
+def pidfd_available():
+    try:
+        fd = os.pidfd_open(os.getpid())
+        signal.pidfd_send_signal(fd, 0)
+        os.close(fd)
+        return True
+    except (AttributeError, OSError):
+        return False
 
 
 def pidfd_signal(rec, sig):
@@ -798,7 +813,8 @@ class Supervisor:
             return {}
         rec = {k: v for k, v in (s.get("escaped") or {}).items() if not core.identity_gone(v)}
         procs = uid_procs()
-        for pid in list(descendants_outside(cg, [int(k) for k in rec], procs)):
+        known = {int(k): v for k, v in rec.items()}
+        for pid in list(descendants_outside(cg, known, procs)):
             if str(pid) in rec:
                 continue
             # pidfd first; identity and ancestry are then read while it pins the process, and the pidfd is checked to
@@ -809,7 +825,7 @@ class Supervisor:
                 continue
             try:
                 ident = core.proc_identity(pid)
-                reaches = _reaches(pid, cg, {int(k) for k in rec}, procs)
+                reaches = _reaches(pid, cg, known, procs)
                 pcg = core.proc_cgroup(pid)
                 signal.pidfd_send_signal(fd, 0)          # raises if the pinned process has exited
             except OSError:
@@ -1312,6 +1328,7 @@ class Supervisor:
                 print(f"bus: {self.rid} runs on {s['host']}, not here", file=sys.stderr)
                 return 1
             self.hooks = Hooks(s.get("on_message"))
+            self.check_pidfd()
             prev = s.get("supervisor") or {}
             s["supervisor"] = dict(code=build_id(), pid=os.getpid(), boot_id=core.boot_id(),
                                    ticks=core.proc_ticks(os.getpid()))
@@ -1339,6 +1356,15 @@ class Supervisor:
             return 0
         finally:
             self.lock.release()
+
+    def check_pidfd(self):
+        """Without pidfd nothing of the run outside its slice can be signaled safely: releases stay unverified and its
+        GPUs stay held. That is the safe side, and the owner is told once."""
+        if self.s.get("mode") == "systemd" and not pidfd_available() and not self.s.get("told_pidfd"):
+            self.s["told_pidfd"] = True
+            notice(self.rid, self.s, self.hooks, "pidfd-unavailable",
+                   action="this host lacks pidfd (Linux 5.3+, Python 3.9+): processes of this run outside its slice "
+                          "cannot be signaled, so a release may not complete and its GPUs stay held")
 
     def resolve_starting(self):
         """A run found in `starting` (its client died early): running when systemd shows its main unit, ended only when

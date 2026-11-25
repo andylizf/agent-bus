@@ -67,8 +67,12 @@ class GcUnderTheRunLock(BusTest):
         live, ended, unknown = (f"{core.USER}-20261124-00000{i}-g" for i in range(3))
         for rid in (live, ended, unknown):
             self.entry(rid)
-        core.write_private(runner.state_path(live), dict(id=live, state="running", host="elsewhere"))
-        core.write_private(runner.state_path(ended), dict(id=ended, state="ended", host=core.HOST))
+        with core.Board(str(self.root)) as b:
+            pin = dict(path=b.path, inode=b.ino, fsid=b.fsid)
+        core.write_private(runner.state_path(live), dict(id=live, state="running", host="elsewhere", run="a" * 32,
+                                                         board=pin))
+        core.write_private(runner.state_path(ended), dict(id=ended, state="ended", host=core.HOST, run="a" * 32,
+                                                          board=pin))
         r = self.bus_json("gc", "--mine", "--json")
         self.assertEqual(r["archived"], [ended])
         self.assertEqual(r["unknown"], [unknown])
