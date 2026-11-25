@@ -255,7 +255,7 @@ def cmd_stop_hook(a):
 # ------------------------------------------------------------------------------------------------ runs
 
 def cmd_release(a):
-    r = runner.cmd_release(a.id, a.reason, a.wait)
+    r = runner.cmd_release(a.id, a.reason, a.wait, a.run)
     if a.json:
         out(r)
     else:
@@ -497,6 +497,7 @@ def parser():
     s.add_argument("argv", nargs="*")
     s = p("release", cmd_release, "release one of your runs (verified)")
     s.add_argument("id")
+    s.add_argument("--run", help="the generation meant; refused if the run is now another")
     s.add_argument("--reason")
     s.add_argument("--wait", type=float)
     s.add_argument("--json", action="store_true")

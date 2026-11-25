@@ -100,7 +100,7 @@ class ArchiveWithoutTheFlag(BusTest):
         sup = runner.Supervisor(rid)
         sup.s = dict(id=rid, host="h", gpus=[0], run="a" * 32, started=1, until=2, kind="other", entry_state="ended",
                      end_reason="exited rc=0", **{"class": "backfill"})          # no entry_on_board
-        (self.root / "agents" / f"{rid}.json").write_text("{}")
+        (self.root / "agents" / f"{rid}.json").write_text(json.dumps(dict(id=rid, run="a" * 32)))
         with core.Board(str(self.root)) as b:
             sup.archive_entry(b)
         self.assertFalse((self.root / "agents" / f"{rid}.json").exists())
@@ -113,7 +113,7 @@ class ArchiveRewrite(BusTest):
         sup = runner.Supervisor(rid)
         sup.s = dict(id=rid, host="h", gpus=[0], run="a" * 32, started=1, until=2, kind="other", entry_state="ended",
                      end_reason="exited rc=0", entry_on_board=True, **{"class": "backfill"})
-        (self.root / "agents" / f"{rid}.json").write_text("{}")
+        (self.root / "agents" / f"{rid}.json").write_text(json.dumps(dict(id=rid, run="a" * 32)))
         with core.Board(str(self.root)) as b, mock.patch.object(core, "replace", side_effect=OSError(5, "EIO")):
             sup.archive_entry(b)
         self.assertIn("rewrite", sup.s.get("archive_error", ""))

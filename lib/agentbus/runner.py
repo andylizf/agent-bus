@@ -456,14 +456,30 @@ def _reaches(pid, cg_rel, known, procs):
         p = _ppid(p)
         if not p or p <= 1:
             return False
-        cg = procs.get(p) or core.proc_cgroup(p)
-        if cg and in_tree(cg, cg_rel):
+        if _live_in_slice(p, cg_rel):        # read now, through a pidfd: a scan's cached cgroup never decides
             return True
         rec = known.get(p) if isinstance(known, dict) else None
         if rec is not None and core.identity_state(rec) == "alive":
             return True
         n += 1
     return False
+
+
+def _live_in_slice(pid, cg_rel):
+    """Whether `pid` is in the slice now: its cgroup read while a pidfd pins the process, then the pidfd checked to
+    still name a live process (so the answer is about that process, not a successor at the same pid)."""
+    try:
+        fd = os.pidfd_open(pid)
+    except (OSError, AttributeError):
+        return False
+    try:
+        cg = core.proc_cgroup(pid)
+        signal.pidfd_send_signal(fd, 0)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return bool(cg) and in_tree(cg, cg_rel)
 
 
 def pidfd_available():
@@ -712,6 +728,9 @@ class Supervisor:
         board.writable()
         data = core.dumps(self.entry())
         if data != self.s.get("_entry_written"):
+            cur = core.read_json(board.wdir("agents"), f"{self.rid}.json")
+            if cur and cur[0].get("run") != self.s["run"]:
+                raise Refused(f"the board holds {self.rid} for another generation ({cur[0].get('run')}); not overwritten")
             core.replace(board.wdir("agents"), f"{self.rid}.json", data)
             self.s["_entry_written"] = data.decode()
             self.s["entry_on_board"] = True
@@ -728,6 +747,12 @@ class Supervisor:
             self.s["entry_on_board"] = False
             return
         if st.st_uid != core.UID:
+            return
+        cur = core.read_json(afd, f"{self.rid}.json")
+        if not cur or cur[0].get("run") != self.s.get("run"):
+            # an entry of the same id but another generation (or unreadable): not this run's to archive
+            self.s["archive_error"] = "the entry on the board is not this run's generation; left in place"
+            self.s["entry_on_board"] = False
             return
         dest = f"{self.rid}-{now()}.json"
         try:
@@ -1671,8 +1696,10 @@ def run_fallback(rid, a):
 
 # ------------------------------------------------------------------------------------------------ owner commands
 
-def cmd_release(rid, reason=None, wait=None):
+def cmd_release(rid, reason=None, wait=None, run=None):
     s = load_state(rid)
+    if run is not None and s.get("run") != run:
+        raise Refused(f"{rid} is now run {s.get('run')}, not {run}: refusing to release another generation")
     if s["state"] == "ended":
         return dict(id=rid, state="ended", released=True, remains=[])
     d = ctl_dir(rid)
