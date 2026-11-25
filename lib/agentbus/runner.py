@@ -329,9 +329,10 @@ def other_runs_attribution(rid):
             rec = (st.get("escaped") or {}).get(str(pid))
             if rec and core.identity_alive(rec):
                 return st["id"]
-            if st.get("mode") == "fallback" and st.get("pgid"):
-                try:
-                    if os.getpgid(pid) == st["pgid"]:
+            leader = st.get("leader")
+            if st.get("mode") == "fallback" and leader and core.identity_state(leader) == "alive":
+                try:        # the group id is the recorded leader's, and that leader is alive: not a recycled group
+                    if os.getpgid(pid) == leader["pid"]:
                         return st["id"]
                 except OSError:
                     pass
@@ -442,20 +443,22 @@ def descendants_outside(cg_rel, known=(), procs=None):
     moves it into a scope of its own while the monitor that started it is still in the job."""
     procs = uid_procs() if procs is None else procs
     known = set(known)
-    out = {}
-    for pid, cg in procs.items():
-        if in_tree(cg, cg_rel) or pid in known:
-            continue
-        p, n = pid, 0
-        while n < 64:
-            p = _ppid(p)
-            if not p or p <= 1:
-                break
-            if (p in procs and in_tree(procs[p], cg_rel)) or p in known:
-                out[pid] = cg
-                break
-            n += 1
-    return out
+    return {pid: cg for pid, cg in procs.items()
+            if not in_tree(cg, cg_rel) and pid not in known and _reaches(pid, cg_rel, known, procs)}
+
+
+def _reaches(pid, cg_rel, known, procs):
+    """Whether the parent chain of `pid`, read from /proc now, reaches a process in the slice or a known one."""
+    p, n = pid, 0
+    while n < 64:
+        p = _ppid(p)
+        if not p or p <= 1:
+            return False
+        cg = procs.get(p) or core.proc_cgroup(p)
+        if (cg and in_tree(cg, cg_rel)) or p in known:
+            return True
+        n += 1
+    return False
 
 
 def pidfd_signal(rec, sig):
@@ -711,8 +714,8 @@ class Supervisor:
         try:
             e = dict(self.entry(), state="ended", end_reason=self.s.get("end_reason"), ended=now())
             core.replace(gfd, dest, core.dumps(e))
-        except OSError:
-            pass
+        except OSError as err:       # archived, but its end record not written: said so on the run
+            self.s["archive_error"] = f"rewrite: {core.errno_name(err)}: {err}"
         hb = board.dir("agents", ".heartbeat")
         if hb is not None:
             core.unlink_own(hb, self.rid)
@@ -783,9 +786,25 @@ class Supervisor:
             return {}
         rec = {k: v for k, v in (s.get("escaped") or {}).items() if not core.identity_gone(v)}
         procs = uid_procs()
-        for pid, pcg in descendants_outside(cg, [int(k) for k in rec], procs).items():
-            ident = core.proc_identity(pid)
-            if ident:
+        for pid in list(descendants_outside(cg, [int(k) for k in rec], procs)):
+            if str(pid) in rec:
+                continue
+            # pidfd first; identity and ancestry are then read while it pins the process, and the pidfd is checked to
+            # still name a live process afterwards, so a pid reused between the reads is never recorded
+            try:
+                fd = os.pidfd_open(pid)
+            except (OSError, AttributeError):
+                continue
+            try:
+                ident = core.proc_identity(pid)
+                reaches = _reaches(pid, cg, {int(k) for k in rec}, procs)
+                pcg = core.proc_cgroup(pid)
+                signal.pidfd_send_signal(fd, 0)          # raises if the pinned process has exited
+            except OSError:
+                continue
+            finally:
+                os.close(fd)
+            if ident and pcg and reaches and not in_tree(pcg, cg):
                 rec[str(pid)] = dict(ident, unit=unit_of(pcg), cgroup=pcg, seen=now())
         s["escaped"] = rec
         return rec
@@ -911,8 +930,16 @@ class Supervisor:
         else:
             s.pop("gpu_view", None)
         # everything of the job is gone and only processes nobody's records explain remain: the owner decides
-        s["_reconcile"] = dict(pids=mine, held=sorted(held) or sorted(s.get("held_gpus") or gpus),
-                               released=sorted(set(gpus) - set(held or s.get("held_gpus") or gpus))) \
+        # the per-GPU picture comes from this pass's scan alone: with the job not yet gone, or the scan failed, every
+        # GPU is held; otherwise exactly the GPUs carrying an unattributed process of ours are
+        if err or not gone:
+            cur_held = list(gpus)
+        else:
+            cur_held = sorted(held) if held else (sorted(s.get("held_gpus") or gpus) if mine else [])
+        if s.get("held_gpus") is not None or s.get("gpus_released"):
+            s["held_gpus"] = cur_held
+            s["gpus_released"] = sorted(set(gpus) - set(cur_held)) if (gone and not err and mine) else []
+        s["_reconcile"] = dict(pids=mine, held=cur_held, released=sorted(set(gpus) - set(cur_held))) \
             if (gone and not err and mine) else None
         return gone and clear, remains
 

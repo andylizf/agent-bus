@@ -275,13 +275,23 @@ def cmd_gc(a):
             res["orphans"].append(dict(id=rid, state=r["state"], mode=r.get("mode"),
                                        note="no supervisor holds it: `bus adopt --all` (systemd mode) or stop its "
                                             "processes by hand (fallback mode)"))
+    res["unknown"] = []
     with board() as b:
         if b.ok:
             for e in b.entries():
                 if e["user"] != core.USER:
                     continue
-                st = states.get(e["id"])
-                if st is None or st["state"] == "ended":
+                # decided under the run's own supervisor lock, from its private state read now: only a run that is
+                # positively ended is archived; one with no private state, or live, is left and listed
+                lk = runner.Locked(os.path.join(runner.runs_dir(), f"{e['id']}.lock"))
+                if not lk.acquire():
+                    continue                         # a supervisor holds it: live
+                try:
+                    st = core.read_private(runner.state_path(e["id"]))
+                    if not st or st.get("state") != "ended":
+                        if not st:
+                            res["unknown"].append(e["id"])
+                        continue
                     afd, gfd = b.dir("agents"), b.dir("archive")
                     try:
                         os.rename(f"{e['id']}.json", f"{e['id']}-{now()}.json", src_dir_fd=afd, dst_dir_fd=gfd)
@@ -291,12 +301,16 @@ def cmd_gc(a):
                             core.unlink_own(hb, e["id"])
                     except OSError:
                         pass
+                finally:
+                    lk.release()
     if a.json:
         return out(res)
     for o in res["orphans"]:
         print(f"orphan {o['id']} ({o['state']}, {o['mode']}): {o['note']}")
     for x in res["archived"]:
-        print(f"archived {x} (no live private run)")
+        print(f"archived {x} (its run has ended)")
+    for x in res["unknown"]:
+        print(f"left {x}: no private state of its run here, so not known to be ended")
 
 
 def cmd_doctor(a):

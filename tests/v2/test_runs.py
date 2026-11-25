@@ -646,7 +646,7 @@ class Runs(BusTest):
         self.assertIn("released", out)
         self.assertIn(f"WATCH {d['id']} ended", out)
 
-    def test_gc_lists_orphan_and_archives_own_stale_entry(self):
+    def test_gc_lists_orphan_and_leaves_an_entry_whose_run_is_unknown(self):
         d = self.start(SLEEP)
         os.kill(self.state(d["id"])["supervisor"]["pid"], signal.SIGKILL)
         stale = dict(id=f"{core.USER}-20261123-000000-stale", user=core.USER, host="h", gpus=[0], booking=None,
@@ -657,7 +657,8 @@ class Runs(BusTest):
         time.sleep(0.5)
         r = self.bus_json("gc", "--mine", "--json")
         self.assertEqual([o["id"] for o in r["orphans"]], [d["id"]])
-        self.assertEqual(r["archived"], [stale["id"]])
+        self.assertEqual(r["archived"], [])                 # no private state: unknown, never archived
+        self.assertEqual(r["unknown"], [stale["id"]])
         self.assertTrue(self.entry_file(d["id"]).exists())
 
     def test_reply_and_mailbox(self):
