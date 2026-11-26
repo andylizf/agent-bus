@@ -17,7 +17,7 @@ same id.
   is authorized when its file is the sender's own and `0644`, it names the run's current generation, and the run is
   not inside its own standing booking; any other request is shown and does nothing.
 - A scheduled run is protected only inside its own standing booking's window. Book first with `bus book`, wait until
-  the booking stands, meaning its objection window (30 minutes by default) closed with no reasoned objection, then
+  the booking stands, meaning its objection window (15 minutes by default, 10 minutes minimum) closed with no reasoned objection, then
   start it with `bus run --scheduled <booking-id>`. Before the booking stands and after its window, it is backfill.
 - A booking lapses if no run of yours is on it within 30 minutes of its start, and a lapsed booking protects nothing.
 - A booking starts at most 7 days ahead and lasts at most 24 hours, and your bookings add up to at most 96 GPU-hours in

@@ -95,30 +95,35 @@ def tile(g, entries, slot, usage, now, span_s):
         f'title="{esc(u)}: {gib(mb):.1f} GiB"></span>' for u, mb in occ if mb)
     who = []
     for u, mb in occ:
-        flag = "" if u in board_users else '<span class="flag">Off board</span>'
+        flag = "" if u in board_users else '<span class="flag">Not on board</span>'
         memory = f"{gib(mb):.1f} GiB" if mb else ""
         who.append(f'<li class="who"><span class="dot" style="--c:var(--u{slot[u]})"></span>'
                    f'<span class="name">{esc(u)}</span><span class="mem">{memory}</span>{flag}</li>')
     tasks = []
-    for e in mine:
+    for e in sorted(mine, key=lambda entry: not entry["protected"]):
         kind = e["class"]
         display = "Scheduled" if kind == "scheduled" else "Backfill"
         if kind == "scheduled" and not e["protected"]:
             display = "Scheduled · backfill now"
-        tags = [f'<span class="tag {kind}">{display}</span>']
+        treatment = "scheduled" if e["protected"] else "backfill"
+        tags = [f'<span class="tag {treatment}">{display}</span>']
         if e["state"] != "running":
             tags.append(f'<span class="tag warn">{esc(e["state"])}</span>')
         if e["idle"]:
             tags.append('<span class="tag">Idle</span>')
         if e["occupancy"] != "live":
             tags.append('<span class="tag warn">Heartbeat unknown</span>')
-        until = f'until {clock(e["until"], e["until"] - now > 12 * 3600)}' if e["until"] else ""
+        if e["protected"] and e["started"] and e["until"]:
+            until = span(e["started"], e["until"], now)
+        else:
+            until = f'until {clock(e["until"], e["until"] - now > 12 * 3600)}' if e["until"] else ""
         note = f'<p class="task-text">{esc(e["note"])}</p>' if e["note"] else ""
         tasks.append(f'<div class="task"><div class="task-meta"><span class="dot" style="--c:var(--u{slot[e["user"]]})"></span>'
                      f'<b>{esc(e["user"])}</b> {"".join(tags)}<span class="until">{until}</span></div>{note}</div>')
     util = "–" if g["util"] is None else f'{g["util"]}<small>%</small>'
     mem = f'<b>{gib(g["mem_mb"]):.0f}</b> / {gib(total):.0f} GiB' if total else "Memory unavailable"
-    return f'''<article class="tile {state}" aria-label="GPU {g["gpu"]}, {label}">
+    status = " has-scheduled" if any(e["protected"] for e in mine) else ""
+    return f'''<article class="tile {state}{status}" aria-label="GPU {g["gpu"]}, {label}">
   <header class="tile-head"><h3>GPU {g["gpu"]}</h3><span class="state-pill {state}">{label}</span></header>
   <ul class="whos">{"".join(who)}</ul>
   <div class="gauge">
@@ -218,17 +223,20 @@ def calendar(data, slot, now):
                 label = "Scheduled" if e["protected"] else "Backfill"
                 if e["class"] == "scheduled" and not e["protected"]:
                     label = "Scheduled · backfill now"
-                detail = f'Expected end {clock(e["until"], True)}' if e["until"] else "End unknown"
+                detail = span(e["started"], e["until"], now) if e["protected"] and e["started"] and e["until"] else (
+                    f'Expected end {clock(e["until"], True)}' if e["until"] else "End unknown")
                 if e["occupancy"] != "live":
                     detail += "\nHeartbeat unknown"
             else:
-                label = "Off board"
+                label = "Not on board"
                 detail = f'{gib(it["mb"]):.1f} GiB on GPU {gi}, end unknown'
             tip = f'{it["user"]} · {label}\n{detail}'
             if it.get("note"):
                 tip += "\n" + it["note"]
             block_label = state.title() if it["kind"] == "book" else label
             text = f'<b>{esc(it["user"])}</b> <span class="t">{esc(block_label)}</span>'
+            if it["kind"] == "scheduled":
+                text += f' <span class="t">{esc(detail.splitlines()[0])}</span>'
             if it["clash"]:
                 tip += "\noverlaps: " + ", ".join(sorted({o["user"] for o in it["clash"]}))
             blocks.append(f'<div class="blk {it["kind"]} {state}{" clash" if it["clash"] else ""}" '
@@ -309,21 +317,25 @@ def render(data, snapshot=False):
   <p>Previous 3 h and next 72 h · Eastern time</p></div>
 <div class="cal-card">
   <div class="legend">
-    <span><i class="sw sw-book"></i>Booking</span>
     <span><i class="sw sw-scheduled"></i>Scheduled run</span>
     <span><i class="sw sw-backfill"></i>Backfill run</span>
-    <span><i class="sw sw-unreg"></i>Off board · end unknown</span>
+    <span><i class="sw sw-unreg"></i>Not on board · end unknown</span>
+    <span><i class="sw sw-book"></i>Booking</span>
     <span><i class="sw sw-clash"></i>Overlap</span>
     <span><i class="sw sw-night"></i>22:00–07:00</span>
   </div>
   {calendar(data, slot, now)}
   <p class="scroll-hint">Scroll sideways for later days.</p>
 </div></section>
-<section aria-labelledby="h-book"><div class="sec-head"><h2 id="h-book">Bookings</h2></div>
+<section aria-labelledby="h-book"><div class="sec-head"><h2 id="h-book">Bookings</h2><p>{OBJECTION_WINDOW}</p></div>
 {booking_table(bookings, slot, now)}</section>
 <footer>Agents book GPUs with <a href="https://github.com/andylizf/agent-bus#bookings-as-public-notices"><code>bus book</code></a>{board}.</footer>
 </main><script>{JS}</script></body></html>
 '''
+
+
+OBJECTION_WINDOW = (f"Objection window: {core.DEFAULT_LIMITS['default_objection_s'] // 60} min by default, "
+                    f"{core.DEFAULT_LIMITS['min_objection_s'] // 60} min minimum.")
 
 
 CSS = r"""
@@ -334,6 +346,7 @@ CSS = r"""
   --line: #dadce0; --line-2: #e8eaed; --accent: #1a73e8; --pill: #d3e3fd; --pill-ink: #041e49;
   --now: #1a73e8; --night: rgba(60, 64, 67, 0.045); --past: rgba(60, 64, 67, 0.06);
   --free: #137333; --free-bg: #f3faf5; --warn: #b05a00; --warn-bg: #fef7e0; --crit: #c5221f; --crit-bg: #fce8e6;
+  --scheduled: #184e9c; --scheduled-bg: #e0ebfc; --backfill: #41684d; --backfill-bg: #edf5ee;
   --u1: #2a78d6; --u2: #eb6834; --u3: #1baf7a; --u4: #eda100; --u5: #e87ba4; --u6: #008300; --u7: #6250d6; --u8: #e34948;
   --body: "Hanken Grotesk", "Helvetica Neue", Arial, sans-serif;
   --mono: "Google Sans Code", ui-monospace, "SF Mono", Menlo, monospace;
@@ -344,6 +357,7 @@ CSS = r"""
   --line: #3c3f41; --line-2: #2a2b2d; --accent: #a8c7fa; --pill: #0b3a82; --pill-ink: #d3e3fd;
   --now: #a8c7fa; --night: rgba(168, 199, 250, 0.045); --past: rgba(0, 0, 0, 0.28);
   --free: #6dd58c; --free-bg: #16231a; --warn: #f6ae5a; --warn-bg: #2d2214; --crit: #f28b82; --crit-bg: #3a1d1b;
+  --scheduled: #b7d2ff; --scheduled-bg: #243a59; --backfill: #92b99c; --backfill-bg: #202d24;
   --u1: #3987e5; --u2: #d95926; --u3: #199e70; --u4: #c98500; --u5: #d55181; --u6: #2a9a2a; --u7: #9085e9; --u8: #e66767;
   color-scheme: dark; } }
 * { box-sizing: border-box; }
@@ -382,7 +396,7 @@ code, .mono { font-family: var(--mono); font-size: 0.86em; }
 .state-pill { margin-left: auto; color: var(--ink-2); }
 .state-pill.free { color: var(--free); }
 .state-pill.claimed { color: var(--muted); border-style: dashed; }
-.flag { color: var(--warn); }
+.flag { color: var(--crit); background: var(--crit-bg); }
 .tag { font-size: 11.5px; font-weight: 600; color: var(--ink-2); background: var(--wash-2); border-radius: 4px; padding: 1px 6px; }
 .tag.excl { color: var(--crit); background: var(--crit-bg); }
 .tag.warn { color: var(--warn); background: var(--warn-bg); }
@@ -394,6 +408,7 @@ code, .mono { font-family: var(--mono); font-size: 0.86em; }
 @media (max-width: 600px) { .tiles { grid-template-columns: minmax(0, 1fr); } }
 .tile { background: var(--bg); padding: 16px 18px 16px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .tile.free { background: var(--free-bg); }
+.tile.has-scheduled { box-shadow: inset 0 3px var(--scheduled); }
 .tile-head { display: flex; align-items: baseline; gap: 8px; }
 .tile-head h3 { font: 600 18px/1 var(--body); margin: 0; }
 .whos { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; min-height: 24px; }
@@ -461,10 +476,12 @@ code, .mono { font-family: var(--mono); font-size: 0.86em; }
 .blk b { font-weight: 600; }
 .blk .t { color: var(--ink-2); font-variant-numeric: tabular-nums; }
 .blk.book, .sw-book { background: color-mix(in srgb, var(--c) 18%, var(--bg)); box-shadow: inset 0 0 0 1.5px var(--c); }
-.blk.scheduled, .sw-scheduled { background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--c) 24%, var(--bg)) 0 5px,
-  color-mix(in srgb, var(--c) 10%, var(--bg)) 5px 10px); box-shadow: inset 3px 0 0 var(--c); }
-.blk.unreg, .sw-unreg { background: linear-gradient(90deg, color-mix(in srgb, var(--c) 22%, var(--bg)) 0 55%, transparent);
-  box-shadow: inset 3px 0 0 var(--c); border-radius: 0 4px 4px 0; }
+.blk.scheduled, .sw-scheduled { background: var(--scheduled-bg); color: var(--scheduled);
+  box-shadow: inset 0 0 0 1px var(--scheduled), inset 4px 0 var(--scheduled); }
+.blk.scheduled .t { color: var(--scheduled); font-weight: 700; }
+.blk.unreg, .sw-unreg { background: linear-gradient(90deg, var(--crit-bg) 0 65%, transparent);
+  color: var(--crit); box-shadow: inset 2px 0 var(--crit); }
+.blk.unreg .t { color: var(--crit); }
 .blk.clash, .sw-clash { outline: 2px solid var(--crit); outline-offset: -1px; }
 .sw-night { background: color-mix(in srgb, var(--ink) 9%, transparent); }
 .now-line { position: absolute; top: -3px; bottom: -3px; border-left: 2px solid var(--now); margin-left: -1px; }
@@ -483,15 +500,17 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 
 .blk.backfill, .sw-backfill {
-  background: repeating-linear-gradient(45deg, color-mix(in srgb, var(--c) 14%, var(--bg)) 0 3px,
-    color-mix(in srgb, var(--c) 4%, var(--bg)) 3px 7px);
-  border: 1px dashed var(--c);
+  color: var(--backfill); background: var(--backfill-bg);
+  border: 1px solid color-mix(in srgb, var(--backfill) 32%, transparent);
 }
+.blk.backfill .t { color: var(--backfill); }
 .blk.book.pending { box-shadow: none; border: 1px dashed var(--c); }
 .blk.book.objected, .blk.book.lapsed, .blk.book.invalid, .blk.book.over-budget {
   background: var(--wash); color: var(--ink-2);
 }
-.state-pill.standing, .tag.scheduled { color: var(--free); }
+.state-pill.standing { color: var(--free); }
+.tag.scheduled { color: var(--scheduled); background: var(--scheduled-bg); font-weight: 700; }
+.tag.backfill { color: var(--backfill); background: var(--backfill-bg); }
 .state-pill.pending { color: var(--warn); border-style: dashed; }
 .state-pill.objected, .state-pill.conflicting { color: var(--crit); }
 .state-pill.lapsed, .state-pill.invalid, .state-pill.over-budget { color: var(--muted); }

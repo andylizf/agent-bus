@@ -50,7 +50,7 @@ class States(unittest.TestCase):
         b = booking("alice-1-a", "alice", [0, 1], T0 + H, T0 + 2 * H)
         self.assertEqual(self.one(b, T0 + 60)["state"], "pending")
 
-    def test_standing_after_default_30_min(self):
+    def test_standing_after_saved_30_min_window(self):
         b = booking("alice-1-a", "alice", [0, 1], T0 + H, T0 + 2 * H)
         r = self.one(b, T0 + 1800)
         self.assertEqual(r["state"], "standing")
@@ -276,7 +276,7 @@ class Parsing(unittest.TestCase):
 
 
 class Receipts(BusTest):
-    board_settings = dict(min_objection_s=600, default_objection_s=1800)
+    board_settings = {}
 
     def book(self, *extra, gpus="0", start=None, end=None):
         t = int(time.time())
@@ -288,6 +288,9 @@ class Receipts(BusTest):
         b = json.loads(self.book("--slug", "second").stdout)
         self.assertEqual((a["slot"], b["slot"]), (1, 2))
         self.assertEqual(a["state"], "pending")
+        booking = next(record for record in self.bus_json("cal", "--json")["bookings"] if record["id"] == a["id"])
+        self.assertEqual(booking["objection_s"], 900)
+        self.assertEqual(booking["objection_close"] - booking["receipt_time"], 900)
         self.assertTrue((self.root / "seq" / "0" / "1").is_file())
         self.assertEqual(oct((self.root / "seq" / "0" / "1").stat().st_mode & 0o777), "0o644")
 

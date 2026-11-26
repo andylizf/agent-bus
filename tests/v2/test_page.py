@@ -58,8 +58,9 @@ class Page(unittest.TestCase):
         code, body = self.get(port)
         self.assertEqual(code, 200)
         for s in ("Hanken Grotesk", "Scheduled run", "Backfill run", "Scheduled · backfill now",
-                  "Standing", "Pending", "Objected", "Lapsed", "carol: Class deadline", "erin", "Off board",
-                  "now-line", "sw-night", "spark-line", "22.5 GiB", "bus book", 'name="robots"'):
+                  "Standing", "Pending", "Objected", "Lapsed", "carol: Class deadline", "erin", "Not on board",
+                  "now-line", "sw-night", "spark-line", "22.5 GiB", "bus book", 'name="robots"',
+                  "15 min by default, 10 min minimum", 'class="tag scheduled"', 'class="tag backfill"'):
             self.assertIn(s, body)
         self.assertIn('class="blk scheduled', body)
         self.assertIn('class="blk backfill', body)
@@ -75,6 +76,26 @@ class Page(unittest.TestCase):
         self.assertIn("[redacted]", body)
         for note in ("<img src=x onerror=alert(1)>", "192.0.2.10", "2001:db8::1", "hf.example.com", "srun train"):
             self.assertEqual(page.public_note(note), "[redacted]")
+
+    def test_public_feed_exposes_only_display_fields(self):
+        data = sample()
+        data["gpus"][0]["users"]["192.0.2.10"] = 100
+        data["gpus"][0]["users"]["Unknown user"] = 200
+        data["gpus"][0]["pid"] = 42
+        data["entries"][0].update(command="python /private/work.py", note="private-token", id="hidden")
+        data["bookings"][0]["id"] = "private-booking"
+        feed = page.public_feed(data)
+        self.assertEqual(set(feed), {"t", "board", "gpus", "entries", "bookings"})
+        self.assertEqual(set(feed["gpus"][0]), {"gpu", "mem_mb", "total_mb", "util", "users", "available"})
+        self.assertEqual(set(feed["entries"][0]), {"gpus", "user", "started", "until", "kind"})
+        self.assertEqual(set(feed["bookings"][0]), {"gpus", "user", "start", "end", "state", "objection_close"})
+        self.assertEqual(feed["board"], "/test/board")
+        self.assertEqual(feed["gpus"][0]["users"], {"bob": 23000, "Unknown user": 300})
+        self.assertEqual([entry["kind"] for entry in feed["entries"]], ["backfill", "scheduled", "backfill"])
+        self.assertEqual(feed["bookings"][0]["state"], "standing")
+        for private in ("192.0.2.10", "password", "/private/work.py", "private-token", "private-booking",
+                        "Class deadline", "gpuhost", "Fake GPU"):
+            self.assertNotIn(private, json.dumps(feed))
 
     def test_only_get_root_is_served(self):
         port, _ = self.serve()

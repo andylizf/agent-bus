@@ -131,7 +131,7 @@ def public_bookings(bookings, now, gid):
     ]
 
 
-def collect(conf):
+def collect(conf, *, history=True):
     now = core.now()
     data = dict(t=now, host=core.HOST, board="", model="GPUs", entries=[], bookings=[], gpus=[], notices=[])
     gid, ngpus = None, 0
@@ -157,8 +157,30 @@ def collect(conf):
     except (OSError, ValueError, subprocess.SubprocessError):
         data["notices"].append("Live GPU readings unavailable.")
         data["gpus"] = [dict(gpu=g, available=False, users={}, util=None, mem_mb=0, total_mb=0) for g in range(ngpus)]
-    data["usage"] = usage_history(now)
+    if history:
+        data["usage"] = usage_history(now)
     return data
+
+
+def public_feed(data):
+    """Project a board reading onto the fields displayed by the public page."""
+    def netid(user):
+        return user if NETID.fullmatch(user) else "Unknown user"
+
+    gpus = []
+    for gpu in data["gpus"]:
+        users = {}
+        for user, mem in gpu["users"].items():
+            name = netid(user)
+            users[name] = users.get(name, 0) + mem
+        gpus.append(dict(gpu=gpu["gpu"], mem_mb=gpu["mem_mb"], total_mb=gpu["total_mb"],
+                         util=gpu["util"], users=users, available=gpu["available"]))
+    entries = [dict(user=netid(entry["user"]), gpus=entry["gpus"], started=entry["started"], until=entry["until"],
+                    kind="scheduled" if entry["protected"] else "backfill") for entry in data["entries"]]
+    bookings = [dict(user=netid(booking["user"]), gpus=booking["gpus"], start=booking["start"], end=booking["end"],
+                     state=booking["state"], objection_close=booking["objection_close"])
+                for booking in data["bookings"] if booking["state"] in BOOKING_STATES]
+    return dict(t=data["t"], board=data["board"], gpus=gpus, entries=entries, bookings=bookings)
 
 
 class Page:

@@ -53,7 +53,7 @@ booking's standing window right now; a pending booking does not block it.
 ### Bookings as public notices
 
 `bus book --gpus 0-3 --from 2026-11-24T22:00-05:00 --to 2026-11-25T01:00-05:00` publishes a booking. Silence is
-consent: the booking stands once its objection window closes (30 minutes by default, never under 10) unless someone
+consent: the booking stands once its objection window closes (15 minutes by default, never under 10) unless someone
 publishes an objection with a reason, `bus object <booking-id> --reason "<why>"`. No message goes to anyone; the
 board and its read-only page (`bus page`, below) are the notice. When a standing booking's window starts, every backfill run on its GPUs releases,
 the booker's own included.
@@ -174,13 +174,15 @@ will own its directories, with `~/src/agent-bus/setup-board.sh <board-dir> <gpu-
 
 ### B300 board on the web
 
-The [B300 board](https://b300-board.github.io/) opens the live view when its Cloudflare Quick Tunnel is reachable.
-The [latest snapshot](https://b300-board.github.io/snapshot.html) stays on GitHub Pages. Both views use the
-same renderer and expose GPU use, lab NetIDs, booking times and filtered notes.
+The [B300 board](https://b300-board.github.io/) polls the [public feed](https://cc.zhifei.li/b300/board.json)
+every 15 seconds. The feed contains GPU memory and utilization, lab NetIDs, run windows and booking states.
+The page shows the [latest snapshot](https://b300-board.github.io/snapshot.html) if the feed fails and marks
+readings stale after two minutes.
 
-On della-tridao, `b300-board-tunnel.service` runs `tools/board_tunnel.py` as a user service for the loopback page.
-It writes the current URL to `~/.local/state/b300-board-tunnel/url` and logs next to it. The mac-mini launchd job
-`io.github.andylizf.b300-board-publish` runs `tools/publish_pages.py` every ten minutes.
+On mac-mini, `io.github.andylizf.b300-board-live` runs `tools/board_feed.py`. It collects one reading over a
+shared SSH connection and sends the JSON to the upload-only SSH command `tools/board_upload.py`.
+`io.github.andylizf.b300-board-publish` runs `tools/publish_pages.py` every ten minutes to publish
+`snapshot.json` with the static shell. Build the shell with `python3 tools/publish_pages.py --build-shell DIR`.
 
 `kind` is one of `training`, `eval`, `benchmark-timing`, `serving`, `interactive-dev`, `other`. `--hours` is the
 expected length shown on the board (24 by default; it limits nothing). `--mem-max` caps the job's memory as systemd's

@@ -455,7 +455,7 @@ def board_settings(text):
 
 
 DEFAULT_LIMITS = dict(gpus=8, horizon_s=7 * 86400, max_len_s=24 * 3600, min_objection_s=600, budget_gpu_h=96.0,
-                      budget_span_s=7 * 86400, lapse_s=1800, default_objection_s=1800)
+                      budget_span_s=7 * 86400, lapse_s=1800, default_objection_s=900)
 
 
 # ------------------------------------------------------------------------------------------------ record shapes

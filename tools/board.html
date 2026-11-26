@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta name="board-feed" content="@FEED@">
+  <title>B300 GPU board</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&amp;family=Google+Sans+Code:wght@400;500;600&amp;display=swap">
+  <link rel="stylesheet" href="@CSS@">
+  <script src="@JS@" defer></script>
+</head>
+<body>
+<main class="wrap">
+  <header class="top">
+    <p class="eyebrow"><span id="mode">GPU board</span><time class="stamp" id="stamp"></time></p>
+    <h1>B300 GPU board <span id="gpu-count"></span></h1>
+    <div class="summary" id="summary" hidden></div>
+    <div class="notes" role="status"><p id="status">Loading board data…</p></div>
+    <noscript>JavaScript is required to display the board.</noscript>
+  </header>
+  <section aria-labelledby="h-now" id="now-section" hidden>
+    <div class="sec-head"><h2 id="h-now">Now</h2><p>Memory by user · current GPU utilization</p></div>
+    <div class="tiles" id="tiles"></div>
+  </section>
+  <section aria-labelledby="h-cal" id="cal-section" hidden>
+    <div class="sec-head"><h2 id="h-cal">Calendar</h2><p>Previous 3 h and next 72 h · Eastern time</p></div>
+    <div class="cal-card">
+      <div class="legend">
+        <span><i class="sw sw-scheduled"></i>Scheduled run</span>
+        <span><i class="sw sw-backfill"></i>Backfill run</span>
+        <span><i class="sw sw-unreg"></i>Not on board · end unknown</span>
+        <span><i class="sw sw-book"></i>Booking</span>
+        <span><i class="sw sw-clash"></i>Overlap</span>
+        <span><i class="sw sw-night"></i>22:00–07:00</span>
+      </div>
+      <div class="cal-scroll" id="calendar" tabindex="0" aria-label="Calendar, scrolls sideways"></div>
+      <p class="scroll-hint">Scroll sideways for later days.</p>
+    </div>
+  </section>
+  <section aria-labelledby="h-book" id="book-section" hidden>
+    <div class="sec-head"><h2 id="h-book">Bookings</h2><p>@OBJECTION@</p></div>
+    <div id="bookings"></div>
+  </section>
+  <footer>Agents book GPUs with <a href="https://github.com/andylizf/agent-bus#bookings-as-public-notices"><code>bus book</code></a><span id="board-path"></span>.</footer>
+</main>
+</body>
+</html>
