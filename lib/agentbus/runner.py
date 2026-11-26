@@ -800,6 +800,30 @@ class Supervisor:
             return True, b
         return False, b
 
+    def notice_bookings_ahead(self, rows, t):
+        s = self.s
+        told = s.setdefault("told_booking_ahead", [])
+        for b in rows:
+            if b["state"] not in ("pending", "standing") or b["id"] == s.get("booking"):
+                continue
+            effective_start = max(b["start"], b["objection_close"])
+            if b["receipt_time"] < s["started"] or not t < effective_start < min(s["until"], b["end"]):
+                continue
+            gpus = sorted(set(s["gpus"]).intersection(b["gpus"]))
+            key = f"{b['id']}@{b['revision']}"
+            if not gpus or key in told:
+                continue
+            # Save which revision this run is announcing so an adopting supervisor does not announce it again.
+            told.append(key)
+            try:
+                self.save()
+            except OSError:
+                told.pop()
+                raise
+            notice(self.rid, s, self.hooks, "booking-ahead", booking=b["id"], revision=b["revision"],
+                   sender=b["user"], gpus=gpus, state=b["state"], start=b["start"], end=b["end"],
+                   objection_close=b["objection_close"])
+
     def authorized(self, board, m, prot):
         """Design 3.10: why a request may not stop the run, or None when it may."""
         if m.get("_mode") != 0o644:
@@ -1272,6 +1296,8 @@ class Supervisor:
                         b = yield_to[0]
                         self.start_release(f"yielded to booking {b['id']}")
                         board.log("yield", entry=self.rid, booking=b["id"], booker=b["user"])
+                    elif s["state"] in ("running", "leader-exited"):
+                        self.notice_bookings_ahead(rows, t)
             if s.get("release"):
                 self.release_step(board if with_board else _NoBoard())
                 if s["state"] == "ended":
