@@ -15,5 +15,7 @@ if q.startswith("--query-gpu="):
                "memory.used": g.get("mem", 0), "memory.total": 100000, "name": "Fake GPU", "pci.bus_id": "0"}
         print(", ".join(str(row[f]) for f in fields))
 elif q.startswith("--query-compute-apps="):
+    fields = q.split("=", 1)[1].split(",")
     for a in spec.get("apps", []):
-        print(f"{a['uuid']}, {a['pid']}")
+        row = {"gpu_uuid": a["uuid"], "pid": a["pid"], "used_gpu_memory": a.get("mem", 0)}
+        print(", ".join(str(row[f]) for f in fields))

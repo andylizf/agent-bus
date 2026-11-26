@@ -1,98 +1,164 @@
-"""`bus page`: the read-only board page, rendered by one's own install (design 3.11).
+"""Collect and serve the public view of the read-only board."""
 
-Runs with their class, bookings with their state and objections, and the live nvidia-smi view with processes of
-users not on the board shown as off-board use. GET only; nothing is written anywhere. Bounds: 16 handler threads, overload
-answered 503; one 15 s deadline per connection, enforced by shutting the socket down; collection in one refresher
-thread with 20 s subprocess timeouts; the last good page served with a banner when a refresh fails.
-"""
-import html, socket, threading, time
-from datetime import datetime
+import json
+import os
+import pwd
+import re
+import socket
+import subprocess
+import threading
+import time
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from socketserver import ThreadingMixIn
 
 from . import bookings as bk
-from . import core, runner
+from . import core
+from .board_view import HISTORY, PAST, ROBOTS, clock, render
 
 THREADS = 16
 CONN_DEADLINE_S = 15.0
 REFRESH_S = 20.0
+NETID = re.compile(r"[a-z][a-z0-9]{1,15}\Z")
+BOOKING_STATES = {"standing", "pending", "conflicting", "objected", "over-budget", "lapsed", "invalid"}
+
+# Free text can contain anything. Withhold a note that resembles a path, network address, credential or command.
+PRIVATE_TEXT = re.compile(
+    r"[/\\=@\x60|$<>;&]|\b(?:[a-z][a-z0-9_-]*\.)+(?:[a-z]{2,}|local)\b|"
+    r"\b(?:\d{1,3}\.){3}\d{1,3}\b|(?:[\da-f]{0,4}:){2,}[\da-f]{0,4}|"
+    r"\b(?:token|secret|credentials?|bearer|password|passwd|passphrase|api[-_ ]?key|private[-_ ]?key)\b|"
+    r"\b(?:cmd|command)\s*:|\b(?:srun|sbatch|curl|wget|scp|ssh|bash|sh|zsh|python[23]?|torchrun|uv run|git|make)\s+\S|"
+    r"(?<!\w)--[a-z]|\b[a-z0-9_+.-]{24,}\b",
+    re.IGNORECASE,
+)
+
+
+def public_note(note):
+    note = " ".join((note or "").split())
+    return "[redacted]" if PRIVATE_TEXT.search(note) else note
+
+
+@lru_cache(maxsize=256)
+def lab_user(user, gid):
+    if user and NETID.fullmatch(user) and gid is not None:
+        try:
+            if gid in os.getgrouplist(user, pwd.getpwnam(user).pw_gid):
+                return user
+        except KeyError:
+            pass
+    return "Unknown user"
+
+
+def smi(query):
+    result = subprocess.run([core.NVSMI(), query, "--format=csv,noheader,nounits"],
+                            capture_output=True, text=True, timeout=8, check=True)
+    return [[cell.strip() for cell in line.split(",")] for line in result.stdout.splitlines()
+            if line.strip() and not line.startswith("No running")]
+
+
+def gpu_view(gid):
+    models = set()
+    by_uuid = {}
+    for idx, uuid, used, total, util, name in smi("--query-gpu=index,uuid,memory.used,memory.total,utilization.gpu,name"):
+        models.add(name.removeprefix("NVIDIA ").split()[0])
+        by_uuid[uuid] = dict(gpu=int(idx), mem_mb=int(used), total_mb=int(total),
+                             util=int(util) if util.isdigit() else None, users={}, available=True)
+    for uuid, pid, mem in smi("--query-compute-apps=gpu_uuid,pid,used_gpu_memory"):
+        gpu = by_uuid.get(uuid)
+        if gpu is not None:
+            uid = core.proc_uid(int(pid))
+            user = lab_user(core.owner_name(uid) if uid is not None else None, gid)
+            users = gpu["users"]
+            users[user] = users.get(user, 0) + (int(mem) if mem.isdigit() else 0)
+    model = models.pop() if len(models) == 1 else "GPU"
+    return model, sorted(by_uuid.values(), key=lambda g: g["gpu"])
+
+
+def usage_history(now):
+    """Read the private per-run telemetry tails and reduce them to host-wide GPU utilization by timestamp."""
+    per_gpu = {}
+    try:
+        files = Path(core.STATE(), "usage").glob("*.jsonl")
+        for path in files:
+            try:
+                if path.is_symlink() or not path.is_file() or path.stat().st_mtime < now - HISTORY:
+                    continue
+                with path.open("rb") as f:
+                    size = f.seek(0, os.SEEK_END)
+                    if size > 256 * 1024:
+                        f.seek(size - 256 * 1024)
+                        f.readline()
+                    else:
+                        f.seek(0)
+                    for line in f:
+                        try:
+                            row = json.loads(line)
+                            t = row["t"]
+                            if type(t) is int and now - HISTORY <= t <= now:
+                                for gpu, util in row["util"].items():
+                                    if type(util) is int and 0 <= util <= 100:
+                                        samples = per_gpu.setdefault(int(gpu), {})
+                                        samples[t] = max(util, samples.get(t, 0))
+                        except (AttributeError, KeyError, TypeError, ValueError):
+                            continue
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return {gpu: sorted(samples.items()) for gpu, samples in sorted(per_gpu.items())}
+
+
+def public_entries(entries, bookings, gid):
+    by_id = {b["id"]: b for b in bookings}
+    output = []
+    for e in entries:
+        b = by_id.get(e.get("booking"))
+        protected = (e["class"] == "scheduled" and b is not None and b["user"] == e["user"]
+                     and b["active"] and set(e["gpus"]) <= set(b["gpus"]))
+        output.append(dict(user=lab_user(e["user"], gid), gpus=e["gpus"], started=e["started"], until=e["until"],
+                           state=e["state"], occupancy=e["occupancy"], idle=bool(e.get("idle")), protected=protected,
+                           note=public_note(e.get("note")), **{"class": e["class"]}))
+    return output
+
+
+def public_bookings(bookings, now, gid):
+    return [
+        dict(user=lab_user(b["user"], gid), gpus=b["gpus"], start=b["start"], end=b["end"], state=b["state"],
+             objection_close=b.get("objection_close"), note=public_note(b.get("note")),
+             objections=[dict(user=lab_user(o["user"], gid), reason=public_note(o["reason"])) for o in b["objections"]])
+        for b in bookings if b["state"] in BOOKING_STATES and now - PAST < b["end"] and b["start"] < now + 7 * 86400
+    ]
 
 
 def collect(conf):
-    data = dict(t=core.now(), host=core.HOST, errors=[])
+    now = core.now()
+    data = dict(t=now, host=core.HOST, board="", model="GPUs", entries=[], bookings=[], gpus=[], notices=[])
+    gid, ngpus = None, 0
     try:
         with core.Board.from_conf(conf) as b:
+            if not b.ok:
+                raise core.Refused("board identity changed")
+            gid = os.fstat(b.fd).st_gid
+            ngpus = b.ngpus
             entries = bk.entries_with_occupancy(b)
-            data.update(identity="ok" if b.ok else "changed", board=b.path, ngpus=b.ngpus,
-                        entries=[core.clean(e) for e in entries],
-                        bookings=bk.evaluate(b, entries=entries), warnings=b.warnings)
-    except (OSError, core.Refused) as e:
-        data["errors"].append(f"v2 board: {e}")
-        data.setdefault("entries", [])
-        data.setdefault("bookings", [])
-    ok, idx, apps, util = runner.nvidia_view(timeout=20)
-    gpus = {i: dict(gpu=i, uuid=u, util=util.get(i), procs=[]) for i, u in idx.items()}
-    by_uuid = {u: i for i, u in idx.items()}
-    for uuid, pid in apps:
-        if uuid in by_uuid:
-            uid = core.proc_uid(pid)
-            gpus[by_uuid[uuid]]["procs"].append(core.owner_name(uid) if uid is not None else "?")
-    if not ok:
-        data["errors"].append("nvidia-smi failed")
-    data["gpus"] = [gpus[i] for i in sorted(gpus)]
+            seen = (core.read_private(os.path.join(core.STATE(), "slots.json")) or {}).get("slots", {})
+            bookings = bk.evaluate(b, now, seen=seen, entries=entries, record=False)
+            data.update(board=b.path, entries=public_entries(entries, bookings, gid),
+                        bookings=public_bookings(bookings, now, gid))
+            if b.warnings:
+                data["notices"].append("Some board records could not be read.")
+    except (OSError, core.Refused):
+        data["notices"].append("Board records unavailable.")
+    try:
+        data["model"], data["gpus"] = gpu_view(gid)
+        if not data["gpus"]:
+            raise ValueError("empty GPU listing")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        data["notices"].append("Live GPU readings unavailable.")
+        data["gpus"] = [dict(gpu=g, available=False, users={}, util=None, mem_mb=0, total_mb=0) for g in range(ngpus)]
+    data["usage"] = usage_history(now)
     return data
-
-
-def esc(x):
-    return html.escape(str(x if x is not None else ""))
-
-
-def when(t):
-    return datetime.fromtimestamp(t).strftime("%a %m-%d %H:%M") if isinstance(t, (int, float)) else "-"
-
-
-def render(d, banner=None):
-    on_board = {e["user"] for e in d.get("entries", [])}
-    claimed = {}
-    for e in d.get("entries", []):
-        for g in e["gpus"]:
-            claimed.setdefault(g, []).append(e["user"])
-    rows = []
-    for g in d.get("gpus", []):
-        users = sorted(set(g["procs"]))
-        off = [u for u in users if u not in on_board]
-        rows.append(f"<tr><td>gpu{g['gpu']}</td><td>{esc(g['util'])}%</td><td>{esc(', '.join(users) or '-')}</td>"
-                    f"<td>{esc(', '.join(sorted(set(claimed.get(g['gpu'], [])))) or '-')}</td>"
-                    f"<td>{'off-board use: ' + esc(', '.join(off)) if off else ''}</td></tr>")
-    ents = "".join(
-        f"<tr><td>{esc(e['id'])}</td><td>{esc(e['user'])}</td><td>{esc(core.gpu_text(e['gpus']))}</td>"
-        f"<td>{esc(e['class'])}{' (idle)' if e.get('idle') else ''}</td><td>{esc(e['state'])}</td>"
-        f"<td>{esc(e['occupancy'] if e['occupancy'] == 'live' else 'occupancy unknown')}</td>"
-        f"<td>{esc(when(e['until']))}</td><td>{esc(e['kind'])}</td><td>{esc(e.get('note'))}</td></tr>"
-        for e in d.get("entries", []))
-    books = "".join(
-        f"<tr><td>{esc(b['id'])}</td><td>{esc(b['user'])}</td><td>{esc(core.gpu_text(b['gpus']))}</td>"
-        f"<td>{esc(when(b['start']))} - {esc(when(b['end']))}</td><td>{esc(b['state'])}</td>"
-        f"<td>{esc(when(b.get('objection_close')))}</td><td>{esc(b['kind'])}</td><td>{esc(b.get('note'))}</td>"
-        f"<td>{'<br>'.join(esc(o['user'] + ': ' + o['reason']) for o in b.get('objections', [])) or esc(b.get('why'))}</td></tr>"
-        for b in d.get("bookings", []) if b.get("state") != "unpublished")
-    notes = "".join(f"<p class=warn>{esc(x)}</p>" for x in (([banner] if banner else []) + d.get("errors", [])
-                                                            + d.get("warnings", [])))
-    ident = "" if d.get("identity", "ok") == "ok" else "<p class=warn>board identity changed: shown as read</p>"
-    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GPU board</title><style>
-:root{{--bg:#fff;--fg:#1b1b1b;--mute:#666;--line:#ddd;--warn:#9a3b00}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#151515;--fg:#eee;--mute:#aaa;--line:#333;--warn:#ffb070}}}}
-body{{background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif;margin:16px;max-width:1200px}}
-table{{border-collapse:collapse;width:100%;margin-bottom:20px}}td,th{{border-bottom:1px solid var(--line);padding:4px 8px;text-align:left;vertical-align:top}}
-th{{color:var(--mute);font-weight:600}}.warn{{color:var(--warn)}}.wrap{{overflow-x:auto}}h2{{font-size:16px;margin:20px 0 6px}}
-</style></head><body>
-<h1 style="font-size:20px">GPUs of {esc(d.get('host'))} <span style="color:var(--mute);font-size:13px">as of {esc(when(d.get('t')))}; read-only</span></h1>
-{notes}{ident}
-<h2>Now on each GPU</h2><div class=wrap><table><tr><th>GPU</th><th>use</th><th>processes of</th><th>v2 entries of</th><th></th></tr>{''.join(rows)}</table></div>
-<h2>v2 runs</h2><div class=wrap><table><tr><th>id</th><th>user</th><th>GPUs</th><th>class</th><th>state</th><th>heartbeat</th><th>until</th><th>kind</th><th>note</th></tr>{ents or '<tr><td colspan=9>none</td></tr>'}</table></div>
-<h2>Bookings</h2><div class=wrap><table><tr><th>id</th><th>user</th><th>GPUs</th><th>window</th><th>state</th><th>objections until</th><th>kind</th><th>note</th><th>objections / why</th></tr>{books or '<tr><td colspan=9>none</td></tr>'}</table></div>
-</body></html>"""
 
 
 class Page:
@@ -106,9 +172,9 @@ class Page:
             h = render(self.collect_fn())
             with self.lock:
                 self.html, self.ok_at, self.err = h, time.time(), None
-        except Exception as e:  # the last good page stays, with a banner
+        except Exception:  # preserve the last good page without exposing diagnostics
             with self.lock:
-                self.err = f"{type(e).__name__}: {e}"
+                self.err = True
 
     def loop(self):
         while True:
@@ -119,11 +185,10 @@ class Page:
         with self.lock:
             h, err, at = self.html, self.err, self.ok_at
         if h is None:
-            return 503, "<p>collecting; try again in a few seconds</p>" + (f"<p>{esc(err)}</p>" if err else "")
+            return 503, "<p>Board data unavailable. Try again in a few seconds.</p>"
         if err:
-            banner = (f"<p class=warn>refresh failed ({esc(err)}); showing the page from "
-                      f"{esc(when(at))}</p>")
-            h = h.replace("<body>", "<body>" + banner, 1)
+            banner = f"<p class=warn>Board refresh failed. Showing data from {clock(at)} ET.</p>"
+            h = h.replace('<div class="notes" role="status">', '<div class="notes" role="status">' + banner, 1)
         return 200, h
 
 
@@ -139,7 +204,9 @@ class Server(ThreadingMixIn, HTTPServer):
     def process_request(self, request, client_address):
         if not self.slots.acquire(blocking=False):
             try:
-                request.sendall(b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                request.settimeout(0.1)
+                request.sendall((f"HTTP/1.0 503 Service Unavailable\r\nX-Robots-Tag: {ROBOTS}\r\n"
+                                 "Content-Length: 0\r\nConnection: close\r\n\r\n").encode())
             except OSError:
                 pass
             self.shutdown_request(request)
@@ -172,26 +239,37 @@ def make_handler(page):
         def log_message(self, *a):
             pass
 
+        def end_headers(self):
+            self.send_header("X-Robots-Tag", ROBOTS)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            super().end_headers()
+
+        def parse_request(self):
+            if not super().parse_request():
+                return False
+            if self.command != "GET":
+                self._send(405, "Read-only page.\n", "text/plain; charset=utf-8")
+                return False
+            return True
+
         def _send(self, code, body, ctype="text/html; charset=utf-8"):
             data = body.encode()
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
             if code == 405:
                 self.send_header("Allow", "GET")
             self.end_headers()
-            self.wfile.write(data)
+            if self.command != "HEAD":
+                self.wfile.write(data)
 
         def do_GET(self):
-            if self.path.split("?", 1)[0] != "/":
+            target = self.requestline.split()[1]
+            if target.split("?", 1)[0] != "/":
                 return self._send(404, "not found\n", "text/plain; charset=utf-8")
             self._send(*page.current())
 
-        def _no(self):
-            self._send(405, "read-only page: GET only\n", "text/plain; charset=utf-8")
-
-        do_POST = do_PUT = do_DELETE = do_PATCH = _no
     return H
 
 

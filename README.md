@@ -172,6 +172,16 @@ will own its directories, with `~/src/agent-bus/setup-board.sh <board-dir> <gpu-
 | `bus doctor`, `bus upgrade --build <dir>`, `bus adopt --all`, `bus stop-hook` | install checks, updates, adoption, the Claude Code stop hook |
 | `bus page [--port 8300]` | a read-only page of the board, served on 127.0.0.1 from your own install |
 
+### B300 board on the web
+
+The [B300 board](https://b300-board.github.io/) opens the live view when its Cloudflare Quick Tunnel is reachable.
+The [latest snapshot](https://b300-board.github.io/snapshot.html) stays on GitHub Pages. Both views use the
+same renderer and expose GPU use, lab NetIDs, booking times and filtered notes.
+
+On della-tridao, `b300-board-tunnel.service` runs `tools/board_tunnel.py` as a user service for the loopback page.
+It writes the current URL to `~/.local/state/b300-board-tunnel/url` and logs next to it. The mac-mini launchd job
+`io.github.andylizf.b300-board-publish` runs `tools/publish_pages.py` every ten minutes.
+
 `kind` is one of `training`, `eval`, `benchmark-timing`, `serving`, `interactive-dev`, `other`. `--hours` is the
 expected length shown on the board (24 by default; it limits nothing). `--mem-max` caps the job's memory as systemd's
 MemoryMax with no swap, so a job that goes over it is killed by the kernel. `--exclusive` on a
