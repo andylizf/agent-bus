@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from helpers import BusTest
-from agentbus import page
+from agentbus import core, page
 
 
 def sample():
@@ -250,9 +250,9 @@ class ProcessOwners(unittest.TestCase):
         self.assertNotIn("owner unknown", body)
 
     def test_pids_report_parser_keeps_graphics_only_entries(self):
-        self.assertEqual(page.graphics_apps(PIDS_REPORT),
+        self.assertEqual(core.graphics_apps(PIDS_REPORT),
                          [("00000000:1A:00.0", 1824987, 2876), ("00000000:1A:00.0", 1825968, 2508)])
-        self.assertEqual(page.graphics_apps("No devices were found"), [])
+        self.assertEqual(core.graphics_apps("No devices were found"), [])
 
 
 PIDS_REPORT = """

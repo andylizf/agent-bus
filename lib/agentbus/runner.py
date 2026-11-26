@@ -278,24 +278,29 @@ def cgroup_pids(cg_rel):
 
 
 def nvidia_view(timeout=20):
-    """(ok, {index: uuid}, [(uuid, pid)], {index: util}); ok False when either query fails or does not parse."""
+    """(ok, {index: uuid}, [(uuid, pid)], {index: util}); ok False when a query fails or does not parse. The processes
+    are compute ones (--query-compute-apps) and graphics-only ones (Type G, such as EGL rendering), which only the
+    `-q -d PIDS` report lists, matched to their GPU by PCI bus id. A report that fails, or has no section for a GPU
+    the query listed, makes the whole view unknown rather than empty."""
     q = lambda *a: subprocess.run([core.NVSMI(), *a, "--format=csv,noheader,nounits"], capture_output=True, text=True,
                                   timeout=timeout)
     try:
-        g = q("--query-gpu=index,uuid,utilization.gpu")
+        g = q("--query-gpu=index,uuid,utilization.gpu,pci.bus_id")
         a = q("--query-compute-apps=gpu_uuid,pid")
+        r = subprocess.run([core.NVSMI(), "-q", "-d", "PIDS"], capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return False, {}, [], {}
-    if g.returncode or a.returncode:
+    if g.returncode or a.returncode or r.returncode:
         return False, {}, [], {}
-    idx, util, apps = {}, {}, []
+    idx, util, apps, by_bus = {}, {}, [], {}
     try:
         for line in g.stdout.splitlines():
             if not line.strip():
                 continue
-            i, uuid, u = [x.strip() for x in line.split(",")]
+            i, uuid, u, bus = [x.strip() for x in line.split(",")]
             idx[int(i)] = uuid
             util[int(i)] = int(u) if u.isdigit() else None
+            by_bus[bus.upper()] = uuid
         for line in a.stdout.splitlines():
             if not line.strip() or "No running" in line:
                 continue
@@ -303,6 +308,12 @@ def nvidia_view(timeout=20):
             apps.append((uuid, int(pid)))
     except ValueError:
         return False, {}, [], {}
+    if not set(by_bus) <= core.gpu_report_buses(r.stdout):
+        return False, {}, [], {}
+    for bus, pid, _ in core.graphics_apps(r.stdout):
+        uuid = by_bus.get(bus)
+        if uuid is not None and (uuid, pid) not in apps:
+            apps.append((uuid, pid))
     return True, idx, apps, util
 
 

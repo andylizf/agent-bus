@@ -113,11 +113,15 @@ class BusTest(unittest.TestCase):
         import socket
         return socket.gethostname().split(".")[0]
 
-    def set_gpus(self, apps=(), fail=False, util=0, n=None):
+    def set_gpus(self, apps=(), fail=False, util=0, n=None, graphics=(), pids_fail=False, pids_missing=()):
+        """apps are compute processes; graphics are Type G ones, listed only in the -q -d PIDS report. pids_fail
+        makes that report fail; pids_missing leaves those GPU indexes out of it."""
         n = self.gpus if n is None else n
         self.gpus_file.write_text(json.dumps(dict(
-            fail=fail, gpus=[dict(index=i, uuid=f"GPU-{i}", util=util) for i in range(n)],
-            apps=[dict(uuid=f"GPU-{g}", pid=p) for g, p in apps])))
+            fail=fail, pids_fail=pids_fail, pids_missing=list(pids_missing),
+            gpus=[dict(index=i, uuid=f"GPU-{i}", util=util) for i in range(n)],
+            apps=[dict(uuid=f"GPU-{g}", pid=p) for g, p in apps] +
+                 [dict(uuid=f"GPU-{g}", pid=p, type="G") for g, p in graphics])))
 
     def entry_point(self):
         """The installed `bus` once setUp has installed it (as members run it), else the checkout's."""

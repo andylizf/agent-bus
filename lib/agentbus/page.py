@@ -59,32 +59,6 @@ def smi(query):
             if line.strip() and not line.startswith("No running")]
 
 
-BUS_LINE = re.compile(r"GPU ([0-9A-Fa-f]{4,8}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])\Z")
-
-
-def graphics_apps(report):
-    """[(bus id, pid, MiB)] for graphics-only processes (Type G, such as EGL rendering) in an `nvidia-smi -q -d PIDS`
-    report. --query-compute-apps leaves them out, and this driver has no --query-graphics-apps."""
-    out, bus, proc = [], None, None
-    for line in report.splitlines():
-        text = line.strip()
-        head = BUS_LINE.fullmatch(text)
-        if head:
-            bus, proc = head.group(1).upper(), None
-            continue
-        key, sep, value = (part.strip() for part in text.partition(" : "))
-        if not sep or bus is None:
-            continue
-        if key == "Process ID" and value.isdigit():
-            proc = dict(bus=bus, pid=int(value), type="", mem=0)
-            out.append(proc)
-        elif proc is not None and key == "Type":
-            proc["type"] = value
-        elif proc is not None and key == "Used GPU Memory":
-            proc["mem"] = int(value.split()[0]) if value.split() and value.split()[0].isdigit() else 0
-    return [(p["bus"], p["pid"], p["mem"]) for p in out if p["type"] == "G"]
-
-
 def gpu_view():
     models = set()
     by_uuid, by_bus = {}, {}
@@ -97,7 +71,7 @@ def gpu_view():
     try:
         report = subprocess.run([core.NVSMI(), "-q", "-d", "PIDS"], capture_output=True, text=True, timeout=8,
                                 check=True).stdout
-        procs += [(by_bus.get(bus), str(pid), str(mem)) for bus, pid, mem in graphics_apps(report)]
+        procs += [(by_bus.get(bus), str(pid), str(mem)) for bus, pid, mem in core.graphics_apps(report)]
     except (OSError, subprocess.SubprocessError):
         pass  # without the report a graphics-only GPU still reads as in use, with its owner unknown
     for gpu, pid, mem in procs:

@@ -836,3 +836,34 @@ def parse_gpus(text, ngpus=8):
 
 def errno_name(e):
     return errno.errorcode.get(getattr(e, "errno", 0) or 0, type(e).__name__)
+
+
+BUS_LINE = re.compile(r"GPU ([0-9A-Fa-f]{4,8}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])\Z")
+
+
+def gpu_report_buses(report):
+    """The PCI bus ids an `nvidia-smi -q` report has a section for."""
+    return {m.group(1).upper() for m in (BUS_LINE.fullmatch(line.strip()) for line in report.splitlines()) if m}
+
+
+def graphics_apps(report):
+    """[(bus id, pid, MiB)] for graphics-only processes (Type G, such as EGL rendering) in an `nvidia-smi -q -d PIDS`
+    report. --query-compute-apps leaves them out, and this driver has no --query-graphics-apps."""
+    out, bus, proc = [], None, None
+    for line in report.splitlines():
+        text = line.strip()
+        head = BUS_LINE.fullmatch(text)
+        if head:
+            bus, proc = head.group(1).upper(), None
+            continue
+        key, sep, value = (part.strip() for part in text.partition(" : "))
+        if not sep or bus is None:
+            continue
+        if key == "Process ID" and value.isdigit():
+            proc = dict(bus=bus, pid=int(value), type="", mem=0)
+            out.append(proc)
+        elif proc is not None and key == "Type":
+            proc["type"] = value
+        elif proc is not None and key == "Used GPU Memory":
+            proc["mem"] = int(value.split()[0]) if value.split() and value.split()[0].isdigit() else 0
+    return [(p["bus"], p["pid"], p["mem"]) for p in out if p["type"] == "G"]
