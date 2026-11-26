@@ -59,16 +59,49 @@ def smi(query):
             if line.strip() and not line.startswith("No running")]
 
 
+BUS_LINE = re.compile(r"GPU ([0-9A-Fa-f]{4,8}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])\Z")
+
+
+def graphics_apps(report):
+    """[(bus id, pid, MiB)] for graphics-only processes (Type G, such as EGL rendering) in an `nvidia-smi -q -d PIDS`
+    report. --query-compute-apps leaves them out, and this driver has no --query-graphics-apps."""
+    out, bus, proc = [], None, None
+    for line in report.splitlines():
+        text = line.strip()
+        head = BUS_LINE.fullmatch(text)
+        if head:
+            bus, proc = head.group(1).upper(), None
+            continue
+        key, sep, value = (part.strip() for part in text.partition(" : "))
+        if not sep or bus is None:
+            continue
+        if key == "Process ID" and value.isdigit():
+            proc = dict(bus=bus, pid=int(value), type="", mem=0)
+            out.append(proc)
+        elif proc is not None and key == "Type":
+            proc["type"] = value
+        elif proc is not None and key == "Used GPU Memory":
+            proc["mem"] = int(value.split()[0]) if value.split() and value.split()[0].isdigit() else 0
+    return [(p["bus"], p["pid"], p["mem"]) for p in out if p["type"] == "G"]
+
+
 def gpu_view():
     models = set()
-    by_uuid = {}
-    for idx, uuid, used, total, util, name in smi("--query-gpu=index,uuid,memory.used,memory.total,utilization.gpu,name"):
+    by_uuid, by_bus = {}, {}
+    for idx, uuid, bus, used, total, util, name in smi(
+            "--query-gpu=index,uuid,pci.bus_id,memory.used,memory.total,utilization.gpu,name"):
         models.add(name.removeprefix("NVIDIA ").split()[0])
-        by_uuid[uuid] = dict(gpu=int(idx), mem_mb=int(used), total_mb=int(total),
-                             util=int(util) if util.isdigit() else None, users={}, available=True)
-    for uuid, pid, mem in smi("--query-compute-apps=gpu_uuid,pid,used_gpu_memory"):
-        gpu = by_uuid.get(uuid)
-        if gpu is not None:
+        by_uuid[uuid] = by_bus[bus.upper()] = dict(gpu=int(idx), mem_mb=int(used), total_mb=int(total),
+                                                   util=int(util) if util.isdigit() else None, users={}, available=True)
+    procs = [(by_uuid.get(uuid), pid, mem) for uuid, pid, mem in smi("--query-compute-apps=gpu_uuid,pid,used_gpu_memory")]
+    try:
+        report = subprocess.run([core.NVSMI(), "-q", "-d", "PIDS"], capture_output=True, text=True, timeout=8,
+                                check=True).stdout
+        procs += [(by_bus.get(bus), str(pid), str(mem)) for bus, pid, mem in graphics_apps(report)]
+    except (OSError, subprocess.SubprocessError):
+        pass  # without the report a graphics-only GPU still reads as in use, with its owner unknown
+    for gpu, pid, mem in procs:
+        if gpu is not None and pid.isdigit():
             uid = core.proc_uid(int(pid))
             user = lab_user(core.owner_name(uid) if uid is not None else None)
             users = gpu["users"]

@@ -1,6 +1,7 @@
 """The read-only page (design 3.11): GET only, bounded threads, a 15 s connection deadline, the last good page kept."""
 import http.client, json, os, pwd, re, socket, threading, time, unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from helpers import BusTest
@@ -221,17 +222,70 @@ class ProcessOwners(unittest.TestCase):
         for name in (None, "", "root-like name", "192.0.2.10", "Abc1234"):
             self.assertEqual(page.lab_user(name), "Unknown user")
 
-    def test_gpu_view_names_a_process_owner_outside_the_board_group(self):
-        rows = {"--query-gpu=index,uuid,memory.used,memory.total,utilization.gpu,name":
-                [["7", "GPU-7", "109922", "275040", "100", "NVIDIA B300"]],
-                "--query-compute-apps=gpu_uuid,pid,used_gpu_memory": [["GPU-7", "4242", "109900"]]}
+    def gpu_view(self, gpus, compute, report=""):
+        rows = {"--query-gpu=index,uuid,pci.bus_id,memory.used,memory.total,utilization.gpu,name": gpus,
+                "--query-compute-apps=gpu_uuid,pid,used_gpu_memory": compute}
         fake = pwd.struct_passwd(("abc1234", "x", 60001, 60001, "", "/home/abc1234", "/bin/bash"))
         with patch.object(page, "smi", side_effect=rows.get), \
+             patch.object(page.subprocess, "run", return_value=SimpleNamespace(stdout=report)), \
              patch.object(page.core, "proc_uid", return_value=60001), \
              patch.object(page.core, "owner_name", return_value="abc1234"), \
              patch.object(page.pwd, "getpwnam", return_value=fake):
-            _, gpus = page.gpu_view()
+            return page.gpu_view()[1]
+
+    def test_gpu_view_names_a_process_owner_outside_the_board_group(self):
+        gpus = self.gpu_view([["7", "GPU-7", "00000000:F0:00.0", "109922", "275040", "100", "NVIDIA B300"]],
+                             [["GPU-7", "4242", "109900"]])
         self.assertEqual(gpus[0]["users"], {"abc1234": 109900})
+
+    def test_graphics_only_processes_are_attributed_to_their_owner(self):
+        # EGL rendering (MuJoCo, for one) runs as Type G processes, which --query-compute-apps does not list.
+        gpus = self.gpu_view([["0", "GPU-0", "00000000:1A:00.0", "22600", "275040", "100", "NVIDIA B300"],
+                              ["1", "GPU-1", "00000000:2B:00.0", "80000", "275040", "90", "NVIDIA B300"]],
+                             [["GPU-1", "4243", "79000"]], PIDS_REPORT)
+        self.assertEqual(gpus[0]["users"], {"abc1234": 2876 + 2508})
+        self.assertEqual(gpus[1]["users"], {"abc1234": 79000})  # the C and C+G entries come from the compute query
+        body = page.render(dict(sample(), gpus=[dict(gpus[0], total_mb=275040)], entries=[], bookings=[]))
+        self.assertIn('aria-label="GPU 0, Not on board"', body)
+        self.assertNotIn("owner unknown", body)
+
+    def test_pids_report_parser_keeps_graphics_only_entries(self):
+        self.assertEqual(page.graphics_apps(PIDS_REPORT),
+                         [("00000000:1A:00.0", 1824987, 2876), ("00000000:1A:00.0", 1825968, 2508)])
+        self.assertEqual(page.graphics_apps("No devices were found"), [])
+
+
+PIDS_REPORT = """
+==============NVSMI LOG==============
+
+Timestamp                                              : Thu Nov 26 10:30:56 2026
+Attached GPUs                                          : 2
+GPU 00000000:1A:00.0
+    Processes
+        GPU instance ID                   : N/A
+        Compute instance ID               : N/A
+        Process ID                        : 1824987
+            Type                          : G
+            Name                          : /scratch/example/.venv/bin/python
+            Used GPU Memory               : 2876 MiB
+        GPU instance ID                   : N/A
+        Compute instance ID               : N/A
+        Process ID                        : 1825968
+            Type                          : G
+            Name                          : /scratch/example/.venv/bin/python
+            Used GPU Memory               : 2508 MiB
+
+GPU 00000000:2B:00.0
+    Processes
+        Process ID                        : 4243
+            Type                          : C
+            Name                          : python
+            Used GPU Memory               : 79000 MiB
+        Process ID                        : 4244
+            Type                          : C+G
+            Name                          : python
+            Used GPU Memory               : N/A
+"""
 
 
 class Collect(BusTest):
@@ -258,6 +312,16 @@ class Collect(BusTest):
         self.assertEqual(list(data["gpus"][1]["users"].values()), [16384])
         self.assertEqual(data["usage"][1], [(now - 180, 25), (now - 60, 75)])
         self.assertNotIn("private-name", page.render(data))
+
+    def test_collect_counts_graphics_only_processes(self):
+        from agentbus import core
+        self.set_gpus(apps=[(2, os.getpid())])
+        spec = json.loads(self.gpus_file.read_text())
+        spec["apps"][0].update(mem=2876, type="G")
+        self.gpus_file.write_text(json.dumps(spec))
+        data = page.collect(core.load_conf())
+        self.assertEqual(list(data["gpus"][2]["users"].values()), [2876])
+        self.assertEqual(data["notices"], [])
 
 
 if __name__ == "__main__":
