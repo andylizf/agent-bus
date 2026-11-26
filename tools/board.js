@@ -2,6 +2,7 @@
 
 const HOUR = 3600;
 const POLL = 15000;
+const CATCH_UP = 27;
 const STALE = 120;
 const feed = document.querySelector('meta[name="board-feed"]').content;
 const snapshot = feed === "./snapshot.json";
@@ -164,6 +165,7 @@ function render(data) {
 
 let shown = null;
 let fetching = false;
+let caughtUpFor = null;
 const age = t => Math.max(0, Math.floor(Date.now() / 1000 - t));
 function stamp() {
   if (!shown) return;
@@ -176,6 +178,11 @@ function stamp() {
   time.dataset.ts = shown.t;
   time.textContent = `Updated ${elapsed} ago${stale ? " (stale)" : ""}`;
   time.classList.toggle("stale", stale);
+  // Independent collection and poll clocks can leave a fresh sample waiting between polls.
+  if (!snapshot && !fetching && seconds >= CATCH_UP && caughtUpFor !== shown.t && el("status").hidden) {
+    caughtUpFor = shown.t;
+    poll();
+  }
 }
 
 async function get(url) {

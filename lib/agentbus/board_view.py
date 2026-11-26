@@ -482,7 +482,7 @@ code, .mono { font-family: var(--mono); font-size: 0.86em; }
 .blk.unreg, .sw-unreg { background: linear-gradient(90deg, var(--crit-bg) 0 65%, transparent);
   color: var(--crit); box-shadow: inset 2px 0 var(--crit); }
 .blk.unreg .t { color: var(--crit); }
-.blk.clash, .sw-clash { outline: 2px solid var(--crit); outline-offset: -1px; }
+.blk.clash:not(.backfill), .sw-clash { outline: 2px solid var(--crit); outline-offset: -1px; }
 .sw-night { background: color-mix(in srgb, var(--ink) 9%, transparent); }
 .now-line { position: absolute; top: -3px; bottom: -3px; border-left: 2px solid var(--now); margin-left: -1px; }
 .now-line span { position: absolute; bottom: -24px; left: 0; transform: translateX(-50%); background: var(--pill); color: var(--pill-ink);
