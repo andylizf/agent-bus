@@ -40,11 +40,13 @@ def public_note(note):
 
 
 @lru_cache(maxsize=256)
-def lab_user(user, gid):
-    if user and NETID.fullmatch(user) and gid is not None:
+def lab_user(user):
+    """A netID for any account on the node. Who owns a GPU process is visible to everyone logged in there, so
+    group membership does not decide it; only a name that is not an account or not netID-shaped is withheld."""
+    if user and NETID.fullmatch(user):
         try:
-            if gid in os.getgrouplist(user, pwd.getpwnam(user).pw_gid):
-                return user
+            pwd.getpwnam(user)
+            return user
         except KeyError:
             pass
     return "Unknown user"
@@ -57,7 +59,7 @@ def smi(query):
             if line.strip() and not line.startswith("No running")]
 
 
-def gpu_view(gid):
+def gpu_view():
     models = set()
     by_uuid = {}
     for idx, uuid, used, total, util, name in smi("--query-gpu=index,uuid,memory.used,memory.total,utilization.gpu,name"):
@@ -68,7 +70,7 @@ def gpu_view(gid):
         gpu = by_uuid.get(uuid)
         if gpu is not None:
             uid = core.proc_uid(int(pid))
-            user = lab_user(core.owner_name(uid) if uid is not None else None, gid)
+            user = lab_user(core.owner_name(uid) if uid is not None else None)
             users = gpu["users"]
             users[user] = users.get(user, 0) + (int(mem) if mem.isdigit() else 0)
     model = models.pop() if len(models) == 1 else "GPU"
@@ -109,24 +111,24 @@ def usage_history(now):
     return {gpu: sorted(samples.items()) for gpu, samples in sorted(per_gpu.items())}
 
 
-def public_entries(entries, bookings, gid):
+def public_entries(entries, bookings):
     by_id = {b["id"]: b for b in bookings}
     output = []
     for e in entries:
         b = by_id.get(e.get("booking"))
         protected = (e["class"] == "scheduled" and b is not None and b["user"] == e["user"]
                      and b["active"] and set(e["gpus"]) <= set(b["gpus"]))
-        output.append(dict(user=lab_user(e["user"], gid), gpus=e["gpus"], started=e["started"], until=e["until"],
+        output.append(dict(user=lab_user(e["user"]), gpus=e["gpus"], started=e["started"], until=e["until"],
                            state=e["state"], occupancy=e["occupancy"], idle=bool(e.get("idle")), protected=protected,
                            note=public_note(e.get("note")), **{"class": e["class"]}))
     return output
 
 
-def public_bookings(bookings, now, gid):
+def public_bookings(bookings, now):
     return [
-        dict(user=lab_user(b["user"], gid), gpus=b["gpus"], start=b["start"], end=b["end"], state=b["state"],
+        dict(user=lab_user(b["user"]), gpus=b["gpus"], start=b["start"], end=b["end"], state=b["state"],
              objection_close=b.get("objection_close"), note=public_note(b.get("note")),
-             objections=[dict(user=lab_user(o["user"], gid), reason=public_note(o["reason"])) for o in b["objections"]])
+             objections=[dict(user=lab_user(o["user"]), reason=public_note(o["reason"])) for o in b["objections"]])
         for b in bookings if b["state"] in BOOKING_STATES and now - PAST < b["end"] and b["start"] < now + 7 * 86400
     ]
 
@@ -134,24 +136,23 @@ def public_bookings(bookings, now, gid):
 def collect(conf, *, history=True):
     now = core.now()
     data = dict(t=now, host=core.HOST, board="", model="GPUs", entries=[], bookings=[], gpus=[], notices=[])
-    gid, ngpus = None, 0
+    ngpus = 0
     try:
         with core.Board.from_conf(conf) as b:
             if not b.ok:
                 raise core.Refused("board identity changed")
-            gid = os.fstat(b.fd).st_gid
             ngpus = b.ngpus
             entries = bk.entries_with_occupancy(b)
             seen = (core.read_private(os.path.join(core.STATE(), "slots.json")) or {}).get("slots", {})
             bookings = bk.evaluate(b, now, seen=seen, entries=entries, record=False)
-            data.update(board=b.path, entries=public_entries(entries, bookings, gid),
-                        bookings=public_bookings(bookings, now, gid))
+            data.update(board=b.path, entries=public_entries(entries, bookings),
+                        bookings=public_bookings(bookings, now))
             if b.warnings:
                 data["notices"].append("Some board records could not be read.")
     except (OSError, core.Refused):
         data["notices"].append("Board records unavailable.")
     try:
-        data["model"], data["gpus"] = gpu_view(gid)
+        data["model"], data["gpus"] = gpu_view()
         if not data["gpus"]:
             raise ValueError("empty GPU listing")
     except (OSError, ValueError, subprocess.SubprocessError):

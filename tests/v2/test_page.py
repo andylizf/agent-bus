@@ -1,5 +1,5 @@
 """The read-only page (design 3.11): GET only, bounded threads, a 15 s connection deadline, the last good page kept."""
-import http.client, json, os, re, socket, threading, time, unittest
+import http.client, json, os, pwd, re, socket, threading, time, unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25,9 +25,9 @@ def sample():
     ]
     gpus = [dict(gpu=i, util=50, users={user: 23000}, mem_mb=23000, total_mb=100000, available=True)
             for i, user in enumerate(("bob", "alice", "bob", "erin"))]
-    with patch.object(page, "lab_user", side_effect=lambda user, gid: user):
+    with patch.object(page, "lab_user", side_effect=lambda user: user):
         return dict(t=now, host="gpuhost", model="Fake GPU", board="/test/board", notices=[], gpus=gpus,
-                    entries=page.public_entries(entries, bookings, 0), bookings=page.public_bookings(bookings, now, 0),
+                    entries=page.public_entries(entries, bookings), bookings=page.public_bookings(bookings, now),
                     usage={1: [(now - 120, 30), (now - 60, 95)]})
 
 
@@ -99,7 +99,7 @@ class Page(unittest.TestCase):
         self.assertIn('<li class="who scheduled">', t)
         self.assertIn('class="task scheduled"', t)
         self.assertRegex(t, r'class="task scheduled"><div class="task-meta"><span class="dot"[^>]*></span><b>bob</b>')
-        self.assertRegex(t, r'<span class="until">\d\d:\d\d.\d\d:\d\d</span>')
+        self.assertRegex(t, r'<span class="until">\d\d:\d\d[^<]*\d\d:\d\d</span>')
 
     def test_backfill_tile_is_muted_and_does_not_repeat_the_name(self):
         t = tiles(page.render(sample()))[1]
@@ -201,6 +201,37 @@ class Page(unittest.TestCase):
         self.assertIn("refresh failed", body)
         self.assertIn("Training", body)
         self.assertNotIn("/private/nvidia-smi", body)
+
+
+class ProcessOwners(unittest.TestCase):
+    def setUp(self):
+        page.lab_user.cache_clear()
+        self.addCleanup(page.lab_user.cache_clear)
+
+    def test_any_account_is_shown_by_netid_whatever_its_groups(self):
+        # A process owner outside the board's unix group is still a person on the node, not "Unknown user".
+        fake = pwd.struct_passwd(("abc1234", "x", 60001, 60001, "", "/home/abc1234", "/bin/bash"))
+        with patch.object(page.pwd, "getpwnam", return_value=fake), \
+             patch.object(page.os, "getgrouplist", return_value=[60001], create=True):
+            self.assertEqual(page.lab_user("abc1234"), "abc1234")
+
+    def test_names_that_are_not_netid_accounts_stay_unknown(self):
+        with patch.object(page.pwd, "getpwnam", side_effect=KeyError("no such user")):
+            self.assertEqual(page.lab_user("zz9999"), "Unknown user")
+        for name in (None, "", "root-like name", "192.0.2.10", "Abc1234"):
+            self.assertEqual(page.lab_user(name), "Unknown user")
+
+    def test_gpu_view_names_a_process_owner_outside_the_board_group(self):
+        rows = {"--query-gpu=index,uuid,memory.used,memory.total,utilization.gpu,name":
+                [["7", "GPU-7", "109922", "275040", "100", "NVIDIA B300"]],
+                "--query-compute-apps=gpu_uuid,pid,used_gpu_memory": [["GPU-7", "4242", "109900"]]}
+        fake = pwd.struct_passwd(("abc1234", "x", 60001, 60001, "", "/home/abc1234", "/bin/bash"))
+        with patch.object(page, "smi", side_effect=rows.get), \
+             patch.object(page.core, "proc_uid", return_value=60001), \
+             patch.object(page.core, "owner_name", return_value="abc1234"), \
+             patch.object(page.pwd, "getpwnam", return_value=fake):
+            _, gpus = page.gpu_view()
+        self.assertEqual(gpus[0]["users"], {"abc1234": 109900})
 
 
 class Collect(BusTest):

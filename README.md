@@ -176,7 +176,7 @@ will own its directories, with `~/src/agent-bus/setup-board.sh <board-dir> <gpu-
 ### B300 board on the web
 
 The [B300 board](https://b300-board.github.io/) polls the [public feed](https://cc.zhifei.li/b300/board.json)
-every 15 seconds. The feed contains GPU memory and utilization, lab NetIDs, run windows and booking states.
+every 15 seconds. The feed contains GPU memory and utilization, the NetID of everyone with a process on a GPU, run windows and booking states.
 The page shows the [latest snapshot](https://b300-board.github.io/snapshot.html) if the feed fails and marks
 readings stale after two minutes.
 
