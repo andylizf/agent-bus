@@ -15,9 +15,10 @@ def run(state):
     connected = False
     command = [str(Path.home() / ".local/bin/cloudflared"), "tunnel", "--no-autoupdate",
                "--url", "http://127.0.0.1:8300"]
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as child:
+    with (state / "cloudflared.log").open("a") as log, subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as child:
         for line in child.stdout:
-            print(line, end="", flush=True)
+            print(line, file=log, end="", flush=True)
             if match := re.search(r"https://[a-z0-9-]+\.trycloudflare\.com\b", line):
                 url = match.group()
             if "Registered tunnel connection" in line:

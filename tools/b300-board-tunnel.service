@@ -12,8 +12,6 @@ UMask=0077
 ExecStartPre=/usr/bin/rm -f %S/b300-board-tunnel/url %S/b300-board-tunnel/url.new
 ExecStart=/usr/bin/python3 -IB %h/.local/bin/b300-board-tunnel %S/b300-board-tunnel
 ExecStopPost=/usr/bin/rm -f %S/b300-board-tunnel/url %S/b300-board-tunnel/url.new
-StandardOutput=append:%S/b300-board-tunnel/cloudflared.log
-StandardError=inherit
 Restart=always
 RestartSec=5s
 
