@@ -26,6 +26,15 @@ const stateText = state => state[0].toUpperCase() + state.slice(1);
 const kindOf = entry => entry.kind === "scheduled" ? "scheduled" : "backfill";
 const kindLabel = entry => kindOf(entry) === "scheduled" ? "Scheduled" : "Backfill";
 
+function gpuStatus(gpu, entries) {
+  if (!gpu.available) return ["unknown", "Unavailable"];
+  const users = Object.keys(gpu.users);
+  if (users.some(user => user !== "Unknown user")) return ["busy", "In use"];
+  if (users.length || gpu.mem_mb > 2048 || gpu.util > 0) return ["unattributed", "In use, owner unknown"];
+  if (entries.length) return ["claimed", "Claimed"];
+  return ["free", "Free"];
+}
+
 function colors(data) {
   const users = new Set([...data.gpus.flatMap(gpu => Object.keys(gpu.users)),
     ...data.entries.map(entry => entry.user), ...data.bookings.map(booking => booking.user)]);
@@ -43,8 +52,8 @@ function colors(data) {
 function tile(gpu, entries, slots, now) {
   const owners = new Set(entries.map(entry => entry.user));
   const users = grouped(gpu);
-  const [state, label] = !gpu.available ? ["unknown", "Unavailable"] : users.length ? ["busy", "In use"] :
-    entries.length ? ["claimed", "Claimed"] : ["free", "Free"];
+  const [state, label] = gpuStatus(gpu, entries);
+  const flag = state === "unattributed" ? " flag" : "";
   const scheduled = entries.some(entry => kindOf(entry) === "scheduled");
   const occupants = users.map(([user, mb]) => `
     <li class="who"><span class="dot" style="--c:${slots.get(user)}"></span>
@@ -63,7 +72,7 @@ function tile(gpu, entries, slots, now) {
   const used = gpu.total_mb ? `<b>${gib(gpu.mem_mb, 0)}</b> / ${gib(gpu.total_mb, 0)} GiB` : "Memory unavailable";
   const util = gpu.util === null ? "–" : `${Number(gpu.util)}<small>%</small>`;
   return `<article class="tile ${state}${scheduled ? " has-scheduled" : ""}" aria-label="GPU ${Number(gpu.gpu)}, ${label}">
-    <header class="tile-head"><h3>GPU ${Number(gpu.gpu)}</h3><span class="state-pill ${state}">${label}</span></header>
+    <header class="tile-head"><h3>GPU ${Number(gpu.gpu)}</h3><span class="state-pill ${state}${flag}">${label}</span></header>
     <ul class="whos">${occupants}</ul>
     <div class="gauge"><div class="meter" role="img" aria-label="GPU ${Number(gpu.gpu)} memory by user">${segments}</div>
       <div class="meter-legend"><span class="memtext">${used}</span>
@@ -151,7 +160,7 @@ function bookings(data, slots) {
 function render(data) {
   const slots = colors(data);
   const entries = gpu => data.entries.filter(entry => entry.gpus.includes(gpu));
-  const free = data.gpus.filter(g => g.available && !Object.keys(g.users).length && !entries(g.gpu).length).length;
+  const free = data.gpus.filter(g => gpuStatus(g, entries(g.gpu))[0] === "free").length;
   const upcoming = data.bookings.filter(b => b.start > data.t).length;
   el("gpu-count").textContent = `${data.gpus.length} GPUs`;
   el("summary").innerHTML = `<span class="chip free"><b>${free}</b> of ${data.gpus.length} free</span>

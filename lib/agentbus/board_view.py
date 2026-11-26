@@ -56,6 +56,18 @@ def occupants(g):
     return sorted(g["users"].items(), key=lambda item: (-item[1], item[0]))
 
 
+def gpu_status(g, entries):
+    if not g["available"]:
+        return "unknown", "Unavailable"
+    if any(user != "Unknown user" for user in g["users"]):
+        return "busy", "In use"
+    if g["users"] or g["mem_mb"] > 2048 or (g["util"] or 0) > 0:
+        return "unattributed", "In use, owner unknown"
+    if entries:
+        return "claimed", "Claimed"
+    return "free", "Free"
+
+
 def history_span(usage, now):
     oldest = min((t for samples in usage.values() for t, _ in samples), default=now)
     return min(HISTORY, max(3600, now - oldest))
@@ -86,9 +98,8 @@ def tile(g, entries, slot, usage, now, span_s):
     occ = occupants(g)
     mine = [e for e in entries if g["gpu"] in e["gpus"]]
     board_users = {e["user"] for e in mine}
-    state, label = ("busy", "In use") if occ else ("claimed", "Claimed") if mine else ("free", "Free")
-    if not g["available"]:
-        state, label = "unknown", "Unavailable"
+    state, label = gpu_status(g, mine)
+    flag_class = " flag" if state == "unattributed" else ""
     total = g["total_mb"]
     bar = "" if not total else "".join(
         f'<span class="seg" style="width:{100 * mb / total:.2f}%;--c:var(--u{slot[u]})" '
@@ -124,7 +135,7 @@ def tile(g, entries, slot, usage, now, span_s):
     mem = f'<b>{gib(g["mem_mb"]):.0f}</b> / {gib(total):.0f} GiB' if total else "Memory unavailable"
     status = " has-scheduled" if any(e["protected"] for e in mine) else ""
     return f'''<article class="tile {state}{status}" aria-label="GPU {g["gpu"]}, {label}">
-  <header class="tile-head"><h3>GPU {g["gpu"]}</h3><span class="state-pill {state}">{label}</span></header>
+  <header class="tile-head"><h3>GPU {g["gpu"]}</h3><span class="state-pill {state}{flag_class}">{label}</span></header>
   <ul class="whos">{"".join(who)}</ul>
   <div class="gauge">
     <div class="meter" role="img" aria-label="GPU {g["gpu"]} memory by user">{bar}</div>
@@ -289,7 +300,7 @@ def render(data, snapshot=False):
     slot = colours(users)
     span_s = history_span(usage, now)
     tiles = "".join(tile(g, entries, slot, usage, now, span_s) for g in gpus)
-    nfree = sum(g["available"] and not g["users"] and all(g["gpu"] not in e["gpus"] for e in entries) for g in gpus)
+    nfree = sum(gpu_status(g, [e for e in entries if g["gpu"] in e["gpus"]])[0] == "free" for g in gpus)
     upcoming = sum(b["start"] > now for b in bookings)
     notes = "".join(f'<p class="warn">{esc(message)}</p>' for message in data["notices"])
     mode = "Snapshot" if snapshot else "Live"

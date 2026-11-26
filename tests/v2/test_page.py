@@ -77,6 +77,18 @@ class Page(unittest.TestCase):
         for note in ("<img src=x onerror=alert(1)>", "192.0.2.10", "2001:db8::1", "hf.example.com", "srun train"):
             self.assertEqual(page.public_note(note), "[redacted]")
 
+    def test_telemetry_keeps_unattributed_gpus_out_of_free_count(self):
+        data = sample()
+        for g, (mem, util) in zip(data["gpus"], ((154624, 0), (0, 1), (0, 0), (2048, None))):
+            g.update(users={}, mem_mb=mem, util=util)
+        body = page.render(data)
+        for gpu in (0, 1):
+            self.assertIn(f'aria-label="GPU {gpu}, In use, owner unknown"', body)
+        self.assertEqual(body.count('class="state-pill unattributed flag"'), 2)
+        self.assertIn('aria-label="GPU 2, Claimed"', body)
+        self.assertIn('aria-label="GPU 3, Free"', body)
+        self.assertIn('<b>1</b> of 4 free', body)
+
     def test_public_feed_exposes_only_display_fields(self):
         data = sample()
         data["gpus"][0]["users"]["192.0.2.10"] = 100
