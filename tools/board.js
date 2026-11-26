@@ -26,13 +26,27 @@ const stateText = state => state[0].toUpperCase() + state.slice(1);
 const kindOf = entry => entry.kind === "scheduled" ? "scheduled" : "backfill";
 const kindLabel = entry => kindOf(entry) === "scheduled" ? "Scheduled" : "Backfill";
 
+const UNKNOWN = "Unknown user";
+const IN_USE_MB = 2048;  // a CUDA context alone stays below this; more memory, or any utilization, is someone's work
+const inUse = gpu => Object.keys(gpu.users).length > 0 || gpu.mem_mb > IN_USE_MB || gpu.util > 0;
+
+// A GPU that reads as in use is never Free, whether or not anyone is listed on it.
 function gpuStatus(gpu, entries) {
   if (!gpu.available) return ["unknown", "Unavailable"];
+  if (!inUse(gpu)) return entries.length ? ["claimed", "Claimed"] : ["free", "Free"];
+  const owners = new Set(entries.map(entry => entry.user));
   const users = Object.keys(gpu.users);
-  if (users.some(user => user !== "Unknown user")) return ["busy", "In use"];
-  if (users.length || gpu.mem_mb > 2048 || gpu.util > 0) return ["unattributed", "In use, owner unknown"];
-  if (entries.length) return ["claimed", "Claimed"];
-  return ["free", "Free"];
+  if (!users.some(user => user !== UNKNOWN)) return ["unattributed", "In use, owner unknown"];
+  if (users.some(user => !owners.has(user))) return ["offboard", "Not on board"];
+  return ["busy", "In use"];
+}
+
+// Scheduled owners are prominent, backfill is muted, off-board and unknown use are warnings.
+function occupantKind(user, entries) {
+  if (user === UNKNOWN) return "unknown";
+  const mine = entries.filter(entry => entry.user === user);
+  if (!mine.length) return "off";
+  return mine.some(entry => kindOf(entry) === "scheduled") ? "scheduled" : "backfill";
 }
 
 function colors(data) {
@@ -50,33 +64,58 @@ function colors(data) {
 }
 
 function tile(gpu, entries, slots, now) {
-  const owners = new Set(entries.map(entry => entry.user));
   const users = grouped(gpu);
   const [state, label] = gpuStatus(gpu, entries);
-  const flag = state === "unattributed" ? " flag" : "";
-  const scheduled = entries.some(entry => kindOf(entry) === "scheduled");
-  const occupants = users.map(([user, mb]) => `
-    <li class="who"><span class="dot" style="--c:${slots.get(user)}"></span>
-      <span class="name">${esc(user)}</span><span class="mem">${mb ? gib(mb) + " GiB" : ""}</span>
-      ${owners.has(user) ? "" : '<span class="flag">Not on board</span>'}</li>`).join("");
-  const segments = gpu.total_mb ? users.filter(([, mb]) => mb).map(([user, mb]) => `
-    <span class="seg" style="width:${100 * mb / gpu.total_mb}%;--c:${slots.get(user)}"
-      title="${esc(user)}: ${gib(mb)} GiB"></span>`).join("") : "";
+  const colour = user => user === UNKNOWN ? "var(--crit)" : slots.get(user);
+  const flags = { off: '<span class="flag">Not on board</span>', unknown: '<span class="flag">Owner unknown</span>' };
+  let occupants = users.map(([user, mb]) => {
+    const kind = occupantKind(user, entries);
+    return `
+    <li class="who ${kind}"><span class="dot" style="--c:${colour(user)}"></span>
+      <span class="name">${esc(user)}</span><span class="mem">${mb ? gib(mb) + " GiB" : ""}</span>${flags[kind] || ""}</li>`;
+  }).join("");
+  if (state === "unattributed" && !users.length) occupants = `
+    <li class="who unknown"><span class="dot" style="--c:var(--crit)"></span>
+      <span class="name">No process listed</span><span class="flag">Owner unknown</span></li>`;
+  let segments = "";
+  if (gpu.total_mb) {
+    segments = users.filter(([, mb]) => mb).map(([user, mb]) => `
+    <span class="seg ${occupantKind(user, entries)}" style="width:${100 * mb / gpu.total_mb}%;--c:${colour(user)}"
+      title="${esc(user)}: ${gib(mb)} GiB"></span>`).join("");
+    const unlisted = gpu.mem_mb - users.reduce((sum, [, mb]) => sum + mb, 0);
+    if (state === "unattributed" && unlisted > IN_USE_MB) segments += `
+    <span class="seg unknown" style="width:${100 * unlisted / gpu.total_mb}%;--c:var(--crit)"
+      title="No process listed: ${gib(unlisted)} GiB"></span>`;
+  }
+  const listed = new Set(users.map(([user]) => user));
   const tasks = [...entries].sort((a, b) => kindOf(b).localeCompare(kindOf(a))).map(entry => {
-    const until = entry.until ? kindOf(entry) === "scheduled" && entry.started
+    const kind = kindOf(entry);
+    const until = entry.until ? kind === "scheduled" && entry.started
       ? windowText(entry.started, entry.until, now) : `until ${readableTime(entry.until, now)}` : "End unknown";
-    return `<div class="task"><div class="task-meta"><span class="dot" style="--c:${slots.get(entry.user)}"></span>
-      <b>${esc(entry.user)}</b><span class="tag ${kindOf(entry)}">${kindLabel(entry)}</span>
+    // A scheduled run names its owner; a backfill line is the chip and its end, the name is already above.
+    const owner = kind === "scheduled" || !listed.has(entry.user)
+      ? `<span class="dot" style="--c:${slots.get(entry.user)}"></span><b>${esc(entry.user)}</b>` : "";
+    return `<div class="task ${kind}"><div class="task-meta">${owner}<span class="tag ${kind}">${kindLabel(entry)}</span>
       <span class="until">${until}</span></div></div>`;
   }).join("");
+  const scheduled = entries.some(entry => kindOf(entry) === "scheduled");
+  const role = scheduled ? " has-scheduled" : entries.length ? " backfill-only" : "";
   const used = gpu.total_mb ? `<b>${gib(gpu.mem_mb, 0)}</b> / ${gib(gpu.total_mb, 0)} GiB` : "Memory unavailable";
   const util = gpu.util === null ? "–" : `${Number(gpu.util)}<small>%</small>`;
-  return `<article class="tile ${state}${scheduled ? " has-scheduled" : ""}" aria-label="GPU ${Number(gpu.gpu)}, ${label}">
-    <header class="tile-head"><h3>GPU ${Number(gpu.gpu)}</h3><span class="state-pill ${state}${flag}">${label}</span></header>
+  return `<article class="tile ${state}${role}" aria-label="GPU ${Number(gpu.gpu)}, ${label}">
+    <header class="tile-head"><h3>GPU ${Number(gpu.gpu)}</h3><span class="state-pill ${state}">${label}</span></header>
     <ul class="whos">${occupants}</ul>
     <div class="gauge"><div class="meter" role="img" aria-label="GPU ${Number(gpu.gpu)} memory by user">${segments}</div>
       <div class="meter-legend"><span class="memtext">${used}</span>
         <span class="util"><span class="util-num">${util}</span> util</span></div></div>${tasks}</article>`;
+}
+
+function warnings(data, entries) {
+  const states = data.gpus.map(g => gpuStatus(g, entries(g.gpu))[0]);
+  return [["unattributed", "in use, owner unknown"], ["offboard", "not on board"]].map(([state, text]) => {
+    const n = states.filter(s => s === state).length;
+    return n ? `<span class="chip alert ${state}"><b>${n}</b> GPU${n === 1 ? "" : "s"} ${text}</span>` : "";
+  }).join("");
 }
 
 function calendar(data, slots) {
@@ -116,9 +155,11 @@ function calendar(data, slots) {
         detail: entry.until ? windowText(a, entry.until, now) : "End unknown" });
     }
     for (const [user, mb] of grouped(gpu)) {
-      if (!owners.has(user)) items.push({ a: now, b: now + 3 * HOUR, user, type: "unreg", label: "Not on board",
-        detail: `${gib(mb)} GiB on GPU ${gpu.gpu}, end unknown` });
+      if (!owners.has(user)) items.push({ a: now, b: now + 3 * HOUR, user, type: "unreg",
+        label: user === UNKNOWN ? "Owner unknown" : "Not on board", detail: `${gib(mb)} GiB on GPU ${gpu.gpu}, end unknown` });
     }
+    if (gpu.available && inUse(gpu) && !Object.keys(gpu.users).length) items.push({ a: now, b: now + 3 * HOUR,
+      user: UNKNOWN, type: "unreg", label: "Owner unknown", detail: `${gib(gpu.mem_mb)} GiB on GPU ${gpu.gpu}, no process listed` });
     const ends = [];
     const blocks = items.sort((a, b) => a.a - b.a || a.b - b.b).map(it => {
       let lane = ends.findIndex(end => end <= it.a);
@@ -130,8 +171,9 @@ function calendar(data, slots) {
       const title = `${it.user} · ${it.label}\n${it.detail}${clash ? "\nOverlaps a booking or another user" : ""}`;
       const left = pct(it.a);
       const text = it.type === "scheduled" ? `${it.label} ${it.detail}` : it.label;
-      return `<div class="blk ${it.type} ${esc(it.state || "")}${clash ? " clash" : ""}"
-        style="left:${left}%;width:${Math.max(0.4, pct(it.b) - left)}%;top:calc(${lane} * var(--lane));--c:${slots.get(it.user)}"
+      const unknown = it.user === UNKNOWN;
+      return `<div class="blk ${it.type}${unknown ? " unknown" : ""} ${esc(it.state || "")}${clash ? " clash" : ""}"
+        style="left:${left}%;width:${Math.max(0.4, pct(it.b) - left)}%;top:calc(${lane} * var(--lane));--c:${unknown ? "var(--crit)" : slots.get(it.user)}"
         title="${esc(title)}"><span class="blk-text"><b>${esc(it.user)}</b> <span class="t">${esc(text)}</span></span></div>`;
     }).join("");
     return `<div class="cal-row" style="--lanes:${Math.max(1, ends.length)}"><div class="cal-gpu">GPU ${Number(gpu.gpu)}</div>
@@ -164,7 +206,7 @@ function render(data) {
   const upcoming = data.bookings.filter(b => b.start > data.t).length;
   el("gpu-count").textContent = `${data.gpus.length} GPUs`;
   el("summary").innerHTML = `<span class="chip free"><b>${free}</b> of ${data.gpus.length} free</span>
-    <span class="chip"><b>${upcoming}</b> booking${upcoming === 1 ? "" : "s"} ahead</span>`;
+    <span class="chip"><b>${upcoming}</b> booking${upcoming === 1 ? "" : "s"} ahead</span>${warnings(data, entries)}`;
   el("tiles").innerHTML = data.gpus.map(g => tile(g, entries(g.gpu), slots, data.t)).join("");
   el("calendar").innerHTML = calendar(data, slots);
   el("bookings").innerHTML = bookings(data, slots);

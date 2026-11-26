@@ -1,5 +1,5 @@
 """The read-only page (design 3.11): GET only, bounded threads, a 15 s connection deadline, the last good page kept."""
-import http.client, json, os, socket, threading, time, unittest
+import http.client, json, os, re, socket, threading, time, unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,6 +29,10 @@ def sample():
         return dict(t=now, host="gpuhost", model="Fake GPU", board="/test/board", notices=[], gpus=gpus,
                     entries=page.public_entries(entries, bookings, 0), bookings=page.public_bookings(bookings, now, 0),
                     usage={1: [(now - 120, 30), (now - 60, 95)]})
+
+
+def tiles(body):
+    return {int(m.group(1)): m.group(0) for m in re.finditer(r'<article class="tile[^"]*" aria-label="GPU (\d+),.*?</article>', body, re.S)}
 
 
 class Page(unittest.TestCase):
@@ -84,10 +88,56 @@ class Page(unittest.TestCase):
         body = page.render(data)
         for gpu in (0, 1):
             self.assertIn(f'aria-label="GPU {gpu}, In use, owner unknown"', body)
-        self.assertEqual(body.count('class="state-pill unattributed flag"'), 2)
+        self.assertEqual(body.count('class="state-pill unattributed"'), 2)
         self.assertIn('aria-label="GPU 2, Claimed"', body)
         self.assertIn('aria-label="GPU 3, Free"', body)
         self.assertIn('<b>1</b> of 4 free', body)
+
+    def test_scheduled_tile_names_its_owner_and_window(self):
+        t = tiles(page.render(sample()))[0]
+        self.assertIn('class="tile busy has-scheduled"', t)
+        self.assertIn('<li class="who scheduled">', t)
+        self.assertIn('class="task scheduled"', t)
+        self.assertRegex(t, r'class="task scheduled"><div class="task-meta"><span class="dot"[^>]*></span><b>bob</b>')
+        self.assertRegex(t, r'<span class="until">\d\d:\d\d.\d\d:\d\d</span>')
+
+    def test_backfill_tile_is_muted_and_does_not_repeat_the_name(self):
+        t = tiles(page.render(sample()))[1]
+        self.assertIn('class="tile busy backfill-only"', t)
+        self.assertIn('<li class="who backfill">', t)
+        self.assertIn('class="seg backfill"', t)
+        task = t[t.index('class="task backfill"'):]
+        self.assertNotIn("alice", task)
+        self.assertIn('<span class="tag backfill">Backfill</span>', task)
+        self.assertIn("until ", task)
+        self.assertNotIn("Not on board", t)
+
+    def test_off_board_use_is_a_warning(self):
+        body = page.render(sample())
+        t = tiles(body)[3]
+        self.assertIn('class="tile offboard"', t)
+        self.assertIn('<span class="state-pill offboard">Not on board</span>', t)
+        self.assertIn('<li class="who off">', t)
+        self.assertIn('<span class="flag">Not on board</span>', t)
+        self.assertIn('class="chip alert offboard"><b>1</b> GPU not on board', body)
+        self.assertIn('<b>0</b> of 4 free', body)
+
+    def test_in_use_without_an_owner_is_never_free(self):
+        data = sample()
+        data["entries"] = [e for e in data["entries"] if e["user"] != "alice"]
+        data["gpus"][1].update(users={"Unknown user": 150000}, mem_mb=150000, util=100)
+        data["gpus"][3].update(users={}, mem_mb=154624, util=1)
+        body = page.render(data)
+        for gpu in (1, 3):
+            t = tiles(body)[gpu]
+            self.assertIn(f'aria-label="GPU {gpu}, In use, owner unknown"', t)
+            self.assertIn('class="tile unattributed', t)
+            self.assertIn('<span class="flag">Owner unknown</span>', t)
+            self.assertNotIn("Free", t)
+        self.assertIn('class="seg unknown"', tiles(body)[3])
+        self.assertIn('class="chip alert unattributed"><b>2</b> GPUs in use, owner unknown', body)
+        self.assertIn('<b>0</b> of 4 free', body)
+        self.assertIn('class="blk unreg unknown', body)
 
     def test_public_feed_exposes_only_display_fields(self):
         data = sample()

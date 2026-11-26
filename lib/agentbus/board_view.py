@@ -56,16 +56,37 @@ def occupants(g):
     return sorted(g["users"].items(), key=lambda item: (-item[1], item[0]))
 
 
+UNKNOWN = "Unknown user"
+IN_USE_MB = 2048  # a CUDA context alone stays below this; more memory, or any utilization, is someone's work
+
+
+def in_use(g):
+    return bool(g["users"]) or g["mem_mb"] > IN_USE_MB or (g["util"] or 0) > 0
+
+
 def gpu_status(g, entries):
+    """(state, label) for a GPU. A GPU that reads as in use is never Free, whether or not anyone is listed."""
     if not g["available"]:
         return "unknown", "Unavailable"
-    if any(user != "Unknown user" for user in g["users"]):
-        return "busy", "In use"
-    if g["users"] or g["mem_mb"] > 2048 or (g["util"] or 0) > 0:
+    if not in_use(g):
+        return ("claimed", "Claimed") if entries else ("free", "Free")
+    owners = {e["user"] for e in entries}
+    named = [u for u in g["users"] if u != UNKNOWN]
+    if not named:
         return "unattributed", "In use, owner unknown"
-    if entries:
-        return "claimed", "Claimed"
-    return "free", "Free"
+    if any(u not in owners for u in g["users"]):
+        return "offboard", "Not on board"
+    return "busy", "In use"
+
+
+def occupant_kind(user, entries):
+    """How a user on a GPU is shown: scheduled (prominent), backfill (muted), off-board or unknown (warnings)."""
+    if user == UNKNOWN:
+        return "unknown"
+    mine = [e for e in entries if e["user"] == user]
+    if not mine:
+        return "off"
+    return "scheduled" if any(e["protected"] for e in mine) else "backfill"
 
 
 def history_span(usage, now):
@@ -97,26 +118,36 @@ def spark(usage, gpu, now, span_s):
 def tile(g, entries, slot, usage, now, span_s):
     occ = occupants(g)
     mine = [e for e in entries if g["gpu"] in e["gpus"]]
-    board_users = {e["user"] for e in mine}
     state, label = gpu_status(g, mine)
-    flag_class = " flag" if state == "unattributed" else ""
     total = g["total_mb"]
-    bar = "" if not total else "".join(
-        f'<span class="seg" style="width:{100 * mb / total:.2f}%;--c:var(--u{slot[u]})" '
-        f'title="{esc(u)}: {gib(mb):.1f} GiB"></span>' for u, mb in occ if mb)
+    segs = []
+    if total:
+        for u, mb in occ:
+            if mb:
+                colour = "var(--crit)" if u == UNKNOWN else f"var(--u{slot[u]})"
+                segs.append(f'<span class="seg {occupant_kind(u, mine)}" style="width:{100 * mb / total:.2f}%;--c:{colour}" '
+                            f'title="{esc(u)}: {gib(mb):.1f} GiB"></span>')
+        listed = sum(mb for _, mb in occ)
+        if state == "unattributed" and g["mem_mb"] - listed > IN_USE_MB:
+            segs.append(f'<span class="seg unknown" style="width:{100 * (g["mem_mb"] - listed) / total:.2f}%;--c:var(--crit)" '
+                        f'title="No process listed: {gib(g["mem_mb"] - listed):.1f} GiB"></span>')
     who = []
     for u, mb in occ:
-        flag = "" if u in board_users else '<span class="flag">Not on board</span>'
+        kind = occupant_kind(u, mine)
+        colour = "var(--crit)" if u == UNKNOWN else f"var(--u{slot[u]})"
+        flag = {"off": '<span class="flag">Not on board</span>',
+                "unknown": '<span class="flag">Owner unknown</span>'}.get(kind, "")
         memory = f"{gib(mb):.1f} GiB" if mb else ""
-        who.append(f'<li class="who"><span class="dot" style="--c:var(--u{slot[u]})"></span>'
+        who.append(f'<li class="who {kind}"><span class="dot" style="--c:{colour}"></span>'
                    f'<span class="name">{esc(u)}</span><span class="mem">{memory}</span>{flag}</li>')
+    if state == "unattributed" and not occ:
+        who.append('<li class="who unknown"><span class="dot" style="--c:var(--crit)"></span>'
+                   '<span class="name">No process listed</span><span class="flag">Owner unknown</span></li>')
     tasks = []
     for e in sorted(mine, key=lambda entry: not entry["protected"]):
         kind = e["class"]
-        display = "Scheduled" if kind == "scheduled" else "Backfill"
-        if kind == "scheduled" and not e["protected"]:
-            display = "Scheduled · backfill now"
         treatment = "scheduled" if e["protected"] else "backfill"
+        display = "Scheduled" if e["protected"] else "Scheduled · backfill now" if kind == "scheduled" else "Backfill"
         tags = [f'<span class="tag {treatment}">{display}</span>']
         if e["state"] != "running":
             tags.append(f'<span class="tag warn">{esc(e["state"])}</span>')
@@ -129,21 +160,35 @@ def tile(g, entries, slot, usage, now, span_s):
         else:
             until = f'until {clock(e["until"], e["until"] - now > 12 * 3600)}' if e["until"] else ""
         note = f'<p class="task-text">{esc(e["note"])}</p>' if e["note"] else ""
-        tasks.append(f'<div class="task"><div class="task-meta"><span class="dot" style="--c:var(--u{slot[e["user"]]})"></span>'
-                     f'<b>{esc(e["user"])}</b> {"".join(tags)}<span class="until">{until}</span></div>{note}</div>')
+        # A scheduled run names its owner; a backfill line is the chip and its end, the name is already above.
+        owner = (f'<span class="dot" style="--c:var(--u{slot[e["user"]]})"></span><b>{esc(e["user"])}</b> '
+                 if e["protected"] or not any(u == e["user"] for u, _ in occ) else "")
+        tasks.append(f'<div class="task {treatment}"><div class="task-meta">{owner}{"".join(tags)}'
+                     f'<span class="until">{until}</span></div>{note}</div>')
     util = "–" if g["util"] is None else f'{g["util"]}<small>%</small>'
     mem = f'<b>{gib(g["mem_mb"]):.0f}</b> / {gib(total):.0f} GiB' if total else "Memory unavailable"
-    status = " has-scheduled" if any(e["protected"] for e in mine) else ""
+    status = " has-scheduled" if any(e["protected"] for e in mine) else " backfill-only" if mine else ""
     return f'''<article class="tile {state}{status}" aria-label="GPU {g["gpu"]}, {label}">
-  <header class="tile-head"><h3>GPU {g["gpu"]}</h3><span class="state-pill {state}{flag_class}">{label}</span></header>
+  <header class="tile-head"><h3>GPU {g["gpu"]}</h3><span class="state-pill {state}">{label}</span></header>
   <ul class="whos">{"".join(who)}</ul>
   <div class="gauge">
-    <div class="meter" role="img" aria-label="GPU {g["gpu"]} memory by user">{bar}</div>
+    <div class="meter" role="img" aria-label="GPU {g["gpu"]} memory by user">{"".join(segs)}</div>
     <div class="meter-legend"><span class="memtext">{mem}</span>{spark(usage, g["gpu"], now, span_s)}
       <span class="util"><span class="util-num">{util}</span> util</span></div>
   </div>
   {"".join(tasks)}
 </article>'''
+
+
+def warnings(gpus, entries):
+    """Summary chips for GPUs whose use is not on the board, strongest first."""
+    states = [gpu_status(g, [e for e in entries if g["gpu"] in e["gpus"]])[0] for g in gpus]
+    out = []
+    for state, text in (("unattributed", "in use, owner unknown"), ("offboard", "not on board")):
+        n = states.count(state)
+        if n:
+            out.append(f'<span class="chip alert {state}"><b>{n}</b> GPU{"s" if n != 1 else ""} {text}</span>')
+    return "".join(out)
 
 
 def lanes(items):
@@ -184,6 +229,9 @@ def calendar(data, slot, now):
             if u not in board:
                 rows[g["gpu"]].append(dict(kind="unreg", a=now, b=now + 3 * 3600,
                                            user=u, label=u, mb=mb))
+        if g["available"] and in_use(g) and not g["users"]:
+            rows[g["gpu"]].append(dict(kind="unreg", a=now, b=now + 3 * 3600, user=UNKNOWN, label=UNKNOWN,
+                                       mb=g["mem_mb"]))
     # Off-board use is observed at now. Its faded label reserves drawing space only.
     def overlaps(a, b):
         if a["kind"] == "unreg":
@@ -223,7 +271,7 @@ def calendar(data, slot, now):
         blocks = []
         for it in items:
             a, b = pct(it["a"]), pct(it["b"])
-            colour = f'--c:var(--u{slot[it["user"]]})'
+            colour = "--c:var(--crit)" if it["user"] == UNKNOWN else f'--c:var(--u{slot[it["user"]]})'
             state = ""
             if it["kind"] == "book":
                 state = it["state"]
@@ -239,7 +287,7 @@ def calendar(data, slot, now):
                 if e["occupancy"] != "live":
                     detail += "\nHeartbeat unknown"
             else:
-                label = "Not on board"
+                label = "Owner unknown" if it["user"] == UNKNOWN else "Not on board"
                 detail = f'{gib(it["mb"]):.1f} GiB on GPU {gi}, end unknown'
             tip = f'{it["user"]} · {label}\n{detail}'
             if it.get("note"):
@@ -250,7 +298,7 @@ def calendar(data, slot, now):
                 text += f' <span class="t">{esc(detail.splitlines()[0])}</span>'
             if it["clash"]:
                 tip += "\noverlaps: " + ", ".join(sorted({o["user"] for o in it["clash"]}))
-            blocks.append(f'<div class="blk {it["kind"]} {state}{" clash" if it["clash"] else ""}" '
+            blocks.append(f'<div class="blk {it["kind"]}{" unknown" if it["user"] == UNKNOWN else ""} {state}{" clash" if it["clash"] else ""}" '
                           f'style="left:{a:.3f}%;width:{max(b - a, 0.4):.3f}%;top:calc({it["lane"]} * var(--lane));{colour}" '
                           f'title="{esc(tip)}"><span class="blk-text">{text}</span></div>')
         out.append(f'<div class="cal-row" data-gpu="{gi}" style="--lanes:{n}"><div class="cal-gpu">GPU {gi}</div>'
@@ -318,7 +366,7 @@ def render(data, snapshot=False):
   <p class="eyebrow"><span>GPU board · {mode}</span><time class="stamp" id="stamp" datetime="{stamp.isoformat()}" data-ts="{now}">Updated {stamp.strftime("%a %b %-d, %H:%M")} ET</time></p>
   <h1>{esc(data["host"])} <span>{len(gpus)} × {esc(data["model"])}</span></h1>
   <div class="summary"><span class="chip free"><b>{nfree}</b> of {len(gpus)} free</span>
-    <span class="chip"><b>{upcoming}</b> booking{"s" if upcoming != 1 else ""} ahead</span></div>
+    <span class="chip"><b>{upcoming}</b> booking{"s" if upcoming != 1 else ""} ahead</span>{warnings(gpus, entries)}</div>
   <div class="notes" role="status">{notes}</div>
 </header>
 <section aria-labelledby="h-now"><div class="sec-head"><h2 id="h-now">Now</h2>
@@ -357,7 +405,8 @@ CSS = r"""
   --line: #dadce0; --line-2: #e8eaed; --accent: #1a73e8; --pill: #d3e3fd; --pill-ink: #041e49;
   --now: #1a73e8; --night: rgba(60, 64, 67, 0.045); --past: rgba(60, 64, 67, 0.06);
   --free: #137333; --free-bg: #f3faf5; --warn: #b05a00; --warn-bg: #fef7e0; --crit: #c5221f; --crit-bg: #fce8e6;
-  --scheduled: #184e9c; --scheduled-bg: #e0ebfc; --backfill: #41684d; --backfill-bg: #edf5ee;
+  --scheduled: #184e9c; --scheduled-bg: #e0ebfc; --backfill: #41684d; --backfill-bg: #edf5ee; --backfill-tint: #f7fbf7;
+  --crit-tint: #fdf4f3; --on-crit: #ffffff;
   --u1: #2a78d6; --u2: #eb6834; --u3: #1baf7a; --u4: #eda100; --u5: #e87ba4; --u6: #008300; --u7: #6250d6; --u8: #e34948;
   --body: "Hanken Grotesk", "Helvetica Neue", Arial, sans-serif;
   --mono: "Google Sans Code", ui-monospace, "SF Mono", Menlo, monospace;
@@ -368,7 +417,8 @@ CSS = r"""
   --line: #3c3f41; --line-2: #2a2b2d; --accent: #a8c7fa; --pill: #0b3a82; --pill-ink: #d3e3fd;
   --now: #a8c7fa; --night: rgba(168, 199, 250, 0.045); --past: rgba(0, 0, 0, 0.28);
   --free: #6dd58c; --free-bg: #16231a; --warn: #f6ae5a; --warn-bg: #2d2214; --crit: #f28b82; --crit-bg: #3a1d1b;
-  --scheduled: #b7d2ff; --scheduled-bg: #243a59; --backfill: #92b99c; --backfill-bg: #202d24;
+  --scheduled: #b7d2ff; --scheduled-bg: #243a59; --backfill: #92b99c; --backfill-bg: #202d24; --backfill-tint: #171d19;
+  --crit-tint: #251615; --on-crit: #2b0a08;
   --u1: #3987e5; --u2: #d95926; --u3: #199e70; --u4: #c98500; --u5: #d55181; --u6: #2a9a2a; --u7: #9085e9; --u8: #e66767;
   color-scheme: dark; } }
 * { box-sizing: border-box; }
@@ -532,6 +582,41 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .meter-legend > span { flex: none; }
 .meter-legend > .spark-empty { flex: 1; }
 td { overflow-wrap: anywhere; }
+/* Visual hierarchy. Scheduled runs are the board working as intended and carry the owner's name and colour.
+   Backfill is welcome but secondary: muted name, a soft tint, a lighter memory bar. GPU use with no board entry is
+   flagged in red, and use nobody can be named for is the loudest thing on the page. */
+.chip.alert { color: var(--crit); font-weight: 600; }
+.chip.alert b { color: var(--crit); }
+.chip.alert.unattributed { background: var(--crit); color: var(--on-crit); padding: 2px 8px; border-radius: 4px; }
+.chip.alert.unattributed b { color: var(--on-crit); }
+.who.scheduled .name { font-weight: 700; }
+.who.scheduled .dot { width: 10px; height: 10px; }
+.who.backfill .name { font-weight: 400; color: var(--muted); font-size: 15px; }
+.who.backfill .dot { width: 6px; height: 6px; background: var(--muted); opacity: 0.7; }
+.who.backfill .mem { color: var(--muted); }
+.who.off .name, .who.unknown .name { color: var(--crit); font-weight: 700; }
+.who .flag { background: var(--crit); color: var(--on-crit); border-color: var(--crit); }
+.task.scheduled .task-meta { font-size: 14px; }
+.task.scheduled .task-meta b { font-weight: 700; }
+.task.scheduled .dot { width: 10px; height: 10px; }
+.task.scheduled .until { color: var(--scheduled); font-weight: 600; }
+.task.backfill .task-meta b { font-weight: 400; color: var(--muted); }
+.task.backfill .dot { width: 6px; height: 6px; background: var(--muted); opacity: 0.7; }
+.tile.backfill-only { background: var(--backfill-tint); }
+.tile.backfill-only .task { border-color: color-mix(in srgb, var(--backfill) 16%, var(--line-2)); }
+.seg.backfill { background: color-mix(in srgb, var(--c) 42%, var(--bg)); }
+.seg.unknown { background: repeating-linear-gradient(135deg, var(--crit) 0 3px, color-mix(in srgb, var(--crit) 45%, var(--bg)) 3px 6px); }
+.state-pill.offboard { color: var(--crit); border-width: 1.5px; }
+.state-pill.unattributed { color: var(--on-crit); background: var(--crit); border-color: var(--crit); }
+.tile.offboard, .tile.offboard.backfill-only { background: var(--crit-tint); box-shadow: inset 0 3px var(--crit); }
+.tile.unattributed, .tile.unattributed.backfill-only { background: var(--crit-bg); box-shadow: inset 0 0 0 2px var(--crit); }
+.tile.offboard .meter, .tile.unattributed .meter { background: color-mix(in srgb, var(--crit) 14%, var(--bg)); }
+.tile.offboard .task, .tile.unattributed .task { border-color: color-mix(in srgb, var(--crit) 22%, var(--line-2)); }
+.blk.unreg, .sw-unreg { background: var(--crit-bg); color: var(--crit); box-shadow: inset 0 0 0 1px var(--crit), inset 4px 0 var(--crit); }
+.blk.unreg.unknown { background: repeating-linear-gradient(135deg, var(--crit-bg) 0 6px, color-mix(in srgb, var(--crit) 22%, var(--bg)) 6px 9px);
+  box-shadow: inset 0 0 0 2px var(--crit); }
+.blk.unreg b { color: var(--crit); }
+.blk.backfill b { font-weight: 500; }
 footer { border-top: 1px solid var(--line); padding-top: 12px; color: var(--muted); font-size: 13px; }
 footer a { color: var(--accent); }
 """
