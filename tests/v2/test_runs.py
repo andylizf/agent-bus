@@ -296,12 +296,56 @@ class Runs(BusTest):
         d = self.start(SLEEP, "5")
         self.assertEqual(self.state(d["id"])["class"], "backfill")
 
+    def test_booking_ahead_hook_fires_once_per_revision(self):
+        events = self.tmp / "booking-events.jsonl"
+        hook = self.tmp / "booking-hook.sh"
+        hook.write_text(f'''#!/bin/bash
+IFS= read -r event || [ -n "$event" ]
+printf '%s\\n' "$event" >> "{events}"
+''')
+        hook.chmod(0o755)
+        d = self.start(SLEEP, "0,1", "--hours", "0.1", "--on-message", str(hook))
+        start = int(time.time()) + 90
+        self.book_now("2", start=start)
+        self.book_now("0", start=start + 360)
+
+        def notices():
+            return [json.loads(line) for line in events.read_text().splitlines()] if events.exists() else []
+
+        booked = self.bus_json("book", "--gpus", "1", "--from", str(start), "--to", str(start + 120),
+                               "--objection", "8s", "--json")
+        pending = wait_for(notices, 10, what="booking publication hook")[0]
+        self.assertEqual({k: pending[k] for k in ("event", "id", "run", "booking", "revision", "state", "sender", "gpus",
+                                                  "start", "end", "objection_close")},
+                         dict(event="booking-ahead", id=d["id"], run=d["run"], booking=booked["id"],
+                              revision=booked["revision"], state="pending", sender=core.USER, gpus=[1], start=start,
+                              end=start + 120, objection_close=booked["objection_close"]))
+        self.assertLess(pending["time"], pending["objection_close"])
+
+        self.wait_booking(booked["id"], "standing")
+        revised = self.bus_json("book", "--revise", booked["id"], "--gpus", "1", "--from", str(start + 10),
+                                "--to", str(start + 120), "--json")
+        seen = wait_for(lambda: notices() if len(notices()) >= 2 else None, 10, what="standing revision hook")
+        self.assertEqual([(e["revision"], e["state"]) for e in seen],
+                         [(booked["revision"], "pending"), (revised["revision"], "standing")])
+        self.assertEqual(seen[1]["start"], start + 10)
+        pass_at = self.state(d["id"])["last_pass"]
+        wait_for(lambda: self.state(d["id"])["last_pass"] > pass_at, 10, what="next supervisor pass")
+        self.assertEqual(notices(), seen)
+        self.assertEqual(self.state(d["id"])["state"], "running")
+
     def test_8_gpu_backfill_30h_allowed_and_yields_at_standing_start(self):
         d = self.start(SLEEP, "0-7", "--hours", "30")
         self.assertGreater(self.state(d["id"])["until"] - time.time(), 29 * 3600)
-        bid = self.book_now("3", objection="2s")
+        start = int(time.time()) + 8
+        bid = self.book_now("3", objection="2s", start=start)
+        self.wait_booking(bid, "standing")
+        self.assertLess(time.time(), start)
+        self.assertEqual(self.state(d["id"])["state"], "running")
         st = self.wait_state(d["id"], "ended", 40)
         self.assertEqual(st["end_reason"], f"yielded to booking {bid}")
+        release = next(e for e in st["notices"] if e["event"] == "release-started")
+        self.assertGreaterEqual(release["time"], start)
         log = (self.root / "log" / f"{core.USER}.jsonl").read_text()
         self.assertIn('"yield"', log)
 

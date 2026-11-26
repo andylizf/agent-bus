@@ -26,9 +26,8 @@ rules below to its own job, and touches the entry's heartbeat. The job survives 
 session that started it. The client waits in the foreground and exits with the job's status, or 75 when a release
 ended it; `--detach` returns at once. `--on-message <executable>` names a program the supervisor runs with one JSON
 object on stdin for each event of the run (`request`, `release-started`, `stopping`, `released`, `ended`,
-`leader-exited`, `needs-reconcile`, `exec-unidentified`, `booking-objected`, `board-identity-changed`), killed after
-10 seconds; `bus watch <id>` prints the
-same events.
+`leader-exited`, `needs-reconcile`, `exec-unidentified`, `booking-ahead`, `booking-objected`,
+`board-identity-changed`), killed after 10 seconds. `bus watch <id>` prints the same events.
 
 An entry whose heartbeat is 120 seconds old shows as "occupancy unknown": its GPUs count as neither claimed nor free,
 and the live `nvidia-smi` view says what is on them.
@@ -54,9 +53,11 @@ booking's standing window right now; a pending booking does not block it.
 
 `bus book --gpus 0-3 --from 2026-11-24T22:00-05:00 --to 2026-11-25T01:00-05:00` publishes a booking. Silence is
 consent: the booking stands once its objection window closes (15 minutes by default, never under 10) unless someone
-publishes an objection with a reason, `bus object <booking-id> --reason "<why>"`. No message goes to anyone; the
-board and its read-only page (`bus page`, below) are the notice. When a standing booking's window starts, every backfill run on its GPUs releases,
-the booker's own included.
+publishes an objection with a reason, `bus object <booking-id> --reason "<why>"`. The board and its read-only page
+(`bus page`, below) show the booking. When a pending or standing revision is published that can take effect on a
+backfill run's GPUs before the run's stated end, the run's supervisor emits `booking-ahead` once for that revision
+via the run's hook. When a standing booking takes effect, every backfill run on its GPUs releases, including the
+booker's runs.
 
 Every booking revision and every objection gets a receipt in an append-only sequence under `seq/`. The slot is claimed
 by `link(2)`, so the filesystem's `EEXIST` decides the order and no writer picks its place. An earlier receipt wins an
