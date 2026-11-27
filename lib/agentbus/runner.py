@@ -20,6 +20,7 @@ from .core import Refused, now
 STATE_VERSION = int(os.environ.get("AGENT_BUS_TEST_STATE_VERSION") or 1)
 NONTERMINAL = ("starting", "running", "waiting-handoff", "stopping", "leader-exited", "needs-reconcile")
 EXIT_RELEASED = 75
+LEADER_EXIT_GRACE_S = 10
 
 
 def _migrate_1(s):  # the test-only version 2 adds one field (design 8: migration from version 1 to a test version 2)
@@ -275,6 +276,73 @@ def cgroup_pids(cg_rel):
         except (OSError, ValueError) as e:
             bad.append(e)
     return out
+
+
+def cgroup_identity(fd):
+    st = os.fstat(fd)
+    return [st.st_dev, st.st_ino]
+
+
+def cgroup_populated(fd):
+    r = core.read_file(fd, "cgroup.events", 4096)
+    if r:
+        for line in r[0].splitlines():
+            if line in (b"populated 0", b"populated 1"):
+                return line == b"populated 1"
+    raise Refused("cannot read populated from the job cgroup's cgroup.events")
+
+
+def signal_job_cgroup(fd, path, sig, log):
+    own_group = core.proc_cgroup(os.getpid())
+    if not own_group or in_tree(own_group, path):
+        raise Refused("cannot verify that the supervisor is outside the job cgroup")
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise Refused("pidfd is unavailable for job cgroup cleanup")
+
+    def walk_error(err):
+        if not isinstance(err, FileNotFoundError):
+            raise err
+
+    identity = cgroup_identity(fd)
+    seen, failed = set(), []
+    with open(log, "a", buffering=1) as audit:
+        for _, _, _, group in os.fwalk(".", dir_fd=fd, onerror=walk_error):
+            try:
+                procs = os.open("cgroup.procs", core.READ_FLAGS, dir_fd=group)
+            except FileNotFoundError:
+                continue
+            with os.fdopen(procs) as f:
+                pids = {int(p) for p in f.read().split()}
+            for pid in sorted(pids - seen):
+                try:
+                    handle = os.pidfd_open(pid)
+                except ProcessLookupError:
+                    continue
+                except OSError as e:
+                    failed.append(f"{pid}: {e.strerror}")
+                    continue
+                try:
+                    with open(f"/proc/{pid}/comm", errors="replace") as f:
+                        comm = f.read().rstrip("\n")
+                    current = core.walk(CG_ROOT + path)
+                    try:
+                        if cgroup_identity(current) != identity:
+                            raise Refused("job cgroup changed during cleanup")
+                    finally:
+                        os.close(current)
+                    if not in_tree(core.proc_cgroup(pid) or "", path):
+                        continue
+                    signal.pidfd_send_signal(handle, sig)
+                except (ProcessLookupError, FileNotFoundError):
+                    continue
+                except OSError as e:
+                    failed.append(f"{pid}: {e.strerror}")
+                    continue
+                finally:
+                    os.close(handle)
+                seen.add(pid)
+                audit.write("leader-exit " + json.dumps(dict(pid=pid, comm=comm, signal=sig.name)) + "\n")
+    return ", ".join(failed[:8])
 
 
 def nvidia_view(timeout=20):
@@ -1106,7 +1174,7 @@ class Supervisor:
             for req in r.get("requesters_full", []):
                 self.reply(board, req, "yes", f"stopping, not yet free: {what}")
 
-    def finish(self, board, released):
+    def finish(self, board, released, main_exit=None):
         """The run is free of its GPUs: state ended, entry archived, units cleaned up, the requesters told."""
         s = self.s
         if released:
@@ -1126,7 +1194,9 @@ class Supervisor:
         s["ended"] = now()
         close_admission(self.rid)
         self.archive_entry(board)
-        if s["mode"] == "systemd":
+        if main_exit:
+            self.retire_exited_units(*main_exit)
+        elif s["mode"] == "systemd":
             sysctl("stop", s["units"]["main"])
             sysctl("reset-failed", s["units"]["main"])
             sysctl("stop", s["units"]["slice"])
@@ -1138,20 +1208,122 @@ class Supervisor:
 
     # --- the main service
 
-    def main_status(self):
+    def main_status(self, p):
         """None while the job's leader runs; else its exit status (128+signal for a signal)."""
         s = self.s
         if s["mode"] == "fallback":
             self.reap()
             return s.get("exit_status")
-        p = unit_props(s["units"]["main"], "LoadState", "ActiveState", "SubState", "ExecMainStatus", "ExecMainCode",
-                       "ExecMainExitTimestampMonotonic", "MainPID")
         if p.get("LoadState") == "not-found":
             return s.get("exit_status") if s.get("exit_status") is not None else -1
-        if int(p.get("ExecMainExitTimestampMonotonic") or 0) > 0 and p.get("MainPID") in ("0", None):
-            code, st = int(p.get("ExecMainCode") or 0), int(p.get("ExecMainStatus") or 0)
+        if (p.get("MainPID") == "0" and int(p.get("ExecMainExitTimestampMonotonic") or 0) > 0
+                and p.get("ExecMainCode") in ("1", "2", "3") and p.get("ExecMainStatus", "").isdigit()):
+            code, st = int(p["ExecMainCode"]), int(p["ExecMainStatus"])
             return 128 + st if code in (2, 3) else st
         return None
+
+    def clean_main_cgroup(self, p, pin):
+        s = self.s
+        units = s["units"]
+        if pin and not (pin["run"] == s["run"] and
+                        (p.get("LoadState") == "not-found" or p.get("InvocationID") == pin["invocation"])):
+            raise Refused("the job unit's invocation no longer matches this run")
+        path = pin["path"] if pin else (
+            os.path.join(units["cgroup_path"], units["main"]) if units.get("cgroup_path") else None)
+        if not path or p.get("ControlGroup") not in ("", None, path):
+            raise Refused("the job unit's cgroup path is unknown or changed")
+        term_at = s.get("main_term_at")
+        same_boot = pin and pin["boot"] == core.boot_id()
+        if same_boot and term_at is not None and time.monotonic() - term_at < LEADER_EXIT_GRACE_S:
+            return "waiting 10 s after SIGTERM to the job cgroup"
+        try:
+            fd = core.walk(CG_ROOT + path)
+        except FileNotFoundError:
+            return None
+        try:
+            if pin and (not same_boot or cgroup_identity(fd) != pin["identity"]):
+                raise Refused("the job cgroup no longer matches the launch record")
+            if not cgroup_populated(fd):
+                return None
+            if not pin:
+                raise Refused("job cgroup is populated and has no launch identity (run started by an older build)")
+            if p.get("InvocationID") != pin["invocation"]:
+                raise Refused("job cgroup is populated but its unit invocation cannot be verified")
+            sig = signal.SIGTERM if term_at is None else signal.SIGKILL
+            failed = signal_job_cgroup(fd, path, sig, s["log"])
+            detail = f"; signal errors: {failed}" if failed else ""
+            if sig == signal.SIGTERM:
+                s["main_term_at"] = time.monotonic()
+                return "waiting 10 s after SIGTERM to the job cgroup" + detail
+            return ("job cgroup still populated after SIGKILL" + detail) if cgroup_populated(fd) else None
+        finally:
+            os.close(fd)
+
+    def retire_exited_units(self, p, pin):
+        units = self.s["units"]
+        if pin and p.get("InvocationID") == pin["invocation"]:
+            ok, current = unit_query(units["main"], "InvocationID", "MainPID", "ExecMainExitTimestampMonotonic",
+                                     "ExecMainCode", "ExecMainStatus")
+            if (ok and current.get("InvocationID") == pin["invocation"] and current.get("MainPID") == "0" and
+                    self.main_status(current) is not None and
+                    slice_state(units["cgroup_path"]) in ("empty", "gone")):
+                sysctl("stop", units["main"])
+                sysctl("reset-failed", units["main"])
+                if slice_state(units["cgroup_path"]) in ("empty", "gone"):
+                    sysctl("stop", units["slice"])
+
+    def leader_exit_step(self, board):
+        s = self.s
+        systemd = s["mode"] == "systemd"
+        p = {}
+        if systemd:
+            ok, p = unit_query(s["units"]["main"], "LoadState", "ExecMainStatus", "ExecMainCode",
+                               "ExecMainExitTimestampMonotonic", "MainPID", "InvocationID", "ControlGroup")
+            if not ok:
+                if s.get("main_exit_seen"):
+                    self.hold_main_cleanup("systemd did not answer about the job's unit")
+                return
+        st = self.main_status(p)
+        if st is None and s.get("exit_status") is None:
+            return
+        pin = core.read_private(os.path.join(ctl_dir(self.rid), "main-cgroup.json")) if systemd else None
+        saved_status = s.get("exit_status")
+        if saved_status is None and st is not None and st >= 0 and (
+                not pin or p.get("InvocationID") == pin["invocation"]):
+            s["exit_status"] = st
+        if not s.get("main_exit_seen") or s.get("exit_status") != saved_status:
+            s["main_exit_seen"] = True
+            self.save()
+        out = resolve_intents(self.rid) if systemd else []
+        if systemd:
+            try:
+                waiting = self.clean_main_cgroup(p, pin)
+            except (OSError, Refused, ValueError, KeyError) as e:
+                waiting = str(e)
+            if waiting:
+                self.hold_main_cleanup(waiting)
+                return
+        ok, remains = (False, [f"exec {e} outstanding" for e in out]) if out else self.verify()
+        if ok:
+            s["end_reason"] = f"exited rc={s.get('exit_status')}"
+            self.finish(board, released=False, main_exit=(p, pin) if systemd else None)
+            return
+        if s["state"] == "running":
+            s["state"] = s["entry_state"] = "leader-exited"
+            notice(self.rid, s, self.hooks, "leader-exited", exit_status=s.get("exit_status"), remains=remains)
+        if not out:
+            self.mark_reconcile(board)
+        s["leader_remains"] = remains
+
+    def hold_main_cleanup(self, waiting):
+        s = self.s
+        s["state"] = s["entry_state"] = "stopping"
+        s["held_gpus"] = list(s["gpus"])
+        s["gpus_released"] = []
+        s.pop("gpus_released_checked", None)
+        if s.get("leader_remains") != [waiting]:
+            notice(self.rid, s, self.hooks, "stopping", remains=[waiting])
+        s["leader_remains"] = [waiting]
 
     def start_main(self):
         s = self.s
@@ -1282,7 +1454,7 @@ class Supervisor:
                 else:
                     s["pending_verification"] = "systemd did not answer about the job's unit"
             # requests and bookings (board records): only with the board's identity intact
-            if with_board and s["state"] in ("running", "leader-exited", "waiting-handoff", "needs-reconcile") \
+            if with_board and s["state"] in ("running", "leader-exited", "waiting-handoff", "stopping", "needs-reconcile") \
                     and not s.get("release"):
                 for m in msgs:
                     if m["kind"] != "request" or m["request_id"] in s["requests"]:
@@ -1314,21 +1486,10 @@ class Supervisor:
                 if s["state"] == "ended":
                     return
             # the main service and the slice
-            if s["state"] in ("running", "leader-exited", "needs-reconcile") and not s.get("release"):
-                st = self.main_status()
-                if st is not None:
-                    s["exit_status"] = st if st >= 0 else s.get("exit_status")
-                    out = resolve_intents(self.rid) if s["mode"] == "systemd" else []
-                    ok, remains = (False, [f"exec {e} outstanding" for e in out]) if out else self.verify()
-                    if ok:
-                        s["end_reason"] = f"exited rc={s.get('exit_status')}"
-                        return self.finish(board if with_board else _NoBoard(), released=False)
-                    if s["state"] not in ("leader-exited", "needs-reconcile"):
-                        s["state"] = s["entry_state"] = "leader-exited"
-                        notice(self.rid, s, self.hooks, "leader-exited", exit_status=st, remains=remains)
-                    if not out:
-                        self.mark_reconcile(board if with_board else None)
-                    s["leader_remains"] = remains
+            if s["state"] in ("running", "leader-exited", "stopping", "needs-reconcile") and not s.get("release"):
+                self.leader_exit_step(board if with_board else _NoBoard())
+                if s["state"] == "ended":
+                    return
             if s["mode"] == "systemd" and s["state"] in ("running", "leader-exited"):
                 self.track_escaped()
             self.passes += 1
@@ -1414,7 +1575,13 @@ class Supervisor:
                 if s["state"] not in NONTERMINAL:
                     break
                 self.maybe_upgrade()
-                time.sleep(max(0.0, core.PASS_S() - (time.monotonic() - start)))
+                t = time.monotonic()
+                pause = max(0.0, core.PASS_S() - (t - start))
+                if not s.get("release") and s.get("main_term_at") is not None:
+                    grace_left = s["main_term_at"] + LEADER_EXIT_GRACE_S - t
+                    if grace_left > 0:
+                        pause = min(pause, grace_left)
+                time.sleep(pause)
             return 0
         finally:
             self.lock.release()
@@ -1534,6 +1701,23 @@ def job_main(rid):
     if not spec:
         print(f"bus: no job spec for {rid}", file=sys.stderr)
         return 1
+    s = load_state(rid)
+    path = core.proc_cgroup(os.getpid())
+    invocation = os.environ.get("INVOCATION_ID")
+    if not invocation or not path or path.split("/")[-2:] != [s["units"]["slice"], s["units"]["main"]]:
+        raise Refused("cannot pin the job cgroup at launch")
+    fd = core.walk(CG_ROOT + path)
+    try:
+        pin = dict(run=s["run"], path=path, boot=core.boot_id(), identity=cgroup_identity(fd), invocation=invocation)
+    finally:
+        os.close(fd)
+    fd = core.walk(ctl_dir(rid))
+    try:
+        core.publish(fd, "main-cgroup.json", core.dumps(pin), mode=0o600)
+    except FileExistsError:
+        raise Refused("this run already has a job cgroup identity")
+    finally:
+        os.close(fd)
     os.chdir(spec["cwd"])
     os.execve("/bin/bash", ["bash", "-c", spec["command"]], spec["env"])
 

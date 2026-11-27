@@ -104,14 +104,20 @@ class Runs(BusTest):
         d = self.start(SLEEP, "0", "--mem-max", "100")
         self.assertEqual(self.props(d["main_unit"], "MemoryMax")["MemoryMax"], str(100 * 1024 * 1024))
 
-    def test_setsid_children_stay_in_slice_and_leader_exit(self):
-        d = self.start(f"setsid bash -c 'sleep {4 * SCALE}' & (setsid sleep {4 * SCALE} &) ; exit 3")
-        st = self.wait_state(d["id"], "leader-exited", 20)
+    def test_setsid_child_is_killed_after_leader_exit(self):
+        pidf = self.tmp / "sleeper.pid"
+        d = self.start(f"trap '' TERM; (setsid bash -c 'echo $$ > {pidf}; exec sleep 60' &); "
+                       f"while ! test -s {pidf}; do sleep 0.1; done; exit 3")
+        st = self.wait_state(d["id"], "stopping", 20)
         self.assertEqual(st["exit_status"], 3)
         e = json.loads(self.entry_file(d["id"]).read_text())
-        self.assertEqual(e["state"], "leader-exited")
+        self.assertEqual(e["state"], "stopping")
         st = self.wait_state(d["id"], "ended", 30)
         self.assertEqual(st["end_reason"], "exited rc=3")
+        pid = int(pidf.read_text())
+        with open(d["log"]) as f:
+            records = [json.loads(line.partition(" ")[2]) for line in f if line.startswith("leader-exit ")]
+        self.assertEqual([x["signal"] for x in records if x["pid"] == pid], ["SIGTERM", "SIGKILL"])
 
     def test_ray_like_daemon_is_in_slice_and_stopped(self):
         pidf = self.tmp / "daemon.pid"
