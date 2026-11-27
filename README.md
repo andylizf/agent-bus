@@ -107,6 +107,24 @@ admits it before its scope starts in the slice; inside the new scope the command
 stands. An exec that is paused or slow keeps the run "stopping" until it has either started inside the slice (and is
 stopped with it) or both its client and its launcher are gone; there is no timeout shortcut.
 
+### Cleanup after the job leader exits
+
+When the leader of a systemd run exits, `bus` saves its exit status and sends TERM to processes in the job's
+original cgroup. It rechecks each PID's membership just before signaling. A process that moves to another scope
+between that check and delivery can still receive TERM. If processes remain after a 10-second grace period,
+the kernel's `cgroup.kill` interface sends KILL to the job cgroup. The run log records each TERM with its PID
+and command name. It also records the `cgroup.kill` request and a snapshot of PIDs and command names taken
+just before it.
+
+The run holds its GPUs while cgroup cleanup is unverified or the slice repopulates. Before reporting `ended`,
+the supervisor checks GPU release and confirms on later passes that the job service and its slice have stopped.
+If the run's required cgroup identity record is missing, unreadable, or mismatched, all GPUs stay held in
+`needs-reconcile`. `bus state <id>` shows what is holding the run.
+
+Runs adopted from v2.0.7 lack a launch-time cgroup identity record. The supervisor holds their GPUs while the
+job cgroup is populated. Once it is empty, the supervisor can verify GPU release and reclaim the units. The
+owner can use `bus release <id>` to stop an older run through the explicit release path.
+
 ### Trust
 
 - A record's author is its file owner. An entry, booking, objection, receipt or message counts only when its owner's

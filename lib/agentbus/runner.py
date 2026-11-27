@@ -21,7 +21,7 @@ STATE_VERSION = int(os.environ.get("AGENT_BUS_TEST_STATE_VERSION") or 1)
 NONTERMINAL = ("starting", "running", "waiting-handoff", "stopping", "leader-exited", "needs-reconcile")
 EXIT_RELEASED = 75
 LEADER_EXIT_GRACE_S = 10
-MAIN_STATUS_FIELDS = ("LoadState", "ExecMainStatus", "ExecMainCode", "ExecMainExitTimestampMonotonic",
+MAIN_STATUS_FIELDS = ("LoadState", "ActiveState", "ExecMainStatus", "ExecMainCode", "ExecMainExitTimestampMonotonic",
                       "MainPID", "InvocationID", "ControlGroup")
 
 
@@ -162,7 +162,8 @@ def sysctl(*args, timeout=20):
         return 255, "", repr(e)
 
 
-def stop_invocation(invocation):
+def stop_invocation(invocation, reset_failed=False):
+    """Request Stop or clear a failed invocation. The caller confirms inactivity in a later pass."""
     bus = ["busctl", "--user", "--json=short", "--timeout=10s", "call", "org.freedesktop.systemd1"]
     try:
         raw = bytes.fromhex(invocation)
@@ -172,8 +173,9 @@ def stop_invocation(invocation):
                               "GetUnitByInvocationID", "ay", "16", *map(str, raw)], capture_output=True,
                              text=True, timeout=12, check=True)
         path, = json.loads(ref.stdout)["data"]
-        # systemd resolves this object by invocation again when it processes Stop.
-        subprocess.run([*bus, path, "org.freedesktop.systemd1.Unit", "Stop", "s", "ignore-dependencies"],
+        method = ("ResetFailed",) if reset_failed else ("Stop", "s", "ignore-dependencies")
+        # systemd resolves this object by invocation again when it processes the request.
+        subprocess.run([*bus, path, "org.freedesktop.systemd1.Unit", *method],
                        capture_output=True, timeout=12, check=True)
     except (OSError, subprocess.SubprocessError, ValueError, KeyError):
         return False
@@ -1285,7 +1287,10 @@ class Supervisor:
                 or not isinstance(pin.get("identity"), list) or len(pin["identity"]) != 2
                 or not all(type(x) is int for x in pin["identity"])):
             raise Refused("the job cgroup launch identity is missing or unreadable")
-        if pin["run"] != s["run"] or (p.get("LoadState") != "not-found" and p.get("InvocationID") != pin["invocation"]):
+        invocation = p.get("InvocationID")
+        stopped_without_id = p.get("ActiveState") == "inactive" and not invocation
+        if pin["run"] != s["run"] or (p.get("LoadState") != "not-found" and not stopped_without_id
+                                      and invocation != pin["invocation"]):
             raise Refused("the job unit's invocation no longer matches this run")
         return pin
 
@@ -1331,26 +1336,52 @@ class Supervisor:
         finally:
             os.close(fd)
 
+    def retire_unit(self, kind, p, path, expected=None):
+        if p.get("LoadState") == "not-found":
+            return None
+        previous = self.s.setdefault("retire_invocations", {})
+        expected = previous.get(kind) or expected
+        invocation, active = p.get("InvocationID"), p.get("ActiveState")
+        name = "job unit" if kind == "main" else "run slice"
+        if expected and invocation and invocation != expected:
+            raise Refused(f"the {name}'s invocation changed during reclamation")
+        if active == "inactive":
+            return None
+        if not invocation or not active or p.get("ControlGroup") not in ("", None, path):
+            return f"cannot verify the {name}'s invocation for reclamation"
+        if kind == "main" and (not expected or (active not in ("deactivating", "failed") and self.main_status(p) is None)):
+            raise Refused("the job unit's invocation changed during reclamation")
+        if previous.get(kind) != invocation:
+            previous[kind] = invocation
+            self.save()
+        if active == "deactivating":
+            return f"waiting for systemd to confirm the {name} is inactive"
+        if active == "failed":
+            if stop_invocation(invocation, reset_failed=True):
+                return f"waiting for systemd to confirm the {name} is inactive"
+            return f"systemd did not clear the failed {name}"
+        if stop_invocation(invocation):
+            return f"waiting for systemd to confirm the {name} is inactive"
+        return f"systemd did not queue Stop for the {name}"
+
     def retire_exited_units(self, p, pin):
         units = self.s["units"]
         path = self.main_cgroup_path(pin)
         if any(slice_state(cg) not in ("empty", "gone") for cg in (path, units["cgroup_path"])):
             return "the job cgroup or slice is no longer empty"
-        slice_ok, slice_props = unit_query(units["slice"], "ControlGroup", "InvocationID")
         ok, current = unit_query(units["main"], *MAIN_STATUS_FIELDS)
         if not ok:
             return "systemd did not answer during job unit reclamation"
-        if current.get("LoadState") != "not-found":
-            invocation = p.get("InvocationID")
-            if (not invocation or current.get("InvocationID") != invocation or self.main_status(current) is None
-                    or current.get("ControlGroup") not in ("", None, path)):
-                raise Refused("the job unit's invocation changed during reclamation")
-            if not stop_invocation(invocation):
-                return "systemd did not stop the exited job invocation"
-        if (slice_ok and slice_props.get("InvocationID") and slice_props.get("ControlGroup") == units["cgroup_path"]
-                and slice_state(units["cgroup_path"]) in ("empty", "gone")):
-            stop_invocation(slice_props["InvocationID"])
-        return None
+        waiting = self.retire_unit("main", current, path, pin["invocation"] if pin else p.get("InvocationID"))
+        if waiting:
+            return waiting
+        slice_path = units["cgroup_path"]
+        ok, current = unit_query(units["slice"], "LoadState", "ActiveState", "ControlGroup", "InvocationID")
+        if not ok:
+            return "systemd did not answer during slice reclamation"
+        if slice_state(slice_path) not in ("empty", "gone"):
+            return "the run slice is no longer empty"
+        return self.retire_unit("slice", current, slice_path)
 
     def leader_exit_step(self, board):
         s = self.s

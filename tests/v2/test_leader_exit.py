@@ -38,14 +38,15 @@ class LeaderExit(unittest.TestCase):
                           log=str(self.log), gpus=[1, 2], exit_status=None, main_pin_required=True,
                           units=dict(main="run-main.service", slice="run.slice", cgroup_path="/run.slice"))
         self.pin_file = Path(runner.ctl_dir(self.rid)) / "main-cgroup.json"
-        self.props = dict(LoadState="loaded", MainPID="0", ExecMainCode="1", ExecMainStatus="0",
+        self.props = dict(LoadState="loaded", ActiveState="active", MainPID="0", ExecMainCode="1", ExecMainStatus="0",
                           ExecMainExitTimestampMonotonic="200000", InvocationID="original", ControlGroup=self.path)
         self.pin = dict(run=self.sup.s["run"], path=self.path, invocation="original", boot="boot",
                         identity=[self.group.stat().st_dev, self.group.stat().st_ino])
         core.write_private(self.pin_file, self.pin)
         self.patch(runner, "CG_ROOT", new=str(self.root))
         self.patch(core, "boot_id", return_value="boot")
-        self.slice_props = dict(ControlGroup="/run.slice", InvocationID="original-slice")
+        self.slice_props = dict(LoadState="loaded", ActiveState="active", ControlGroup="/run.slice",
+                                InvocationID="original-slice")
         self.query = self.patch(runner, "unit_query", side_effect=self.unit_query)
         self.patch(runner, "resolve_intents", return_value=[])
         self.sysctl = self.patch(runner, "sysctl", return_value=(0, "", ""))
@@ -66,6 +67,13 @@ class LeaderExit(unittest.TestCase):
     def step(self):
         self.sup.leader_exit_step(runner._NoBoard())
         self.sup.save()
+
+    def finish_after_stops(self):
+        self.props["ActiveState"] = "inactive"
+        self.step()
+        self.assertEqual(self.sup.s["state"], "stopping")
+        self.slice_props["ActiveState"] = "inactive"
+        self.step()
 
     def test_term_then_kill_with_adoption_and_gpu_verification(self):
         child = self.group / "child"
@@ -139,6 +147,7 @@ class LeaderExit(unittest.TestCase):
 
         self.gpu.return_value = (True, [], [], None)
         self.step()
+        self.finish_after_stops()
         self.assertEqual((self.sup.s["state"], self.sup.s["exit_status"], self.sup.s["end_reason"]),
                          ("ended", 0, "exited rc=0"))
 
@@ -228,6 +237,7 @@ class LeaderExit(unittest.TestCase):
         self.set_populated(False)
         self.step()
         sent.assert_not_called()
+        self.finish_after_stops()
         self.assertEqual((self.sup.s["state"], self.sup.s["exit_status"]), ("ended", 143))
         self.stopped.assert_has_calls([mock.call("original"), mock.call("original-slice")])
         self.sysctl.assert_not_called()
@@ -239,6 +249,7 @@ class LeaderExit(unittest.TestCase):
         self.step()
         sent.assert_not_called()
         self.gpu.assert_called_once()
+        self.finish_after_stops()
         self.assertEqual((self.sup.s["state"], self.sup.s["exit_status"]), ("ended", 3))
         self.stopped.assert_has_calls([mock.call("original"), mock.call("original-slice")])
         self.sysctl.assert_not_called()
@@ -256,6 +267,75 @@ class LeaderExit(unittest.TestCase):
         self.assertIn("invocation changed during reclamation", self.sup.s["leader_remains"][0])
         self.assertEqual(self.sup.s["exit_status"], 0)
         self.stopped.assert_not_called()
+
+    def test_slice_repopulated_on_final_check_holds_gpus(self):
+        self.props["ActiveState"] = "inactive"
+        self.set_populated(False)
+        self.sup.s.update(held_gpus=[2], gpus_released=[1], gpus_released_checked=15)
+        reads = iter(("empty", "empty", "populated"))
+        with mock.patch.object(runner, "slice_state",
+                               side_effect=lambda path: next(reads) if path == "/run.slice" else "empty"):
+            self.step()
+        self.assertEqual(self.sup.s["state"], "stopping")
+        self.assertEqual(self.sup.s["leader_remains"], ["the run slice is no longer empty"])
+        self.assertEqual(self.sup.s["held_gpus"], [1, 2])
+        self.assertEqual(self.sup.s["gpus_released"], [])
+        self.assertNotIn("gpus_released_checked", self.sup.s)
+        self.stopped.assert_not_called()
+        self.step()
+        self.gpu.assert_called()
+        self.stopped.assert_called_once_with("original-slice")
+        self.assertEqual(self.sup.s["state"], "stopping")
+
+    def test_stop_enqueue_and_slice_stop_failure_do_not_finish(self):
+        self.set_populated(False)
+        self.props["ExecMainStatus"] = "7"
+        self.stopped.side_effect = [True, False, True]
+        self.step()
+        self.assertEqual(self.sup.s["state"], "stopping")
+        self.assertIn("confirm the job unit is inactive", self.sup.s["leader_remains"][0])
+        self.stopped.assert_called_once_with("original")
+
+        self.props["ActiveState"] = "deactivating"
+        self.step()
+        self.stopped.assert_called_once_with("original")
+        self.assertEqual(self.sup.s["state"], "stopping")
+        self.props.update(ActiveState="inactive", InvocationID="")
+        self.step()
+        self.stopped.assert_called_with("original-slice")
+        self.assertEqual(self.sup.s["leader_remains"], ["systemd did not queue Stop for the run slice"])
+        self.assertEqual(self.sup.s["state"], "stopping")
+        self.step()
+        self.assertEqual(self.sup.s["leader_remains"], ["waiting for systemd to confirm the run slice is inactive"])
+        self.assertEqual(self.sup.s["state"], "stopping")
+
+        self.slice_props["ActiveState"] = "deactivating"
+        self.step()
+        self.assertEqual(self.sup.s["state"], "stopping")
+        self.assertEqual(self.stopped.call_count, 3)
+        self.slice_props.update(LoadState="not-found", ActiveState="inactive", InvocationID="")
+        self.step()
+        self.assertEqual((self.sup.s["state"], self.sup.s["exit_status"]), ("ended", 7))
+
+    def test_replaced_slice_during_reclamation_remains_held(self):
+        self.set_populated(False)
+        self.props["ActiveState"] = "inactive"
+        self.step()
+        self.assertEqual(runner.load_state(self.rid)["retire_invocations"], {"slice": "original-slice"})
+        self.slice_props["InvocationID"] = "replacement-slice"
+        self.step()
+        self.assertEqual(self.sup.s["state"], "needs-reconcile")
+        self.assertIn("run slice's invocation changed", self.sup.s["leader_remains"][0])
+        self.stopped.assert_called_once_with("original-slice")
+
+    def test_failed_service_is_cleared_by_invocation_then_confirmed_inactive(self):
+        self.set_populated(False)
+        self.props.update(ActiveState="failed", ExecMainCode="2", ExecMainStatus="9")
+        self.step()
+        self.assertEqual(self.sup.s["state"], "stopping")
+        self.stopped.assert_called_once_with("original", reset_failed=True)
+        self.finish_after_stops()
+        self.assertEqual((self.sup.s["state"], self.sup.s["exit_status"]), ("ended", 137))
 
     def test_traces_escapes_before_both_signals_and_holds_off_gpu_escape(self):
         escape = {"140": dict(pid=140, unit="escaped.scope", boot_id="boot", ticks=1)}
