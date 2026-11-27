@@ -118,8 +118,9 @@ just before it.
 
 The run holds its GPUs while cgroup cleanup is unverified or the slice repopulates. Before reporting `ended`,
 the supervisor checks GPU release and confirms on later passes that the job service and its slice have stopped.
-If the run's required cgroup identity record is missing, unreadable, or mismatched, all GPUs stay held in
-`needs-reconcile`. `bus state <id>` shows what is holding the run.
+A missing or unreadable required launch record or a different systemd invocation keeps all GPUs held in
+`needs-reconcile`. If the job cgroup is still present and the host's boot ID or the cgroup inode differs from
+the launch record, the run stays in `stopping`. `bus state <id>` shows what is holding the run.
 
 Runs adopted from v2.0.7 lack a launch-time cgroup identity record. The supervisor holds their GPUs while the
 job cgroup is populated. Once it is empty, the supervisor can verify GPU release and reclaim the units. The

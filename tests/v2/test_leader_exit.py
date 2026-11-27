@@ -242,6 +242,22 @@ class LeaderExit(unittest.TestCase):
         self.stopped.assert_has_calls([mock.call("original"), mock.call("original-slice")])
         self.sysctl.assert_not_called()
 
+    def test_inactive_job_without_invocation_cannot_supply_first_exit_status(self):
+        self.set_populated(False)
+        self.props.update(ActiveState="inactive", InvocationID="", ExecMainStatus="17")
+        for requires_pin in (True, False):
+            with self.subTest(requires_pin=requires_pin):
+                if not requires_pin:
+                    self.sup.s.pop("main_pin_required")
+                    self.pin_file.unlink()
+                self.step()
+                self.assertEqual(self.sup.s["state"], "needs-reconcile")
+                self.assertEqual(self.sup.s["held_gpus"], [1, 2])
+                self.assertIsNone(self.sup.s["exit_status"])
+                self.assertNotIn("end_reason", self.sup.s)
+        self.stopped.assert_not_called()
+        self.gpu.assert_not_called()
+
     def test_no_leftovers_go_straight_to_release_verification(self):
         self.set_populated(False)
         self.props["ExecMainStatus"] = "3"
@@ -300,7 +316,7 @@ class LeaderExit(unittest.TestCase):
         self.step()
         self.stopped.assert_called_once_with("original")
         self.assertEqual(self.sup.s["state"], "stopping")
-        self.props.update(ActiveState="inactive", InvocationID="")
+        self.props.update(ActiveState="inactive", InvocationID="", ExecMainStatus="17")
         self.step()
         self.stopped.assert_called_with("original-slice")
         self.assertEqual(self.sup.s["leader_remains"], ["systemd did not queue Stop for the run slice"])
@@ -321,12 +337,54 @@ class LeaderExit(unittest.TestCase):
         self.set_populated(False)
         self.props["ActiveState"] = "inactive"
         self.step()
-        self.assertEqual(runner.load_state(self.rid)["retire_invocations"], {"slice": "original-slice"})
+        self.assertEqual(runner.load_state(self.rid)["retire_invocations"],
+                         {"main": "original", "slice": "original-slice"})
         self.slice_props["InvocationID"] = "replacement-slice"
         self.step()
         self.assertEqual(self.sup.s["state"], "needs-reconcile")
         self.assertIn("run slice's invocation changed", self.sup.s["leader_remains"][0])
         self.stopped.assert_called_once_with("original-slice")
+
+    def test_slice_replaced_between_main_stop_and_next_pass_is_never_stopped(self):
+        self.set_populated(False)
+
+        def request_stop(invocation):
+            self.assertEqual(invocation, "original")
+            self.assertEqual(runner.load_state(self.rid)["retire_invocations"],
+                             {"main": "original", "slice": "original-slice"})
+            return True
+
+        self.stopped.side_effect = request_stop
+        self.step()
+        self.assertEqual(self.sup.s["state"], "stopping")
+        self.props.update(ActiveState="inactive", InvocationID="")
+        self.slice_props["InvocationID"] = "replacement-slice"
+        self.sup.s = runner.load_state(self.rid)
+        self.step()
+        self.assertEqual(self.sup.s["state"], "needs-reconcile")
+        self.assertEqual(self.sup.s["held_gpus"], [1, 2])
+        self.assertIn("run slice's invocation changed", self.sup.s["leader_remains"][0])
+        self.stopped.assert_called_once_with("original")
+
+    def test_stop_waits_for_both_invocations_to_be_saved(self):
+        self.set_populated(False)
+        save = self.sup.save
+
+        def fail_invocation_save():
+            if "retire_invocations" in self.sup.s:
+                raise OSError("state write failed")
+            save()
+
+        with mock.patch.object(self.sup, "save", side_effect=fail_invocation_save):
+            for _ in range(2):
+                with self.assertRaisesRegex(OSError, "state write failed"):
+                    self.step()
+                self.assertNotIn("retire_invocations", self.sup.s)
+        self.stopped.assert_not_called()
+        self.step()
+        self.stopped.assert_called_once_with("original")
+        self.assertEqual(runner.load_state(self.rid)["retire_invocations"],
+                         {"main": "original", "slice": "original-slice"})
 
     def test_failed_service_is_cleared_by_invocation_then_confirmed_inactive(self):
         self.set_populated(False)

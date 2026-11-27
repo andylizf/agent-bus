@@ -1261,6 +1261,10 @@ class Supervisor:
             return s.get("exit_status")
         if p.get("LoadState") == "not-found":
             return s.get("exit_status") if s.get("exit_status") is not None else -1
+        if p.get("ActiveState") == "inactive" and not p.get("InvocationID"):
+            if s.get("exit_status") is None:
+                raise Refused("the inactive job unit has no invocation ID and the leader's exit status is unknown")
+            return s["exit_status"]
         if (p.get("MainPID") == "0" and int(p.get("ExecMainExitTimestampMonotonic") or 0) > 0
                 and p.get("ExecMainCode") in ("1", "2", "3") and p.get("ExecMainStatus", "").isdigit()):
             code, st = int(p["ExecMainCode"]), int(p["ExecMainStatus"])
@@ -1288,7 +1292,7 @@ class Supervisor:
                 or not all(type(x) is int for x in pin["identity"])):
             raise Refused("the job cgroup launch identity is missing or unreadable")
         invocation = p.get("InvocationID")
-        stopped_without_id = p.get("ActiveState") == "inactive" and not invocation
+        stopped_without_id = s.get("exit_status") is not None and p.get("ActiveState") == "inactive" and not invocation
         if pin["run"] != s["run"] or (p.get("LoadState") != "not-found" and not stopped_without_id
                                       and invocation != pin["invocation"]):
             raise Refused("the job unit's invocation no longer matches this run")
@@ -1336,24 +1340,22 @@ class Supervisor:
         finally:
             os.close(fd)
 
-    def retire_unit(self, kind, p, path, expected=None):
+    def retire_unit(self, kind, p, path):
         if p.get("LoadState") == "not-found":
             return None
-        previous = self.s.setdefault("retire_invocations", {})
-        expected = previous.get(kind) or expected
+        expected = self.s["retire_invocations"][kind]
         invocation, active = p.get("InvocationID"), p.get("ActiveState")
         name = "job unit" if kind == "main" else "run slice"
-        if expected and invocation and invocation != expected:
+        if invocation and invocation != expected:
             raise Refused(f"the {name}'s invocation changed during reclamation")
         if active == "inactive":
+            if kind == "main" and not invocation:
+                self.main_status(p)
             return None
         if not invocation or not active or p.get("ControlGroup") not in ("", None, path):
             return f"cannot verify the {name}'s invocation for reclamation"
-        if kind == "main" and (not expected or (active not in ("deactivating", "failed") and self.main_status(p) is None)):
+        if kind == "main" and active not in ("deactivating", "failed") and self.main_status(p) is None:
             raise Refused("the job unit's invocation changed during reclamation")
-        if previous.get(kind) != invocation:
-            previous[kind] = invocation
-            self.save()
         if active == "deactivating":
             return f"waiting for systemd to confirm the {name} is inactive"
         if active == "failed":
@@ -1369,38 +1371,52 @@ class Supervisor:
         path = self.main_cgroup_path(pin)
         if any(slice_state(cg) not in ("empty", "gone") for cg in (path, units["cgroup_path"])):
             return "the job cgroup or slice is no longer empty"
-        ok, current = unit_query(units["main"], *MAIN_STATUS_FIELDS)
+        ok, main = unit_query(units["main"], *MAIN_STATUS_FIELDS)
         if not ok:
             return "systemd did not answer during job unit reclamation"
-        waiting = self.retire_unit("main", current, path, pin["invocation"] if pin else p.get("InvocationID"))
-        if waiting:
-            return waiting
         slice_path = units["cgroup_path"]
-        ok, current = unit_query(units["slice"], "LoadState", "ActiveState", "ControlGroup", "InvocationID")
+        ok, slice_props = unit_query(units["slice"], "LoadState", "ActiveState", "ControlGroup", "InvocationID")
         if not ok:
             return "systemd did not answer during slice reclamation"
+        invocations = self.s.get("retire_invocations")
+        if invocations is None:
+            slice_id = slice_props.get("InvocationID") or None
+            slice_stopped = slice_props.get("LoadState") == "not-found" or slice_props.get("ActiveState") == "inactive"
+            if slice_props.get("ControlGroup") not in ("", None, slice_path) or (not slice_id and not slice_stopped):
+                return "cannot verify the run slice's invocation for reclamation"
+            main_id = pin["invocation"] if pin else p.get("InvocationID") or None
+            self.s["retire_invocations"] = {"main": main_id, "slice": slice_id}
+            try:
+                self.save()
+            except OSError:
+                del self.s["retire_invocations"]
+                raise
+        elif "main" not in invocations or "slice" not in invocations:
+            raise Refused("both unit invocations must be recorded before reclamation")
+        waiting = self.retire_unit("main", main, path)
+        if waiting:
+            return waiting
         if slice_state(slice_path) not in ("empty", "gone"):
             return "the run slice is no longer empty"
-        return self.retire_unit("slice", current, slice_path)
+        return self.retire_unit("slice", slice_props, slice_path)
 
     def leader_exit_step(self, board):
         s = self.s
         systemd = s["mode"] == "systemd"
         p = {}
-        pin = None
         if systemd:
             ok, p = unit_query(s["units"]["main"], *MAIN_STATUS_FIELDS)
             if not ok:
                 if s.get("main_exit_seen") and not s.get("main_identity_hold"):
                     self.hold_main_cleanup("systemd did not answer about the job's unit")
                 return
-            try:
-                pin = self.read_main_pin(p)
-            except (OSError, Refused) as e:
-                s["main_identity_hold"] = True
-                self.hold_main_cleanup(str(e), state="needs-reconcile")
-                return
-        st = self.main_status(p)
+        try:
+            pin = self.read_main_pin(p) if systemd else None
+            st = self.main_status(p)
+        except (OSError, Refused) as e:
+            s["main_identity_hold"] = True
+            self.hold_main_cleanup(str(e), state="needs-reconcile")
+            return
         if st is None and s.get("exit_status") is None:
             if s.pop("main_identity_hold", False):
                 s["state"] = s["entry_state"] = "running"
