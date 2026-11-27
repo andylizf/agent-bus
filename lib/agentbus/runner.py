@@ -11,7 +11,7 @@
               verify: slice gone or unpopulated, and no process of the slice on the entry's GPUs (nvidia-smi).
   fallback:   with no user manager, the client is the supervisor; no adoption and no hot update.
 """
-import fcntl, json, os, queue, secrets, signal, subprocess, sys, threading, time
+import errno, fcntl, json, os, queue, secrets, signal, stat, subprocess, sys, threading, time
 
 from . import bookings as bk
 from . import core
@@ -21,6 +21,8 @@ STATE_VERSION = int(os.environ.get("AGENT_BUS_TEST_STATE_VERSION") or 1)
 NONTERMINAL = ("starting", "running", "waiting-handoff", "stopping", "leader-exited", "needs-reconcile")
 EXIT_RELEASED = 75
 LEADER_EXIT_GRACE_S = 10
+MAIN_STATUS_FIELDS = ("LoadState", "ExecMainStatus", "ExecMainCode", "ExecMainExitTimestampMonotonic",
+                      "MainPID", "InvocationID", "ControlGroup")
 
 
 def _migrate_1(s):  # the test-only version 2 adds one field (design 8: migration from version 1 to a test version 2)
@@ -160,6 +162,24 @@ def sysctl(*args, timeout=20):
         return 255, "", repr(e)
 
 
+def stop_invocation(invocation):
+    bus = ["busctl", "--user", "--json=short", "--timeout=10s", "call", "org.freedesktop.systemd1"]
+    try:
+        raw = bytes.fromhex(invocation)
+        if len(raw) != 16 or not any(raw):
+            return False
+        ref = subprocess.run([*bus, "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
+                              "GetUnitByInvocationID", "ay", "16", *map(str, raw)], capture_output=True,
+                             text=True, timeout=12, check=True)
+        path, = json.loads(ref.stdout)["data"]
+        # systemd resolves this object by invocation again when it processes Stop.
+        subprocess.run([*bus, path, "org.freedesktop.systemd1.Unit", "Stop", "s", "ignore-dependencies"],
+                       capture_output=True, timeout=12, check=True)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+        return False
+    return True
+
+
 def unit_props(unit, *props):
     return unit_query(unit, *props)[1]
 
@@ -292,28 +312,50 @@ def cgroup_populated(fd):
     raise Refused("cannot read populated from the job cgroup's cgroup.events")
 
 
+def member_pids(group):
+    try:
+        procs = os.open("cgroup.procs", core.READ_FLAGS, dir_fd=group)
+        with os.fdopen(procs) as f:
+            return {int(p) for p in f.read().split()}
+    except FileNotFoundError:
+        return set()
+    except OSError as e:
+        if e.errno != errno.EOPNOTSUPP:
+            raise
+        # The threaded domain's cgroup.procs already lists this subtree's processes.
+        return set()
+
+
+def process_comm(pid):
+    with open(f"/proc/{pid}/comm", errors="replace") as f:
+        return f.read().removesuffix("\n")
+
+
 def signal_job_cgroup(fd, path, sig, log):
     own_group = core.proc_cgroup(os.getpid())
     if not own_group or in_tree(own_group, path):
         raise Refused("cannot verify that the supervisor is outside the job cgroup")
-    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+    if sig == signal.SIGTERM and (not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal")):
         raise Refused("pidfd is unavailable for job cgroup cleanup")
 
     def walk_error(err):
         if not isinstance(err, FileNotFoundError):
             raise err
 
-    identity = cgroup_identity(fd)
-    seen, failed = set(), []
-    with open(log, "a", buffering=1) as audit:
+    audit_fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK, 0o600)
+    with os.fdopen(audit_fd, "a", buffering=1) as audit:
+        if not stat.S_ISREG(os.fstat(audit.fileno()).st_mode):
+            raise Refused("the job log must be a regular file for cgroup cleanup")
+        seen, failed, snapshot = set(), [], []
         for _, _, _, group in os.fwalk(".", dir_fd=fd, onerror=walk_error):
-            try:
-                procs = os.open("cgroup.procs", core.READ_FLAGS, dir_fd=group)
-            except FileNotFoundError:
-                continue
-            with os.fdopen(procs) as f:
-                pids = {int(p) for p in f.read().split()}
-            for pid in sorted(pids - seen):
+            for pid in sorted(member_pids(group) - seen):
+                if sig == signal.SIGKILL:
+                    try:
+                        snapshot.append((pid, process_comm(pid)))
+                    except OSError:
+                        snapshot.append((pid, None))
+                    seen.add(pid)
+                    continue
                 try:
                     handle = os.pidfd_open(pid)
                 except ProcessLookupError:
@@ -322,17 +364,12 @@ def signal_job_cgroup(fd, path, sig, log):
                     failed.append(f"{pid}: {e.strerror}")
                     continue
                 try:
-                    with open(f"/proc/{pid}/comm", errors="replace") as f:
-                        comm = f.read().rstrip("\n")
-                    current = core.walk(CG_ROOT + path)
-                    try:
-                        if cgroup_identity(current) != identity:
-                            raise Refused("job cgroup changed during cleanup")
-                    finally:
-                        os.close(current)
-                    if not in_tree(core.proc_cgroup(pid) or "", path):
-                        continue
-                    signal.pidfd_send_signal(handle, sig)
+                    comm = process_comm(pid)
+                    # TERM can race a migration between this membership read and the signal.
+                    if pid in member_pids(group):
+                        signal.pidfd_send_signal(handle, sig)
+                        seen.add(pid)
+                        audit.write("leader-exit " + json.dumps(dict(pid=pid, comm=comm, signal=sig.name)) + "\n")
                 except (ProcessLookupError, FileNotFoundError):
                     continue
                 except OSError as e:
@@ -340,8 +377,16 @@ def signal_job_cgroup(fd, path, sig, log):
                     continue
                 finally:
                     os.close(handle)
-                seen.add(pid)
-                audit.write("leader-exit " + json.dumps(dict(pid=pid, comm=comm, signal=sig.name)) + "\n")
+        if sig == signal.SIGKILL:
+            kill_fd = os.open("cgroup.kill", os.O_WRONLY | os.O_NOFOLLOW, dir_fd=fd)
+            try:
+                os.write(kill_fd, b"1")
+            finally:
+                os.close(kill_fd)
+            audit.write("leader-exit " + json.dumps(dict(cgroup=path, signal=sig.name, source="cgroup.kill")) + "\n")
+            for pid, comm in snapshot:
+                audit.write("leader-exit " + json.dumps(dict(pid=pid, comm=comm, signal=sig.name,
+                                                            source="pre-kill snapshot")) + "\n")
     return ", ".join(failed[:8])
 
 
@@ -1174,7 +1219,7 @@ class Supervisor:
             for req in r.get("requesters_full", []):
                 self.reply(board, req, "yes", f"stopping, not yet free: {what}")
 
-    def finish(self, board, released, main_exit=None):
+    def finish(self, board, released, main_exit=False):
         """The run is free of its GPUs: state ended, entry archived, units cleaned up, the requesters told."""
         s = self.s
         if released:
@@ -1194,9 +1239,7 @@ class Supervisor:
         s["ended"] = now()
         close_admission(self.rid)
         self.archive_entry(board)
-        if main_exit:
-            self.retire_exited_units(*main_exit)
-        elif s["mode"] == "systemd":
+        if s["mode"] == "systemd" and not main_exit:
             sysctl("stop", s["units"]["main"])
             sysctl("reset-failed", s["units"]["main"])
             sysctl("stop", s["units"]["slice"])
@@ -1222,14 +1265,41 @@ class Supervisor:
             return 128 + st if code in (2, 3) else st
         return None
 
+    def read_main_pin(self, p):
+        s = self.s
+        name = "main-cgroup.json"
+        fd = core.walk(ctl_dir(self.rid))
+        try:
+            record = core.read_json(fd, name)
+            if not record and not s.get("main_pin_required"):
+                try:
+                    os.stat(name, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return None
+        finally:
+            os.close(fd)
+        pin = record[0] if record else None
+        if (not isinstance(pin, dict) or not all(isinstance(pin.get(k), str) and pin[k]
+                                                for k in ("run", "path", "boot", "invocation"))
+                or not pin["path"].startswith("/")
+                or not isinstance(pin.get("identity"), list) or len(pin["identity"]) != 2
+                or not all(type(x) is int for x in pin["identity"])):
+            raise Refused("the job cgroup launch identity is missing or unreadable")
+        if pin["run"] != s["run"] or (p.get("LoadState") != "not-found" and p.get("InvocationID") != pin["invocation"]):
+            raise Refused("the job unit's invocation no longer matches this run")
+        return pin
+
+    def main_cgroup_path(self, pin):
+        units = self.s["units"]
+        if pin:
+            return pin["path"]
+        if units.get("cgroup_path"):
+            return os.path.join(units["cgroup_path"], units["main"])
+        return None
+
     def clean_main_cgroup(self, p, pin):
         s = self.s
-        units = s["units"]
-        if pin and not (pin["run"] == s["run"] and
-                        (p.get("LoadState") == "not-found" or p.get("InvocationID") == pin["invocation"])):
-            raise Refused("the job unit's invocation no longer matches this run")
-        path = pin["path"] if pin else (
-            os.path.join(units["cgroup_path"], units["main"]) if units.get("cgroup_path") else None)
+        path = self.main_cgroup_path(pin)
         if not path or p.get("ControlGroup") not in ("", None, path):
             raise Refused("the job unit's cgroup path is unknown or changed")
         term_at = s.get("main_term_at")
@@ -1249,6 +1319,8 @@ class Supervisor:
                 raise Refused("job cgroup is populated and has no launch identity (run started by an older build)")
             if p.get("InvocationID") != pin["invocation"]:
                 raise Refused("job cgroup is populated but its unit invocation cannot be verified")
+            self.track_escaped()
+            self.save()       # adoption must keep the escapes even after their in-slice parents die
             sig = signal.SIGTERM if term_at is None else signal.SIGKILL
             failed = signal_job_cgroup(fd, path, sig, s["log"])
             detail = f"; signal errors: {failed}" if failed else ""
@@ -1261,35 +1333,51 @@ class Supervisor:
 
     def retire_exited_units(self, p, pin):
         units = self.s["units"]
-        if pin and p.get("InvocationID") == pin["invocation"]:
-            ok, current = unit_query(units["main"], "InvocationID", "MainPID", "ExecMainExitTimestampMonotonic",
-                                     "ExecMainCode", "ExecMainStatus")
-            if (ok and current.get("InvocationID") == pin["invocation"] and current.get("MainPID") == "0" and
-                    self.main_status(current) is not None and
-                    slice_state(units["cgroup_path"]) in ("empty", "gone")):
-                sysctl("stop", units["main"])
-                sysctl("reset-failed", units["main"])
-                if slice_state(units["cgroup_path"]) in ("empty", "gone"):
-                    sysctl("stop", units["slice"])
+        path = self.main_cgroup_path(pin)
+        if any(slice_state(cg) not in ("empty", "gone") for cg in (path, units["cgroup_path"])):
+            return "the job cgroup or slice is no longer empty"
+        slice_ok, slice_props = unit_query(units["slice"], "ControlGroup", "InvocationID")
+        ok, current = unit_query(units["main"], *MAIN_STATUS_FIELDS)
+        if not ok:
+            return "systemd did not answer during job unit reclamation"
+        if current.get("LoadState") != "not-found":
+            invocation = p.get("InvocationID")
+            if (not invocation or current.get("InvocationID") != invocation or self.main_status(current) is None
+                    or current.get("ControlGroup") not in ("", None, path)):
+                raise Refused("the job unit's invocation changed during reclamation")
+            if not stop_invocation(invocation):
+                return "systemd did not stop the exited job invocation"
+        if (slice_ok and slice_props.get("InvocationID") and slice_props.get("ControlGroup") == units["cgroup_path"]
+                and slice_state(units["cgroup_path"]) in ("empty", "gone")):
+            stop_invocation(slice_props["InvocationID"])
+        return None
 
     def leader_exit_step(self, board):
         s = self.s
         systemd = s["mode"] == "systemd"
         p = {}
+        pin = None
         if systemd:
-            ok, p = unit_query(s["units"]["main"], "LoadState", "ExecMainStatus", "ExecMainCode",
-                               "ExecMainExitTimestampMonotonic", "MainPID", "InvocationID", "ControlGroup")
+            ok, p = unit_query(s["units"]["main"], *MAIN_STATUS_FIELDS)
             if not ok:
-                if s.get("main_exit_seen"):
+                if s.get("main_exit_seen") and not s.get("main_identity_hold"):
                     self.hold_main_cleanup("systemd did not answer about the job's unit")
+                return
+            try:
+                pin = self.read_main_pin(p)
+            except (OSError, Refused) as e:
+                s["main_identity_hold"] = True
+                self.hold_main_cleanup(str(e), state="needs-reconcile")
                 return
         st = self.main_status(p)
         if st is None and s.get("exit_status") is None:
+            if s.pop("main_identity_hold", False):
+                s["state"] = s["entry_state"] = "running"
+                s.pop("leader_remains", None)
             return
-        pin = core.read_private(os.path.join(ctl_dir(self.rid), "main-cgroup.json")) if systemd else None
+        s.pop("main_identity_hold", None)
         saved_status = s.get("exit_status")
-        if saved_status is None and st is not None and st >= 0 and (
-                not pin or p.get("InvocationID") == pin["invocation"]):
+        if saved_status is None and st is not None and st >= 0:
             s["exit_status"] = st
         if not s.get("main_exit_seen") or s.get("exit_status") != saved_status:
             s["main_exit_seen"] = True
@@ -1305,8 +1393,18 @@ class Supervisor:
                 return
         ok, remains = (False, [f"exec {e} outstanding" for e in out]) if out else self.verify()
         if ok:
+            if systemd:
+                try:
+                    waiting = self.retire_exited_units(p, pin)
+                except Refused as e:
+                    s["main_identity_hold"] = True
+                    self.hold_main_cleanup(str(e), state="needs-reconcile")
+                    return
+                if waiting:
+                    self.hold_main_cleanup(waiting)
+                    return
             s["end_reason"] = f"exited rc={s.get('exit_status')}"
-            self.finish(board, released=False, main_exit=(p, pin) if systemd else None)
+            self.finish(board, released=False, main_exit=systemd)
             return
         if s["state"] == "running":
             s["state"] = s["entry_state"] = "leader-exited"
@@ -1315,14 +1413,14 @@ class Supervisor:
             self.mark_reconcile(board)
         s["leader_remains"] = remains
 
-    def hold_main_cleanup(self, waiting):
+    def hold_main_cleanup(self, waiting, state="stopping"):
         s = self.s
-        s["state"] = s["entry_state"] = "stopping"
+        s["state"] = s["entry_state"] = state
         s["held_gpus"] = list(s["gpus"])
         s["gpus_released"] = []
         s.pop("gpus_released_checked", None)
         if s.get("leader_remains") != [waiting]:
-            notice(self.rid, s, self.hooks, "stopping", remains=[waiting])
+            notice(self.rid, s, self.hooks, state, remains=[waiting], gpus_held=s["held_gpus"])
         s["leader_remains"] = [waiting]
 
     def start_main(self):
@@ -1455,7 +1553,7 @@ class Supervisor:
                     s["pending_verification"] = "systemd did not answer about the job's unit"
             # requests and bookings (board records): only with the board's identity intact
             if with_board and s["state"] in ("running", "leader-exited", "waiting-handoff", "stopping", "needs-reconcile") \
-                    and not s.get("release"):
+                    and not s.get("release") and not s.get("main_identity_hold"):
                 for m in msgs:
                     if m["kind"] != "request" or m["request_id"] in s["requests"]:
                         continue
@@ -1681,6 +1779,9 @@ LEADER_SIGNALS = ["SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT",
 
 
 def start_main_unit(rid, s):
+    if not s.get("main_pin_required"):
+        s["main_pin_required"] = True
+        core.write_private(state_path(rid), s)
     u = s["units"]
     props = ["-p", "Type=exec", "-p", "RemainAfterExit=yes", "-p", f"WorkingDirectory={s['cwd']}",
              "-p", f"StandardOutput=append:{s['log']}", "-p", f"StandardError=append:{s['log']}",

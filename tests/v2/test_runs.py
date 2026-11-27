@@ -117,7 +117,8 @@ class Runs(BusTest):
         pid = int(pidf.read_text())
         with open(d["log"]) as f:
             records = [json.loads(line.partition(" ")[2]) for line in f if line.startswith("leader-exit ")]
-        self.assertEqual([x["signal"] for x in records if x["pid"] == pid], ["SIGTERM", "SIGKILL"])
+        self.assertEqual([x["signal"] for x in records if x.get("pid") == pid], ["SIGTERM", "SIGKILL"])
+        self.assertTrue(any(x.get("source") == "cgroup.kill" for x in records))
 
     def test_ray_like_daemon_is_in_slice_and_stopped(self):
         pidf = self.tmp / "daemon.pid"
