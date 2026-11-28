@@ -2090,10 +2090,15 @@ def launch_run(a, launch):
         if os.fstat(fd).st_uid != core.UID:
             raise Refused(f"the inbox for {rid} changed during launch")
         os.fchmod(fd, board.inbox_mode)
-        s["state"] = "starting"
         with admit_lock(rid):
-            core.write_private(state_path(rid), s)
-            admit_write(rid, dict(run=gen, admission="handoff" if handoff else "open", inflight=[]))
+            ledger = dict(run=gen, admission="handoff" if handoff else "open", inflight=[])
+            admit_write(rid, ledger)
+            s["state"] = "starting"
+            try:
+                core.write_private(state_path(rid), s)  # only this commit makes the run adoptable
+            except OSError:
+                admit_write(rid, dict(ledger, admission="closed"))
+                raise
     finally:
         board.close()
     print(f"bus: {prot_text}", file=sys.stderr)

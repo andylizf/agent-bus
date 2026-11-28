@@ -128,6 +128,40 @@ class Gate(unittest.TestCase):
                 self.wait_for(lambda: self.healthy(client, self.old, after_ns), "move-capable supervisor on source")
                 self.assertEqual(self.identity(client), client["original_job"])
 
+    def check_ledger_failure(self, client):
+        t = core.now()
+        booking = json.loads(self.command(client["bus"], "book", "--gpus", "0", "--from", t - 1, "--to", t + 300,
+                                          "--objection", "1s", "--json", env=client["env"]))
+        self.wait_for(lambda: core.now() >= booking["objection_close"], "retry booking standing")
+        executions = self.workspace / "retry-executions"
+        command = f"echo started >> {shlex.quote(str(executions))}"
+        argv = ["run", "--gpus", "0", "--scheduled", booking["id"], "--exclusive", "--detach", "--slug", "ledger",
+                "--", command]
+        with patch.dict(os.environ, client["env"], clear=True):
+            args = cli.parser().parse_args(argv)
+            with patch.object(runner, "admit_write", side_effect=OSError("fixture ledger write failed")):
+                with self.assertRaisesRegex(OSError, "fixture ledger write failed"):
+                    runner.cmd_run(args)
+            failed, = [r for r in runner.cmd_runs() if r["booking"] == booking["id"]]
+            self.assertEqual(failed["state"], "preparing")
+            self.assertTrue(runner.launch_units_absent(failed["id"]))
+        self.assertEqual(json.loads(self.command(client["bus"], "adopt", "--all", env=client["env"])), [])
+        self.assertFalse(executions.exists())
+        retry = dict(client, info=json.loads(self.command(client["bus"], *argv, env=client["env"])))
+        self.clients.append(retry)
+        self.wait_for(lambda: self.state(retry).get("state") == "ended", "retried exclusive run ending")
+        self.assertEqual(executions.read_text().splitlines(), ["started"])
+        self.assertEqual(json.loads(self.command(client["bus"], "adopt", "--all", env=client["env"])), [])
+        with patch.dict(os.environ, client["env"], clear=True):
+            ctime = (self.old / "inbox" / failed["id"]).stat().st_ctime
+            gc = cli.parser().parse_args(["gc", "--mine", "--json"])
+            with patch.object(core, "now", return_value=int(ctime) + move.ABANDONED_INBOX_S + 2), \
+                    patch.object(cli, "out") as out:
+                cli.cmd_gc(gc)
+            self.assertEqual(out.call_args.args[0]["archived"], [failed["id"]])
+        self.command(client["bus"], "unbook", booking["id"], env=client["env"])
+        report("ledger write failure left no adoptable run; the exclusive retry executed its command once")
+
     def clean(self):
         for client in self.clients:
             client["done"].touch()
@@ -185,6 +219,7 @@ class Gate(unittest.TestCase):
         report(f"move refused live run {early['info']['id']} after its confirmed supervisor upgrade")
         early["done"].touch()
         self.wait_for(lambda: self.state(early).get("state") == "ended", "fixture run ending naturally")
+        self.check_ledger_failure(early)
 
         t = core.now()
         booked = json.loads(self.command(early["bus"], "book", "--gpus", "0", "--from", t + 3600, "--to", t + 7200,

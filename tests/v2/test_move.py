@@ -232,6 +232,26 @@ class BoardMove(BusTest):
             spawn.assert_not_called()
         self.cutover()
 
+    def test_ledger_failure_leaves_exclusive_launch_unadoptable(self):
+        t = core.now()
+        with core.Board.from_conf() as board, patch.object(time, "time", return_value=t - 10):
+            booking = bookings.publish_booking(board, [0], t - 1, t + 300, objection_s=1)["id"]
+        args = cli.parser().parse_args(["run", "--gpus", "0", "--scheduled", booking, "--exclusive", "--detach", "true"])
+        with patch.object(runner, "user_manager_ok", return_value=True), \
+                patch.object(runner, "systemd_run", return_value=(0, "")) as systemd:
+            with patch.object(runner, "admit_write", side_effect=OSError("fixture ledger write failed")):
+                with self.assertRaisesRegex(OSError, "fixture ledger write failed"):
+                    runner.cmd_run(args)
+            failed, = runner.cmd_runs()
+            self.assertEqual(failed["state"], "preparing")
+            self.assertEqual(runner.cmd_adopt_all(), [])
+            systemd.assert_not_called()
+            self.assertEqual(runner.cmd_run(args), 0)
+            systemd.assert_called_once()
+        retried, = [r for r in runner.cmd_runs() if r["id"] != failed["id"]]
+        self.assertEqual(retried["state"], "starting")
+        self.assertEqual(runner.admit_read(retried["id"])["admission"], "handoff")
+
     def test_end_record_from_a_hyphenated_name_prefix_cannot_clear_another_users_inbox(self):
         other = core.USER + "-lab"
         rid = f"{other}-20261128-000000-run"
