@@ -884,14 +884,12 @@ class Supervisor:
     def write_entry(self, board):
         fd = board.wdir("agents")
         data = core.dumps(self.entry()).decode()
-        pin = board.pin_fields()
-        if data != self.s.get("_entry_written") or pin != self.s.get("_entry_board"):
+        if data != self.s.get("_entry_written"):
             cur = core.read_json(fd, f"{self.rid}.json")
             if cur and cur[0].get("run") != self.s["run"]:
                 raise Refused(f"the board holds {self.rid} for another generation ({cur[0].get('run')}); not overwritten")
             core.replace(fd, f"{self.rid}.json", data.encode())
             self.s["_entry_written"] = data
-            self.s["_entry_board"] = pin
             self.s["entry_on_board"] = True
 
     def publish_entry(self, board):
@@ -905,11 +903,6 @@ class Supervisor:
         supervisor killed between writing its first entry and saving its state leaves that flag unset."""
         if not board.ok:
             return
-        if any(e["id"] == self.rid and e["run"] == self.s["run"] for e in board.origin.get("runs", [])):
-            try:
-                move.record_end(board, self.entry())
-            except (OSError, Refused) as e:
-                self.s["archive_error"] = str(e)
         afd, gfd = board.dir("agents"), board.dir("archive")
         try:
             st = os.stat(f"{self.rid}.json", dir_fd=afd, follow_symlinks=False)
@@ -1545,13 +1538,17 @@ class Supervisor:
         s = self.s
         t0 = time.monotonic()
         t = now()
+        board = None
         try:
-            board = core.Board.from_pin(dict(s["board"], host=s["host"]))
+            pin = s["board"]
+            board = core.Board(pin["path"], (pin["inode"], pin["fsid"])).lease()
+            board.recheck()
         except (OSError, Refused) as e:
+            if board is not None:
+                board.close()
             board = None
             err = str(e)
         with_board = board is not None and board.ok and not board.pending
-        moved = with_board and board.path != s["board"]["path"]
         entry_board = board if with_board else _NoBoard()
         if not with_board:
             if not s.get("identity_alarm"):
@@ -1569,13 +1566,6 @@ class Supervisor:
                 s["last_pass"] = t
                 self.save_completed_pass()
                 return
-            if moved:
-                try:
-                    if board.repin_conf(s["board"]):
-                        s["board"] = board.pin_fields()
-                        self.save()
-                except OSError as e:
-                    s["board_error"] = str(e)
             if s["mode"] == "systemd" and s["state"] in ("running", "leader-exited", "stopping", "needs-reconcile") \
                     and not s["units"].get("cgroup_path"):
                 s["units"]["cgroup_path"] = recover_cgroup(s["units"]["slice"])
@@ -1866,9 +1856,6 @@ def handoff_waits(board, entries, s):
         if e["id"] != s["id"] and set(e["gpus"]) & set(s["gpus"]):
             occ = "" if e.get("occupancy") == "live" else ", occupancy unknown"
             waits.append(f"entry {e['id']} ({e['user']}, {e['state']}{occ})")
-    for e in move.legacy_runs(board, entries):
-        if e["id"] != s["id"] and set(e["gpus"]) & set(s["gpus"]):
-            waits.append(f"old entry {e['id']} ({e['user']}, occupancy unknown after the board move)")
     ok, idx, apps, _ = nvidia_view()
     if not ok:
         waits.append("nvidia-smi failed")
@@ -1948,8 +1935,6 @@ def classify(board, rows, gpus, scheduled, t):
         if t >= b["end"]:
             raise Refused(f"{scheduled} ended at {time.strftime('%m-%d %H:%M', time.localtime(b['end']))}")
     other = bk.standing_active_on(rows, gpus, t, exclude=scheduled)
-    other.extend(b for b in move.unreplayed_standing(board, t)
-                 if b["id"] != scheduled and set(b["gpus"]) & set(gpus))
     if other:
         o = other[0]
         raise Refused(f"GPUs {core.gpu_text(sorted(set(o['gpus']) & set(gpus)))} are inside {o['user']}'s standing "
@@ -2053,10 +2038,6 @@ def launch_run(a, launch):
         if os.path.exists(log) is False:
             open(log, "a").close()
             os.chmod(log, 0o600)
-        # Finish can run as soon as this lease is released, before either systemd unit exists.
-        reservation = Supervisor(rid)
-        reservation.s = s
-        core.publish(board.wdir("agents"), f"{rid}.json", core.dumps(reservation.entry()))
     finally:
         board.close()
     print(f"bus: {prot_text}", file=sys.stderr)

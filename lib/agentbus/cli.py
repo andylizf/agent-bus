@@ -1,5 +1,6 @@
 """`bus`: the agent-bus v2 command line. `bus <command> -h` for each command's options."""
 import argparse, hashlib, json, os, pwd, secrets, shlex, shutil, subprocess, sys, time
+from contextlib import contextmanager
 
 from . import bookings as bk
 from . import auto_upgrade, core, move, runner
@@ -23,14 +24,16 @@ def when(t):
     return time.strftime("%a %m-%d %H:%M", time.localtime(t)) if isinstance(t, (int, float)) else "-"
 
 
+@contextmanager
 def board(*, write=False):
-    b = core.Board.from_conf()
-    if b.pending:
-        b.close()
-        raise Refused(f"{b.path} is a prepared destination; the source is still active")
-    if write:
-        move.announce(b, runner.build_version())
-    return b
+    with core.Board.from_conf() as b:
+        if b.pending:
+            raise Refused(f"{b.path}: board move is still in progress")
+        try:
+            yield b
+        finally:
+            if write:
+                move.announce(b, runner.build_version())
 
 
 # ------------------------------------------------------------------------------------------------ reading
@@ -47,10 +50,9 @@ def view(b, days=2, all_bookings=False):
 def cmd_ls(a):
     with board() as b:
         t, entries, rows = view(b, 1)
-        old_runs, old_bookings = move.leftovers(b) if b.origin else ([], [])
         if a.json:
             return out(dict(board=dict(path=b.path, identity="ok" if b.ok else "changed"), now=t, entries=entries,
-                            bookings=rows, warnings=b.warnings, old_runs=old_runs, old_bookings=old_bookings))
+                            bookings=rows, warnings=b.warnings))
         if not b.ok:
             print(f"board identity changed at {b.path}: shown as read; nothing will act on it")
         for e in entries:
@@ -59,10 +61,6 @@ def cmd_ls(a):
                   f"until {when(e['until'])}  {e['kind']}  {e.get('note', '')}{occ}")
         if not entries:
             print("no runs on the board")
-        for e in old_runs:
-            print(f"old run {e['id']} ({e['user']}): occupancy unknown, holds GPUs {core.gpu_text(e['gpus'])}")
-        for b in old_bookings:
-            print(f"old booking {b['id']}: awaiting replay by {', '.join(b['awaiting'])}")
         for r in rows:
             print(f"  booking {r['id']}  {r['user']}  gpus {core.gpu_text(r['gpus'])}  {when(r['start'])} - "
                   f"{when(r['end'])}  {r['state']}{'  ' + r['why'] if r.get('why') else ''}")
@@ -287,7 +285,7 @@ def cmd_gc(a):
                                        note="no supervisor holds it: `bus adopt --all` (systemd mode) or stop its "
                                             "processes by hand (fallback mode)"))
     res["unknown"] = []
-    with board() as b:
+    with board(write=True) as b:
         if b.ok:
             for e in b.entries():
                 if e["user"] != core.USER:
@@ -310,8 +308,6 @@ def cmd_gc(a):
                         continue
                     afd, gfd = b.dir("agents"), b.dir("archive")
                     try:
-                        if any(old["id"] == e["id"] and old["run"] == e["run"] for old in b.origin.get("runs", [])):
-                            move.record_end(b, e)
                         os.rename(f"{e['id']}.json", f"{e['id']}-{now()}.json", src_dir_fd=afd, dst_dir_fd=gfd)
                         res["archived"].append(e["id"])
                         hb = b.dir("agents", ".heartbeat")
@@ -563,7 +559,25 @@ def cmd_install(a):
 
 
 def cmd_move_board(a):
-    move.command(a.action, a.old, a.new, a.wait)
+    move.command(a.old, a.new)
+
+
+def cmd_adopt(a):
+    result = runner.cmd_adopt_all()
+    # The same private lock covers run admission, including its reserved state and board inbox.
+    try:
+        lock = auto_upgrade.lock()
+        if lock.acquire():
+            try:
+                if runner.build_root() == runner.build_root(core.BIN()) and move.confirmed():
+                    idle = all(r["state"] == "ended" or r["host"] != core.HOST for r in runner.cmd_runs())
+                    with core.Board.from_conf() as b:
+                        move.announce(b, runner.build_version(), idle=idle)
+            finally:
+                lock.release()
+    except (OSError, Refused):
+        pass
+    out(result)
 
 
 # ------------------------------------------------------------------------------------------------ parser
@@ -621,7 +635,7 @@ def parser():
     s = p("supervise", lambda a: runner.Supervisor(a.id, adopt=a.adopt).run(), "the per-run supervisor (internal)")
     s.add_argument("id")
     s.add_argument("--adopt", action="store_true")
-    s = p("adopt", lambda a: out(runner.cmd_adopt_all()), "start a supervisor for every unsupervised run here")
+    s = p("adopt", cmd_adopt, "start a supervisor for every unsupervised run here")
     s.add_argument("--all", action="store_true", required=True)
     s = p("_exec-guard", lambda a: runner.exec_guard(a.id, a.eid, a.run, a.argv))
     s.add_argument("id")
@@ -704,11 +718,9 @@ def parser():
     s.add_argument("--board", required=True)
     s.add_argument("--board-owner")
     s.add_argument("--print-host", action="store_true")
-    s = p("move-board", cmd_move_board, "stage or finish a board move with automatic replay")
-    s.add_argument("action", choices=("stage", "finish"))
+    s = p("move-board", cmd_move_board, "archive an empty board and create its replacement")
     s.add_argument("old")
     s.add_argument("new")
-    s.add_argument("--wait", type=float, default=10, help="seconds to observe replay after switching (0–30)")
     s = p("page", None, "serve the read-only board page")
     s.add_argument("--port", type=int, default=8300)
     s.add_argument("--host", default="127.0.0.1")

@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 sys.path.insert(0, str(ROOT / "tools"))
 
-from agentbus import auto_upgrade, cli, core, move, runner
+from agentbus import auto_upgrade, bookings, cli, core, move, runner, setup
 from auto_upgrade_gate import healthy_supervisor_pid
 
 
@@ -45,8 +45,8 @@ class Gate(unittest.TestCase):
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result.stderr if expected else result.stdout
 
-    def wait_for(self, test, what):
-        deadline = time.monotonic() + 20
+    def wait_for(self, test, what, timeout=20):
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             value = test()
             if value:
@@ -85,7 +85,7 @@ class Gate(unittest.TestCase):
         except FileNotFoundError:
             return None
 
-    def start(self, name):
+    def install(self, name):
         home = self.workspace / name
         home.mkdir()
         env = dict(self.env, AGENT_BUS_CONFIG=str(home / "config"), AGENT_BUS_STATE=str(home / "state"),
@@ -98,16 +98,18 @@ class Gate(unittest.TestCase):
         client["bus"] = Path(json.loads(install)["bin"])
         client["build"] = str(client["bus"].resolve().parents[1])
         client["label"] = runner.build_version(client["build"])
-        done = shlex.quote(str(client["done"]))
-        command = f"while [ ! -e {done} ] && [ \"$SECONDS\" -lt 120 ]; do sleep 0.2; done"
-        client["info"] = json.loads(self.command(client["bus"], "run", "--gpus", "0", "--slug", name,
-                                                  "--detach", "--", command, env=env))
-        self.assertEqual(client["info"]["mode"], "systemd")
-        client["original_job"] = self.identity(client)
-        self.wait_for(lambda: self.healthy(client, self.old), f"{name} supervisor on source")
         return client
 
-    def upgrade(self, client, board):
+    def start(self, client):
+        done = shlex.quote(str(client["done"]))
+        command = f"while [ ! -e {done} ] && [ \"$SECONDS\" -lt 120 ]; do sleep 0.2; done"
+        client["info"] = json.loads(self.command(client["bus"], "run", "--gpus", "0", "--slug", "fixture",
+                                                  "--detach", "--", command, env=client["env"]))
+        self.assertEqual(client["info"]["mode"], "systemd")
+        client["original_job"] = self.identity(client)
+        self.wait_for(lambda: self.healthy(client, self.old), "fixture supervisor on source")
+
+    def upgrade(self, client):
         with patch.dict(os.environ, client["env"], clear=True):
             candidate = cli.copy_build(str(ROOT))
             label = "v9999.0.1"
@@ -122,9 +124,9 @@ class Gate(unittest.TestCase):
             self.assertEqual(rc, 0, result)
             self.assertEqual(result, f"upgraded {client['label']} to {label}")
             client.update(build=candidate, label=label, upgraded=True)
-            pid = self.wait_for(lambda: self.healthy(client, board, after_ns), f"upgraded supervisor on {board}")
-            self.assertEqual(self.identity(client), client["original_job"])
-            return pid
+            if "info" in client:
+                self.wait_for(lambda: self.healthy(client, self.old, after_ns), "move-capable supervisor on source")
+                self.assertEqual(self.identity(client), client["original_job"])
 
     def clean(self):
         for client in self.clients:
@@ -160,38 +162,52 @@ class Gate(unittest.TestCase):
         self.env.update(AGENT_BUS_NVIDIA_SMI=str(fake), AGENT_BUS_TEST_GPUS=str(gpus), AGENT_BUS_PASS_S="0.5",
                         AGENT_BUS_CONFIG=str(self.workspace / "operator-config"),
                         AGENT_BUS_STATE=str(self.workspace / "operator-state"))
-        from agentbus import setup
-        for board in (self.old, self.new):
-            setup.setup_board(str(board), host=core.HOST, gpus=1, blocks=3)
-            with (board / "config").open("a") as f:
-                f.write("min_objection_s=1\n")
-        with core.Board(str(self.old)) as old, core.Board(str(self.new)) as new:
+        setup.setup_board(str(self.old), host=core.HOST, gpus=1, blocks=3)
+        with (self.old / "config").open("a") as f:
+            f.write("min_objection_s=1\nbudget_gpu_h=1\n")
+        with core.Board(str(self.old)) as old:
             self.archive = Path(move.retired(old.pin_fields()))
-            report(f"start: {core.HOST}, source fsid {old.fsid}, destination fsid {new.fsid}, previous {self.args.previous}")
+            report(f"start: {core.HOST}, source fsid {old.fsid}, target filesystem {os.statvfs(self.workspace).f_fsid}, "
+                   f"previous {self.args.previous}")
         self.addCleanup(self.clean)
-        early = self.start("early")
-        late = self.start("late")
-        self.upgrade(early, self.old)
-        refusal = self.command(ROOT / "bin" / "bus", "move-board", "stage", self.old, self.new,
-                               env=self.env, expected=1)
-        self.assertIn("runs without a move-capable build", refusal)
-        self.assertIn(late["info"]["id"], refusal)
-        report("stage refused while one real supervisor was still on the pre-move build")
-        self.upgrade(late, self.old)
-        self.command(ROOT / "bin" / "bus", "move-board", "stage", self.old, self.new, env=self.env)
+        early = self.install("early")
+        late = self.install("late")
+        self.start(early)
+        self.upgrade(early)
+        refused = lambda: self.command(ROOT / "bin" / "bus", "move-board", self.old, self.new, env=self.env, expected=1)
+        refusal = refused()
+        self.assertIn("runs (including unknown occupancy)", refusal)
+        self.assertIn(early["info"]["id"], refusal)
+        self.assertFalse(self.new.exists())
+        report(f"move refused live run {early['info']['id']} after its confirmed supervisor upgrade")
+        early["done"].touch()
+        self.wait_for(lambda: self.state(early).get("state") == "ended", "fixture run ending naturally")
+
         t = core.now()
-        booked = json.loads(self.command(late["bus"], "book", "--gpus", "0", "--from", t + 3600, "--to", t + 7200,
-                                          "--objection", "3s", "--json", env=late["env"]))
-        refusal = self.command(ROOT / "bin" / "bus", "move-board", "finish", self.old, self.new, "--wait", 0,
-                               env=self.env, expected=1)
-        self.assertIn("open objection windows", refusal)
-        report("finish refused a booking opened after stage")
+        booked = json.loads(self.command(early["bus"], "book", "--gpus", "0", "--from", t + 3600, "--to", t + 7200,
+                                         "--objection", "3s", "--json", env=early["env"]))
+        self.assertIn("open objection windows", refused())
         self.wait_for(lambda: core.now() >= booked["objection_close"], "objection window closing")
+        self.assertIn("pending or standing bookings", refused())
+        self.assertFalse(self.new.exists())
+        report(f"move refused open objection window and standing booking {booked['id']}")
+        self.command(early["bus"], "unbook", booked["id"], env=early["env"])
+        objection_s = 1
+        with patch.dict(os.environ, early["env"], clear=True), core.Board.from_conf() as old:
+            with patch.object(time, "time", return_value=t - 86400):
+                historical = bookings.publish_booking(old, [0], t - 7200, t - 3600, objection_s=objection_s)
+            move.announce(old, early["label"])
+            receipt = old.receipts()[historical["slot"]]
+        orphan = self.old / "inbox" / core.new_id("orphan")
+        orphan.mkdir()
+        self.assertIn("unaccounted run inboxes", refused())
+        self.command(early["bus"], "adopt", "--all", env=early["env"])
+        ready_at = receipt["_ctime"] + bookings.SEEN_GAP_S + objection_s + 1
+        self.wait_for(lambda: core.now() >= ready_at, "all readers' historical objection windows closing", timeout=40)
         afd = core.walk(str(self.old / "arrivals"))
-        mailbox = core.walk(str(self.old / "inbox" / late["info"]["id"]))
+        mailbox = core.walk(str(self.old / "inbox" / early["info"]["id"]))
         try:
-            report(self.command(ROOT / "bin" / "bus", "move-board", "finish", self.old, self.new, "--wait", 0,
-                                env=self.env).strip())
+            report(self.command(ROOT / "bin" / "bus", "move-board", self.old, self.new, env=self.env).strip())
             with self.assertRaises(PermissionError):
                 core.publish(afd, "test-arrival.json", b"{}")
             with self.assertRaises(PermissionError):
@@ -199,17 +215,27 @@ class Gate(unittest.TestCase):
         finally:
             os.close(afd)
             os.close(mailbox)
-        early_pid = self.wait_for(lambda: self.healthy(early, self.new), "early supervisor re-pinning")
-        late_pid = self.wait_for(lambda: self.healthy(late, self.new), "late supervisor re-pinning")
-        self.assertEqual(self.identity(early), early["original_job"])
-        self.assertEqual(self.identity(late), late["original_job"])
-        report(f"cutover: early main PID {early['original_job'][0]}, supervisor {early_pid}; "
-               f"late main PID {late['original_job'][0]}, supervisor {late_pid}")
-        cal = json.loads(self.command(late["bus"], "cal", "--json", env=late["env"]))
-        replayed = next(b for b in cal["bookings"] if b["id"] == booked["id"])
-        self.assertEqual((replayed["slot"], replayed["revision"]), (booked["slot"], booked["revision"]))
-        self.assertEqual(replayed["objection_close"], booked["objection_close"])
-        report(f"replay: build {late['label']}, original receipt {replayed['slot']} and objection close preserved")
+        self.command(late["bus"], "ls", "--json", env=late["env"], expected=1)
+        conf = Path(late["env"]["AGENT_BUS_CONFIG"], "board.conf")
+        self.assertEqual(core.load_conf(str(conf))["path"], str(self.old))
+        self.upgrade(late)
+        for client in (early, late):
+            result = json.loads(self.command(client["bus"], "ls", "--json", env=client["env"]))
+            self.assertEqual(result["board"], dict(path=str(self.new), identity="ok"))
+            self.assertEqual((result["entries"], result["bookings"]), ([], []))
+            pin = core.load_conf(str(Path(client["env"]["AGENT_BUS_CONFIG"], "board.conf")))
+            self.assertEqual(pin["inode"], str(self.new.stat().st_ino))
+            self.assertEqual(pin["fsid"], str(os.statvfs(self.new).f_fsid))
+        self.assertEqual(list((self.new / "inbox").iterdir()), [])
+        self.assertTrue((self.archive / "inbox" / orphan.name).is_dir())
+        self.assertTrue((self.archive / "bookings" / (historical["id"] + ".json")).exists())
+        with core.Board(str(self.new)) as new:
+            self.assertEqual(new.receipts(), {})
+        refusal = self.command(late["bus"], "book", "--gpus", "0", "--from", t + 3600, "--to", t + 7200,
+                               "--objection", "1s", env=late["env"], expected=1)
+        self.assertIn("over your budget", refusal)
+        report("both confirmed clients re-pinned on their next CLI call; the legacy client stayed pinned until upgrade")
+        report("history stayed on GPFS; XFS started empty and enforced the prior GPU-hour budget")
 
 
 def main():

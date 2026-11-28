@@ -510,10 +510,6 @@ def owned_id(v, user):
     return isinstance(v, str) and STAMP_ID.fullmatch(v) is not None and v.startswith(user + "-") and len(v) > len(user) + 1
 
 
-def move_mail_prefix(box):
-    return "mail-" + hashlib.sha256(box.encode()).hexdigest()[:32] + "-"
-
-
 def note_ok(v, n=NOTE_MAX):
     return isinstance(v, str) and len(v) <= n and not any(ord(c) < 32 or ord(c) == 127 for c in v)
 
@@ -667,7 +663,6 @@ class Board:
         self.pending = read_file(self.fd, MOVE_PENDING, 4096) is not None
         row = read_json(self.fd, MOVE_ORIGIN, MOVE_LIMIT)
         self.origin = row[0] if row and row[1].st_uid == self.creator and not row[1].st_mode & 0o022 else {}
-        self.receipt_floor = self.origin.get("floor", 0)
 
     def lease(self, *, exclusive=False):
         """Keep a board transaction on one side of a cutover, even when it holds child descriptors."""
@@ -745,11 +740,11 @@ class Board:
         if not self.ok:
             raise Refused(f"board identity changed at {self.path}: nothing is written there")
         if self.pending:
-            raise Refused(f"{self.path} is a prepared destination; the source is still active")
+            raise Refused(f"{self.path}: board move is still in progress")
 
     # --- readers
 
-    def records(self, sub_dir, check, owner_field="user", stem_field="id", prefix=""):
+    def records(self, sub_dir, check, owner_field="user", stem_field="id"):
         """Valid records of one directory: right shape, file owner equal to its user field, stem equal to its id."""
         fd = self.dir(*sub_dir.split("/"))
         if fd is None:
@@ -760,7 +755,7 @@ class Board:
             return []
         out = []
         for name in names:
-            if not name.startswith(prefix) or not name.endswith(".json"):
+            if not name.endswith(".json"):
                 continue
             r = read_json(fd, name)
             if r is None:
@@ -772,7 +767,7 @@ class Board:
                 good = False
             if (not good or (owner_field != "sender" and st.st_mode & 0o022)
                     or owner_name(st.st_uid) != obj.get(owner_field)
-                    or prefix + str(obj.get(stem_field)) != name[:-5]):
+                    or str(obj.get(stem_field)) != name[:-5]):
                 continue
             obj = dict(obj)
             obj["_mode"], obj["_sha"], obj["_mtime"] = stat.S_IMODE(st.st_mode), sha, st.st_mtime
@@ -864,19 +859,13 @@ class Board:
                     cache[key] = obj
                 n += 1
             empty_run = empty_run + 1 if n == 0 else 0
-            if empty_run >= 2 and k >= (self.receipt_floor + 1) // 10000:
+            if empty_run >= 2:
                 break
         return out
 
     def messages(self, box):
         """Valid messages in inbox/<box>/: owner equal to the sender field, stem equal to the id."""
-        local = self.records(f"inbox/{box}", check_message, owner_field="sender")
-        if not self.origin:
-            return local
-        carried = self.records("migration", lambda m: check_message(m) and m["to"] == box,
-                               owner_field="sender", prefix=move_mail_prefix(box))
-        ids = {m["id"] for m in local}
-        return local + [m for m in carried if m["id"] not in ids]
+        return self.records(f"inbox/{box}", check_message, owner_field="sender")
 
     def inbox_owner(self, box):
         try:

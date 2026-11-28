@@ -6,7 +6,7 @@ unpublished, invalid / over-budget, conflicting, objected, pending, standing (an
 """
 import fcntl, hashlib, json, os, secrets, time
 
-from . import core, move
+from . import core
 from .core import Refused, dumps, now
 
 SEEN_GAP_S = 30          # a reader that read the sequence this recently is watching: new slots are arrivals it saw
@@ -20,7 +20,7 @@ def claim_receipt(board, kind, rid, revision):
     """Claim the next free slot for a receipt; returns the slot."""
     board.writable()
     recs = board.receipts()
-    n = max(max(recs, default=0), board.receipt_floor) + 1
+    n = max(recs, default=0) + 1
     for _ in range(10000):
         k = n // 10000
         bfd = board.dir("seq", str(k))
@@ -36,15 +36,20 @@ def claim_receipt(board, kind, rid, revision):
     raise Refused("could not claim a receipt slot")
 
 
-def seen_update(receipts, imported_through=0):
-    """Record each receipt slot this user's bus processes have read (~/.local/state/agent-bus/slots.json, under
-    lockf on slots.lock): {slot: {sha, first_seen, rec}}. first_seen is an observed arrival only when the previous
+def seen_file(board):
+    suffix = f"-{board.fsid}-{board.ino}" if getattr(board, "origin", None) else ""
+    return os.path.join(core.STATE(), f"slots{suffix}.json")
+
+
+def seen_update(board, receipts):
+    """Record each receipt slot this user has read, scoped to the receipt sequence: {slot: {sha, first_seen, rec}}.
+    first_seen is an observed arrival only when the previous
     read was at most SEEN_GAP_S ago; otherwise it is None and the sequence time t(n) alone applies."""
     d = core.private_dir()
     lock = open(os.path.join(d, "slots.lock"), "a+")
     try:
         fcntl.lockf(lock, fcntl.LOCK_EX)
-        path = os.path.join(d, "slots.json")
+        path = seen_file(board)
         data = core.read_private(path) or {}
         slots = data.get("slots") or {}
         t = time.time()
@@ -53,7 +58,7 @@ def seen_update(receipts, imported_through=0):
         for slot, r in receipts.items():
             s = str(slot)
             if s not in slots:
-                slots[s] = dict(sha=r["_sha"], first_seen=t if watching and slot > imported_through else None, rec=t)
+                slots[s] = dict(sha=r["_sha"], first_seen=t if watching else None, rec=t)
         for s in [s for s, v in slots.items() if t - (v.get("rec") or 0) > SEEN_KEEP_S]:
             del slots[s]
         core.write_private(path, dict(slots=slots, last_read=t))
@@ -62,27 +67,17 @@ def seen_update(receipts, imported_through=0):
         lock.close()
 
 
-def sequence_times(receipts, seen, origin=None):
+def sequence_times(receipts, seen):
     """{slot: (reader receipt time, replaced)}: t(n) = max(created(n), t(n-1)) along the sequence; a reader that saw
     the slot arrive also takes the later of t(n) and its first sight; a slot whose receipt differs from what this
     reader recorded for it is replaced."""
-    origin = origin or {}
-    imported = origin.get("times", {})
-    floor = origin.get("floor", 0)
-    floor_time = max((r[0] for r in imported.values()), default=0)
     out, prev = {}, None
     for slot in sorted(receipts):
         r = receipts[slot]
         tn = r["created"] if prev is None else max(r["created"], prev)
-        original = imported.get(str(slot))
-        if original is not None:
-            tn = original[0]
-        elif slot > floor:
-            tn = max(tn, floor_time)
         prev = tn
         rec = (seen or {}).get(str(slot))
-        replaced = (bool(rec) and rec.get("sha") != r["_sha"]) or (
-            slot <= floor and (original is None or original[1] != r["_sha"]))
+        replaced = bool(rec) and rec.get("sha") != r["_sha"]
         tr = max(tn, rec["first_seen"]) if rec and rec.get("first_seen") else tn
         out[slot] = (tr, replaced)
     return out
@@ -113,18 +108,36 @@ def over_budget(mine, b, lim):
     return False
 
 
+def previous_usage(board, t, user):
+    origin = getattr(board, "origin", {})
+    if t >= origin.get("budget_until", 0):
+        return []
+    return [dict(start=start, end=end, gpus=range(count))
+            for start, end, count in origin["usage"].get(user, [])]
+
+
+def cutover_budget(board, rows, t):
+    """Keep the booked intervals required to evaluate the same rolling budget across cutover."""
+    span = board.limits["budget_span_s"]
+    usage = {}
+    for user in getattr(board, "origin", {}).get("usage", {}):
+        usage[user] = [[b["start"], b["end"], len(b["gpus"])] for b in previous_usage(board, t, user)
+                       if b["end"] > t - span]
+    for b in rows:
+        if b["state"] in ("standing", "lapsed") and b["end"] > t - span:
+            usage.setdefault(b["user"], []).append([b["start"], b["end"], len(b["gpus"])])
+    return dict(budget_until=t + span, usage={user: bands for user, bands in usage.items() if bands})
+
+
 def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=None, record=True, cache=None):
     """Every booking file on the board with its state. Returns a list of dicts: the booking's fields plus slot,
     order, revision, receipt_time, objection_close, state, why, objections."""
     t = now() if t is None else t
     lim = board.limits
-    origin = getattr(board, "origin", {})
-    inherited = {b["id"]: b for b in origin.get("bookings", [])}
-    ready = move.completed(board) if inherited else {}
     recs = receipts if receipts is not None else board.receipts(cache)
     if seen is None and record:
-        seen = seen_update(recs, origin.get("floor", 0))
-    times = sequence_times(recs, seen, origin)
+        seen = seen_update(board, recs)
+    times = sequence_times(recs, seen)
     by_rev = {}
     for slot in sorted(recs):
         r = recs[slot]
@@ -231,7 +244,9 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
                 o = r["objections"][0]
                 r.update(state="objected", why=f"objection by {o['user']}: {o['reason']}")
                 continue
-            mine = counted.setdefault(r["user"], [])
+            if r["user"] not in counted:
+                counted[r["user"]] = previous_usage(board, t, r["user"])
+            mine = counted[r["user"]]
             if over_budget(mine, r, lim):
                 r.update(state="over-budget", why=f"over {lim['budget_gpu_h']:g} GPU-h in a 7-day span")
                 continue
@@ -252,6 +267,7 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
             pb, pi = (pi.get("pred"), pi.get("pred_info")) if pi.get("inherited") else (None, None)
         mine = [o for o in rows if o["user"] == r["user"] and o["id"] != r["id"]
                 and o.get("state") in ("standing", "pending", "lapsed")]
+        mine += previous_usage(board, t, r["user"])
         for pb, pi in links:
             if invalid_why(pb, pi["receipt_time"]) or over_budget(mine, pb, lim):
                 return False
@@ -273,15 +289,6 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
         arrived.setdefault(x["id"], []).append(x)
     for r in rows:
         r.setdefault("objections", [])
-        if r.get("state") == "standing":
-            before = inherited.get(r["id"])
-            revisions = [r["revision"], *r.get("lineage", [])]
-            if before and before["revision"] in revisions and any(u not in ready for u in before["objectors"]):
-                r.update(state="pending", why="waiting for an objection from the previous board")
-            elif any(b["user"] != r["user"] and b["user"] not in ready and b["end"] > t and b["order"] < r["order"]
-                     and b["state"] in ("pending", "standing", "conflicting", "lapsed") and overlap(b, r)
-                     for b in inherited.values()):
-                r.update(state="pending", why="waiting for an earlier overlapping booking from the previous board")
         if r.get("state") == "standing":
             lapse_at = max(r["start"], r["objection_close"]) + lim["lapse_s"]
             revs = [r["revision"]] + (r.get("lineage") or [])
@@ -395,6 +402,7 @@ def publish_booking(board, gpus, start, end, objection_s=None, kind="other", not
     rows = evaluate(board, t, entries=entries)
     mine = [r for r in rows if r["user"] == core.USER and r["id"] != bid
             and r.get("state") in ("pending", "standing", "lapsed")]
+    mine += previous_usage(board, t, core.USER)
     if over_budget(mine, b, lim):
         raise Refused(f"over your budget: {lim['budget_gpu_h']:g} GPU-h of bookings in any 7-day span")
     data = dumps(b)
@@ -454,7 +462,7 @@ def publish_objection(board, booking_id, reason):
         raise Refused(f"no booking {booking_id}")
     if b["user"] == core.USER:
         raise Refused("you cannot object to your own booking; `bus unbook` withdraws it")
-    if b.get("state") not in ("pending", "objected", "conflicting") or now() >= b.get("objection_close", 0):
+    if b.get("state") not in ("pending", "objected", "conflicting"):
         raise Refused(f"{booking_id} is {b.get('state')}: an objection counts only while its objection window is open")
     oid = core.new_id(f"obj-{booking_id[-12:]}")
     o = dict(id=oid, booking=booking_id, booking_revision=b["revision"], user=core.USER, reason=reason, created=now())

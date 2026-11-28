@@ -254,50 +254,39 @@ The timer uses the verified local hostname.
 ### Move an installed board
 
 The move build ships through the normal release channel. Each account's 24-hour soak starts when it sees the
-release. Wait for a quiet window after those upgrades, then have the board owner run these commands on
-`della-tridao`.
+release. After the upgrades, have `al9080` run the move during an empty window on `della-tridao`.
 
 ```sh
 OLD=/scratch/gpfs/TRIDAO/agent-bus-v2
 NEW=/scratch/agent-bus-v2
-~/src/agent-bus/setup-board.sh "$NEW" della-tridao
-bus move-board stage "$OLD" "$NEW"
-bus move-board finish "$OLD" "$NEW"
+bus move-board "$OLD" "$NEW"
 ```
 
-The roots must have the same owner, host, GPU count and booking limits. Stage prepares the destination while
-the old board accepts writes. Stage and finish both check that the latest entry or heartbeat from each account
-that published in the last 14 days reports a confirmed move-capable build. The gate also checks every unarchived
-run, every open objection window, and standing bookings of other accounts that overlap the next five minutes.
-Supervisors and board commands report their build automatically. An idle account reports it on its next
-automatic upgrade check after installation.
+The command lists blockers and leaves the source active. Retry when there are zero runs, including runs with
+unknown occupancy or a launch inbox awaiting its first entry, zero pending or standing bookings, and zero open
+objection windows. Unreceipted future booking revisions also block. Each account that published in the past
+14 days must report a confirmed move-capable build. Board writes, supervisor passes and automatic timers report
+the build. The adopt timer also checks the account's private runs, so an old launch inbox can clear after its
+owner's client confirms the account is idle. Allow up to 30 seconds for other clients to observe a new receipt
+when checking whether its objection window has closed.
 
-Finish drains in-flight board transactions and gives any incomplete booking revision three seconds to receive
-its receipt. If the revision is still unpublished, the owner of that booking must repair or withdraw it before
-the move can finish. Finish then seals the old publication directories and mailboxes owned by the board owner,
-rechecks the gate, and renames the original root to `$OLD.retired-<inode>`. The same board lease drains writers
-in mailboxes owned by other accounts. Unix permissions leave their directory modes under their respective
-owners' control. Keep the archive in place and use it as read-only.
+The move takes the source write lock, seals board-owned publication directories and mailboxes, and checks again
+before creating the new board with the same host, GPU count and booking limits. Setup can use an empty protected
+destination directory already owned by `al9080`. The owner signs the new pin with `move.json` and archives the
+original root at `$OLD.retired-<inode>`. Unix keeps the modes of other users' mailboxes under their owners' control.
+Keep the GPFS archive in place and treat it as read-only.
 
-A confirmed move-capable client replays its own records before it saves the new pin. Supervisors do this on
-their next pass, so the cutover takes a few passes instead of spanning clients' release soak. An upgrade trial
-leaves both pins on the source until takeover is confirmed. The replay keeps receipt slots, objection
-deadlines, booking history and the seven-day budget. An unreplayed standing booking still blocks overlapping
-new launches during its window. A booking with an
-outstanding old objection or an earlier overlapping booking stays pending while it awaits the relevant
-author's records. Mailbox names are recreated by their owners. Senders replay messages they published after
-stage. Earlier messages and logs stay in the archive.
+Clients re-pin on their next board access after their upgrade is confirmed. Entries, bookings, objections,
+arrivals, receipts and messages stay in the archive. For seven days, the new board counts each account's
+previously charged booking intervals and GPU counts in its rolling budget. It stores only those budget inputs
+in owner-authenticated metadata and starts a fresh receipt sequence. Old clients with the original pin can't
+write to the new board. The new page starts with no Agent Bus entries or bookings and continues to show live
+GPU telemetry.
 
-Finish observes replay for 10 seconds by default and lists remaining runs and bookings. A run whose end or takeover has yet to be
-confirmed is shown as occupancy unknown and holds its GPUs for exclusive handoff, even after its old heartbeat
-expires. The page shows those holds, bookings awaiting replay, and GPU telemetry, including identifiable
-processes without current entries.
-
-Before finish, the source is still active. Set the staged destination aside to abandon the move. If finish
-is interrupted, rerun it with the same paths to finish the switch. After finish, move from the active board to
-an empty replacement and keep the original archive. This follows one move per pin, so let active clients re-pin
-before initiating a second move. An installation still pinned two moves back needs an explicit install at the
-current path. Only return to GPFS if every author can access it.
+Before cutover, the source remains active. After an interruption, rerun the same command with the same paths.
+To move again after cutover, wait for an empty window and use a fresh destination, keeping the original archive.
+Let confirmed clients re-pin before a second move. An installation two moves behind needs to install at the
+current path. Use GPFS only if all authors can access the destination.
 
 ## Commands
 
@@ -313,6 +302,7 @@ current path. Only return to GPFS if every author can access it.
 | `bus gc --mine` | your runs no supervisor holds, and your entries whose run has ended |
 | `bus reconcile <id> [--confirm <pid>...] [--cancel-exec <exec-id>]` | list or confirm processes a release cannot attribute to the run; clear an admitted `bus exec` whose client is gone and whose launcher cannot be identified, named by the `exec-unidentified` event |
 | `bus doctor`, `bus upgrade --build <dir>`, `bus adopt --all`, `bus stop-hook` | install checks, updates, adoption, the Claude Code stop hook |
+| `bus move-board <old> <new>` | archive an empty board and create its replacement, as the board owner |
 | `bus page [--port 8300]` | a read-only page of the board, served on 127.0.0.1 from your own install |
 
 ### B300 board on the web

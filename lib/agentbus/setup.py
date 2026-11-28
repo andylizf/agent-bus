@@ -7,8 +7,7 @@ import grp, os, stat
 from . import core
 from .core import Refused
 
-DIRS = ("agents", "agents/.heartbeat", "inbox", "bookings", "objections", "arrivals", "seq", "archive", "log",
-        "migration")
+DIRS = ("agents", "agents/.heartbeat", "inbox", "bookings", "objections", "arrivals", "seq", "archive", "log")
 
 
 def _dir(parent_fd, name, mode, gid, made, fixed=False):
@@ -53,6 +52,24 @@ def _file(dir_fd, name, data, replace_own=False):
         pass
 
 
+def populate(rfd, config, blocks, gid, made, readme=None):
+    shared = 0o3775 if os.fstat(rfd).st_mode & stat.S_ISGID else 0o1777
+    fds = {"": rfd}
+    try:
+        for d in DIRS:
+            head, _, tail = d.rpartition("/")
+            fds[d] = _dir(fds[head], tail, shared, gid, made, fixed=True)
+        for k in range(blocks):
+            os.close(_dir(fds["seq"], str(k), shared, gid, made, fixed=True))
+        _file(rfd, "config", config)
+        if readme:
+            _file(rfd, "README.md", readme, replace_own=True)
+    finally:
+        for d in DIRS:
+            if d in fds:
+                os.close(fds[d])
+
+
 def setup_board(root, host=None, group=None, gpus=8, blocks=1000, add_blocks=None, readme=None):
     root = os.path.abspath(root)
     parent, name = os.path.dirname(root), os.path.basename(root)
@@ -90,19 +107,7 @@ def setup_board(root, host=None, group=None, gpus=8, blocks=1000, add_blocks=Non
                 os.close(b)
                 if old:
                     raise Refused(f"{root} holds an old (v1) board; a v2 board goes in its own directory")
-            fds = {"": rfd}
-            shared = 0o3775 if os.fstat(rfd).st_mode & stat.S_ISGID else 0o1777
-            for d in DIRS:
-                head, _, tail = d.rpartition("/")
-                fds[d] = _dir(fds[head], tail, shared, gid, made, fixed=True)
-            for k in range(blocks):
-                os.close(_dir(fds["seq"], str(k), shared, gid, made, fixed=True))
-            _file(rfd, "config", f"host={host}\ngpus={int(gpus)}\n".encode())
-            if readme:
-                _file(rfd, "README.md", readme, replace_own=True)
-            for d, fd in fds.items():
-                if d:
-                    os.close(fd)
+            populate(rfd, f"host={host}\ngpus={int(gpus)}\n".encode(), blocks, gid, made, readme)
         finally:
             os.close(rfd)
         return dict(root=root, made=len(made), blocks=blocks)
