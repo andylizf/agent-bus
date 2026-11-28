@@ -880,15 +880,21 @@ class Supervisor:
         return e
 
     def write_entry(self, board):
-        board.writable()
+        fd = board.wdir("agents", during_move=True)
         data = core.dumps(self.entry())
-        if data != self.s.get("_entry_written"):
-            cur = core.read_json(board.wdir("agents"), f"{self.rid}.json")
+        pin = board.pin_fields()
+        if data.decode() != self.s.get("_entry_written") or pin != self.s.get("_entry_board"):
+            cur = core.read_json(fd, f"{self.rid}.json")
             if cur and cur[0].get("run") != self.s["run"]:
                 raise Refused(f"the board holds {self.rid} for another generation ({cur[0].get('run')}); not overwritten")
-            core.replace(board.wdir("agents"), f"{self.rid}.json", data)
+            core.replace(fd, f"{self.rid}.json", data)
             self.s["_entry_written"] = data.decode()
+            self.s["_entry_board"] = pin
             self.s["entry_on_board"] = True
+
+    def publish_entry(self, board):
+        self.write_entry(board)
+        core.touch(board.wdir("agents", ".heartbeat", during_move=True), self.rid, data=(self.version + "\n").encode())
 
     def archive_entry(self, board):
         """Archive the run's entry if it is on the board. Decided by the board, not by the state's entry_on_board: a
@@ -931,7 +937,7 @@ class Supervisor:
 
     def reply(self, board, req, answer, text):
         """A reply message into the requester's own mailbox (its reply_to, checked to be theirs)."""
-        if not board.ok or board.inbox_owner(req["reply_to"]) != req["sender"]:
+        if not board.ok or board.pending or board.inbox_owner(req["reply_to"]) != req["sender"]:
             return
         mid = core.new_id(f"re-{secrets.token_hex(3)}")
         m = dict(id=mid, sender=core.USER, to=req["reply_to"], kind="reply", request_id=req["request_id"],
@@ -1531,18 +1537,23 @@ class Supervisor:
         t0 = time.monotonic()
         t = now()
         try:
-            board = core.Board(s["board"]["path"], (s["board"]["inode"], s["board"]["fsid"]))
-        except OSError as e:
+            board = core.Board.from_pin(dict(s["board"], host=s["host"]))
+        except (OSError, Refused) as e:
             board = None
-            err = core.errno_name(e)
-        with_board = board is not None and board.ok
+            err = str(e)
+        with_board = board is not None and board.ok and not board.pending
+        moved = board is not None and board.ok and board.path != s["board"]["path"]
+        entry_board = board if with_board or moved else _NoBoard()
         if not with_board:
             if not s.get("identity_alarm"):
                 s["identity_alarm"] = t
+                pending = board is not None and board.pending
                 notice(self.rid, s, self.hooks, "board-identity-changed",
-                       detail=f"{s['board']['path']}: " + (err if board is None else "inode or filesystem id differs"),
-                       action="nothing is written to the board and no board record acts on this run; the job keeps "
-                              "running")
+                       detail=err if board is None else f"{board.path}: " +
+                       ("board move awaiting booking records" if pending else "inode or filesystem id differs"),
+                       action=("publishing run and owner booking records while board decisions are paused" if pending
+                               else "nothing is written to the board and no board record acts on this run; "
+                                    "the job keeps running"))
         elif s.get("identity_alarm"):
             s.pop("identity_alarm")
             notice(self.rid, s, self.hooks, "board-identity-restored")
@@ -1553,6 +1564,16 @@ class Supervisor:
                 s["last_pass"] = t
                 self.save_completed_pass()
                 return
+            if moved:
+                fd = core.mkdir_own(board.wdir("inbox", during_move=True), self.rid, board.inbox_mode)
+                if fd is None:
+                    raise Refused(f"inbox {self.rid} is occupied on the new board")
+                os.close(fd)
+                self.publish_entry(board)
+                if with_board:
+                    board.repin_conf(s["board"])
+                    s["board"] = board.pin_fields()
+                    self.save()
             if s["mode"] == "systemd" and s["state"] in ("running", "leader-exited", "stopping", "needs-reconcile") \
                     and not s["units"].get("cgroup_path"):
                 s["units"]["cgroup_path"] = recover_cgroup(s["units"]["slice"])
@@ -1660,12 +1681,12 @@ class Supervisor:
                     elif s["state"] in ("running", "leader-exited"):
                         self.notice_bookings_ahead(rows, t)
             if s.get("release"):
-                self.release_step(board if with_board else _NoBoard())
+                self.release_step(entry_board)
                 if s["state"] == "ended":
                     return
             # the main service and the slice
             if s["state"] in ("running", "leader-exited", "stopping", "needs-reconcile") and not s.get("release"):
-                self.leader_exit_step(board if with_board else _NoBoard())
+                self.leader_exit_step(entry_board)
                 if s["state"] == "ended":
                     return
             if s["mode"] == "systemd" and s["state"] in ("running", "leader-exited"):
@@ -1673,10 +1694,8 @@ class Supervisor:
             self.passes += 1
             if self.passes % core.SAMPLE_EVERY() == 1 % core.SAMPLE_EVERY() and s["state"] == "running":
                 self.sample()
-            if with_board and s["state"] in NONTERMINAL:
-                self.write_entry(board)
-                hb = board.wdir("agents", ".heartbeat")
-                core.touch(hb, self.rid, data=(self.version + "\n").encode())
+            if entry_board.ok and s["state"] in NONTERMINAL:
+                self.publish_entry(entry_board)
             s["last_pass"] = t
             s["last_pass_s"] = round(time.monotonic() - t0, 3)
             s["max_pass_s"] = max(s.get("max_pass_s") or 0, s["last_pass_s"])
@@ -1974,7 +1993,7 @@ def launch_run(a, launch):
                     os.mkdir(rid, 0o700, dir_fd=inbox)   # created now, so its mode is set now, on its own descriptor
                     fd = core.sub(inbox, rid)
                     if fd is not None and os.fstat(fd).st_uid == core.UID:
-                        os.fchmod(fd, 0o3775)
+                        os.fchmod(fd, board.inbox_mode)
                     elif fd is not None:
                         os.close(fd)
                         fd = None

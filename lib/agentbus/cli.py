@@ -24,7 +24,11 @@ def when(t):
 
 
 def board():
-    return core.Board.from_conf()
+    b = core.Board.from_conf()
+    if b.pending:
+        b.close()
+        raise Refused(f"board move in progress at {b.path}: waiting for booking records")
+    return b
 
 
 # ------------------------------------------------------------------------------------------------ reading
@@ -112,7 +116,7 @@ def cmd_object(a):
 
 def own_mailbox(b, name="mail"):
     box = core.component(f"{core.USER}-{name}", "mailbox")
-    fd = core.mkdir_own(b.wdir("inbox"), box, 0o3775)
+    fd = core.mkdir_own(b.wdir("inbox"), box, b.inbox_mode)
     if fd is None:
         raise Refused(f"inbox/{box} exists and is not yours")
     os.close(fd)
@@ -344,8 +348,9 @@ def cmd_doctor(a):
     conf = core.load_conf()
     try:
         with core.Board.from_conf(conf) as b:
-            check("board pin", b.ok and b.pin is not None, f"{b.path} inode {b.ino} fsid {b.fsid}"
-                  + ("" if b.ok else f" (pinned {conf.get('inode')} {conf.get('fsid')})"))
+            check("board pin", b.ok and b.pin is not None and not b.pending, f"{b.path} inode {b.ino} fsid {b.fsid}"
+                  + (" (move in progress)" if b.pending else
+                     "" if b.ok else f" (pinned {conf.get('inode')} {conf.get('fsid')})"))
             check("board host", not b.host or b.host in (core.HOST, os.uname().nodename),
                   f"board host {b.host}, this host {core.HOST}")
     except (OSError, Refused) as e:
@@ -511,18 +516,25 @@ def cmd_setup_board(a):
 def cmd_install(a):
     """`bus _install --board DIR` (install.sh calls it): copy the build, flip the entry point, pin the board by inode
     and filesystem id in ~/.config/agent-bus/board.conf."""
+    conf = core.load_conf()
+    with core.Board(os.path.abspath(a.board)) as b:
+        b.writable()
+        if not b.host:
+            raise Refused(f"{b.path} is not a v2 board")
+        conf.update(b.pin_fields(), host=b.host)
     with auto_upgrade.lock():
         auto_upgrade.settle(flip)
         if auto_upgrade.read_state().get("pending"):
             raise Refused("previous upgrade recovery is incomplete; see bus doctor")
         build = copy_build(a.src)
         flip(build)
-    conf = core.load_conf()
-    b = core.Board(os.path.abspath(a.board))
-    conf.update(path=b.path, inode=str(b.ino), fsid=str(b.fsid), host=b.host or "")
-    b.close()
-    core.save_conf(conf)
+        core.save_conf(conf)
     out(dict(build=os.path.basename(build), bin=core.BIN(), conf=conf))
+
+
+def cmd_move_board(a):
+    from . import move
+    move.command(a.action, a.old, a.new)
 
 
 # ------------------------------------------------------------------------------------------------ parser
@@ -661,6 +673,10 @@ def parser():
     s = p("_install", cmd_install)
     s.add_argument("--src", required=True)
     s.add_argument("--board", required=True)
+    s = p("move-board", cmd_move_board, "stage, replay or finish a board move")
+    s.add_argument("action", choices=("stage", "replay", "finish"))
+    s.add_argument("old")
+    s.add_argument("new")
     s = p("page", None, "serve the read-only board page")
     s.add_argument("--port", type=int, default=8300)
     s.add_argument("--host", default="127.0.0.1")

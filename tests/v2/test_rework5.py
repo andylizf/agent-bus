@@ -29,7 +29,7 @@ class RunIdsAndLaunchTimeouts(BusTest):
         self.assertEqual(len(set(ids)), 2, ids)
         for i, rid in enumerate(ids):
             self.assertEqual(self.state(rid)["gpus"], [i])          # neither record overwrote the other
-            self.assertEqual(os.stat(self.root / "inbox" / rid).st_mode & 0o7777, 0o3775)   # others can write to it
+            self.assertEqual(os.stat(self.root / "inbox" / rid).st_mode & 0o7777, 0o1777)
             wait_for(lambda: self.state(rid)["state"] == "running", 20, what=f"{rid} running")
 
     def test_a_launch_timeout_after_systemd_accepted_never_ends_the_job(self):

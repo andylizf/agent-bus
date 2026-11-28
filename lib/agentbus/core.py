@@ -36,6 +36,7 @@ IDLE_S = lambda: env_num("AGENT_BUS_IDLE_S", 1800)           # under 5% this lon
 MAX_RECORD = 64 * 1024
 RACY_NS = 5 * 10 ** 9      # receipts changed this recently are always re-read (ctime granularity)
 MAX_LISTING = 20000
+MOVE_PENDING = ".move-pending"
 NOTE_MAX, MSG_NOTE_MAX, REASON_MAX = 80, 200, 200
 KINDS = ("training", "eval", "benchmark-timing", "serving", "interactive-dev", "other")
 CLASSES = ("scheduled", "backfill")
@@ -564,6 +565,8 @@ class Board:
         self.ino, self.fsid = identity(self.fd)
         st = os.fstat(self.fd)
         self.creator = st.st_uid       # the account that ran setup-board.sh owns the board's directories
+        self.group_shared = bool(st.st_mode & stat.S_ISGID)
+        self.pending = read_file(self.fd, MOVE_PENDING, 4096) is not None
         self.pin = pin
         self.ok = pin is None or (int(pin[0]) == self.ino and int(pin[1]) == self.fsid)
         self.warnings = []
@@ -587,8 +590,51 @@ class Board:
         p = path or conf.get("path")
         if not p:
             raise Refused("no board configured: run install.sh --board <dir> (or pass --board)")
-        pin = (conf["inode"], conf["fsid"]) if conf.get("inode") and (path is None or path == conf.get("path")) else None
-        return cls(p, pin)
+        if not conf.get("inode") or (path is not None and path != conf.get("path")):
+            return cls(p)
+        board = cls.from_pin(conf)
+        if board.path != p and not board.pending:
+            try:
+                board.repin_conf(conf)
+            except BaseException:
+                board.close()
+                raise
+        return board
+
+    @classmethod
+    def from_pin(cls, conf):
+        from . import move
+        try:
+            board = cls(conf["path"], (conf["inode"], conf["fsid"]))
+        except OSError as error:
+            moved = move.follow(conf)
+            if moved is None:
+                raise Refused(f"{conf['path']}: {errno_name(error)}") from error
+            return moved
+        if board.ok:
+            return board
+        try:
+            moved = move.follow(conf)
+        except BaseException:
+            board.close()
+            raise
+        if moved is None:
+            return board
+        board.close()
+        return moved
+
+    def pin_fields(self):
+        return dict(path=self.path, inode=self.ino, fsid=self.fsid)
+
+    def repin_conf(self, old):
+        conf = load_conf()
+        if (conf.get("path"), conf.get("inode"), conf.get("fsid")) == (
+                old["path"], str(old["inode"]), str(old["fsid"])):
+            save_conf(dict(conf, **self.pin_fields(), host=self.host))
+
+    @property
+    def inbox_mode(self):
+        return 0o3775 if self.group_shared else 0o1777
 
     def close(self):
         for fd in self._dirs.values():
@@ -641,9 +687,11 @@ class Board:
             self._dirs[key] = fd if owned else None
         return self._dirs[key]
 
-    def writable(self):
+    def writable(self, *, during_move=False):
         if not self.ok:
             raise Refused(f"board identity changed at {self.path}: nothing is written there")
+        if self.pending and not during_move:
+            raise Refused(f"board move in progress at {self.path}: waiting for booking records")
 
     # --- readers
 
@@ -782,15 +830,15 @@ class Board:
 
     # --- writers (only after writable())
 
-    def wdir(self, *parts):
-        self.writable()
+    def wdir(self, *parts, during_move=False):
+        self.writable(during_move=during_move)
         fd = self.dir(*parts)
         if fd is None:
             raise Refused(f"{'/'.join(parts)} missing on the board (setup-board.sh creates it)")
         return fd
 
     def log(self, action, **kw):
-        if not self.ok:
+        if not self.ok or self.pending:
             return
         try:
             append(self.wdir("log"), f"{USER}.jsonl", json.dumps(dict(ts=now(), user=USER, action=action, **kw),

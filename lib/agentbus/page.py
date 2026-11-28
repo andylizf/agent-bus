@@ -146,7 +146,7 @@ def collect(conf, *, history=True):
     ngpus = 0
     try:
         with core.Board.from_conf(conf) as b:
-            if not b.ok:
+            if not b.ok or b.pending:
                 raise core.Refused("board identity changed")
             ngpus = b.ngpus
             entries = bk.entries_with_occupancy(b)

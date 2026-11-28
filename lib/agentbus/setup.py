@@ -2,7 +2,7 @@
 O_NOFOLLOW, every directory is created and then opened relative to its parent's descriptor, and a mode or group is set
 only on what this run created. A symlink or another account's directory at any level stops the setup, so nothing a
 member puts in the group-writable parent can redirect it."""
-import grp, os
+import grp, os, stat
 
 from . import core
 from .core import Refused
@@ -71,14 +71,15 @@ def setup_board(root, host=None, group=None, gpus=8, blocks=1000, add_blocks=Non
                 raise Refused(f"{root} is not a v2 board")
             names, _ = core.scan(sfd)
             last = max([int(n) for n in names or [] if n.isdigit()], default=-1)
+            shared = 0o3775 if os.fstat(rfd).st_mode & stat.S_ISGID else 0o1777
             for k in range(last + 1, last + 1 + add_blocks):
-                os.close(_dir(sfd, str(k), 0o3775, gid, made, fixed=True))
+                os.close(_dir(sfd, str(k), shared, gid, made, fixed=True))
             os.close(sfd)
             os.close(rfd)
             return dict(blocks=f"0-{last + add_blocks}", made=made)
         if not host or not all(c.isalnum() or c in ".-" for c in host):
             raise Refused("bad host name")
-        rfd = _dir(pfd, core.component(name, "board directory"), 0o2755, gid, made)
+        rfd = _dir(pfd, core.component(name, "board directory"), 0o2755 if group else 0o755, gid, made)
         try:
             b = core.sub(rfd, "bin")
             if b is not None:
@@ -87,11 +88,12 @@ def setup_board(root, host=None, group=None, gpus=8, blocks=1000, add_blocks=Non
                 if old:
                     raise Refused(f"{root} holds an old (v1) board; a v2 board goes in its own directory")
             fds = {"": rfd}
+            shared = 0o3775 if os.fstat(rfd).st_mode & stat.S_ISGID else 0o1777
             for d in DIRS:
                 head, _, tail = d.rpartition("/")
-                fds[d] = _dir(fds[head], tail, 0o3775, gid, made, fixed=True)
+                fds[d] = _dir(fds[head], tail, shared, gid, made, fixed=True)
             for k in range(blocks):
-                os.close(_dir(fds["seq"], str(k), 0o3775, gid, made, fixed=True))
+                os.close(_dir(fds["seq"], str(k), shared, gid, made, fixed=True))
             _file(rfd, "config", f"host={host}\ngpus={int(gpus)}\n".encode())
             if readme:
                 _file(rfd, "README.md", readme, replace_own=True)

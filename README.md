@@ -129,14 +129,17 @@ owner can use `bus release <id>` to stop an older run through the explicit relea
 ### Trust
 
 - A record's author is its file owner. An entry, booking, objection, receipt or message counts only when its owner's
-  name equals its `user` (or `sender`) field and its id starts with `<user>-`. Records are `0644`, one writer each, in
-  setgid sticky directories, so only their author changes or removes them.
+  name equals its `user` (or `sender`) field and its id starts with `<user>-`. Records are `0644`. Sticky
+  directories let a record's author or the directory owner remove it. A node-wide board admits any local
+  account. A board created with `--group` limits writes to that group and uses setgid for group inheritance.
 - Every path on the board is opened by an `openat` walk from `/` with `O_NOFOLLOW`; readers take only regular files
   of at most 64 KiB, skip dot names and symlinks, and skip a directory of more than 20,000 entries.
 - Each install records the board directory's inode and filesystem id. If the directory at that path is ever
   replaced, every `bus` command still reads it (shown as "board identity changed"), and supervisors write nothing to
   it and let nothing on it act on their jobs; the jobs keep running and their owners are told.
-- Nothing read from the board becomes a path to write, a signal target, an ssh host or a shell word.
+- The owner of a pinned board can authorize a new board path through `move.json`. The client opens every
+  component without following symlinks and checks the destination's owner, inode, filesystem id and host.
+  Ordinary records supply no write paths, signal targets, SSH hosts or shell words.
 
 What any member can cause, by design: a request stops a backfill run within one supervisor pass; a standing, unlapsed
 booking stops every backfill run on its GPUs when its window starts; a reasoned objection during a booking's
@@ -224,7 +227,7 @@ Run once, on the GPU host, as yourself (or let your agent run it):
 loginctl enable-linger "$USER"
 loginctl show-user "$USER" -p Linger                 # expect: Linger=yes
 git clone https://github.com/andylizf/agent-bus ~/src/agent-bus && git -C ~/src/agent-bus checkout <release tag>
-~/src/agent-bus/bin/install.sh --board /scratch/gpfs/TRIDAO/agent-bus-v2
+~/src/agent-bus/bin/install.sh
 systemctl --user enable --now bus-adopt.timer
 systemctl --user list-timers bus-adopt.timer --no-pager   # expect a NEXT time
 bus doctor                                           # expect: linger yes, user manager yes, cgroup2 yes, slice test ok, board pin ok
@@ -234,8 +237,37 @@ bus doctor                                           # expect: linger yes, user 
 at it, pins the board in `~/.config/agent-bus/board.conf`, writes the adopt timer with `ConditionHost=` (home
 directories shared across nodes would otherwise start it everywhere), and prints the Claude Code stop hook to add.
 
-Releases are the repository's tags (`git -C ~/src/agent-bus tag`). A new board is created once, by the account that
-will own its directories, with `~/src/agent-bus/setup-board.sh <board-dir> <gpu-host-short-name> --group <unix-group>`.
+Releases are the repository's tags (`git -C ~/src/agent-bus tag`). The default board is `/scratch/agent-bus-v2`.
+On the GPU host, its owner creates it with `~/src/agent-bus/setup-board.sh /scratch/agent-bus-v2 "$(hostname -s)"`.
+For a different board path, pass `--board <board-dir>` to `install.sh`.
+
+### Move an installed board
+
+Run these steps on the board host. `OLD` is the absolute path pinned by members and `NEW` is the path of an
+empty board on the destination filesystem. Both roots must have the same owner, host, GPU count and booking
+limits. Allocate enough receipt blocks on `NEW` to hold the original sequence.
+
+1. Have each installed user run `bus upgrade --build ~/src/agent-bus` from a checkout with move support. Verify
+   `supervisor.code` in `bus state <id>` for each live systemd supervisor. Foreground supervisors on earlier builds
+   keep running without board coordination after the source moves. Let them finish first if their jobs need coordination.
+2. Pause launchers and manual board commands. As the board owner, run `bus move-board stage "$OLD" "$NEW"`.
+   This writes `move.json` in the pinned root and renames that root to `$OLD.retired-<inode>` on the same
+   filesystem. Keep that archive in place for installed users who still need to follow its move record.
+   Treat it as read-only and keep new installs pointed at `NEW`. Let any in-flight passes on the old path finish.
+3. Each author runs `bus move-board replay "$OLD" "$NEW"`. Upgraded supervisors also replay their owner's
+   records and publish their current run, inbox and heartbeat at a pass boundary. Replay preserves the original
+   bytes, authors, and receipt slots for bookings, objections and arrivals. Historical inboxes, archived entries
+   and logs stay on the retired board. Users recreate their standalone mailboxes with `bus mailbox <name>`.
+4. The owner runs `bus move-board finish "$OLD" "$NEW"`. It checks the booking records against the source and
+   checks for entries with fresh source heartbeats that still need to appear on the new board. Once it succeeds,
+   `bus ls` re-pins each user's install on first use and supervisors re-pin their own runs on their next pass.
+   Verify `bus doctor`, `bus ls` and `bus cal` before resuming launchers.
+
+Before `finish`, the board owner can roll back by confirming that `OLD` is vacant and running
+`mv -T -- "$ARCHIVE" "$OLD"` with the archive path printed by `stage`. Clients still pin the original inode.
+Put the staged destination aside before retrying. After `finish`, use the same move procedure from the active
+board to an empty replacement. Use `OLD` only if every author can reach and write to it. Keep the original
+archive in place.
 
 ## Commands
 

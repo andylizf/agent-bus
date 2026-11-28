@@ -23,11 +23,8 @@ lib = (Path.home() / '.local/bin/bus').resolve().parents[1] / 'lib'
 sys.path.insert(0, str(lib))
 from agentbus import core, page
 
-conf = core.load_conf()
-if conf.get('path') != '/scratch/gpfs/TRIDAO/agent-bus-v2':
-    sys.exit('unexpected board')
-data = page.collect(conf, history=False)
-if data['board'] != conf['path'] or [g['gpu'] for g in data['gpus'] if g['available']] != list(range(8)):
+data = page.collect(core.load_conf(), history=False)
+if data['board'] != '/scratch/agent-bus-v2' or [g['gpu'] for g in data['gpus'] if g['available']] != list(range(8)):
     sys.exit('incomplete board reading')
 print(json.dumps(page.public_feed(data), separators=(',', ':')))
 '''

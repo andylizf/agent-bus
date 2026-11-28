@@ -210,8 +210,8 @@ class Setup(BusTest):
     def test_layout_and_modes(self):
         modes = {d: stat.S_IMODE(os.stat(self.root / d).st_mode) for d in
                  ("agents", "agents/.heartbeat", "inbox", "bookings", "objections", "seq", "seq/0", "archive", "log")}
-        self.assertEqual(set(modes.values()), {0o3775}, modes)
-        self.assertEqual(stat.S_IMODE(os.stat(self.root).st_mode), 0o2755)
+        self.assertEqual(set(modes.values()), {0o1777}, modes)
+        self.assertEqual(stat.S_IMODE(os.stat(self.root).st_mode), 0o755)
         self.assertEqual(stat.S_IMODE(os.stat(self.root / "config").st_mode), 0o644)
         self.assertFalse(any(p.suffix in (".py", ".sh") for p in self.root.rglob("*")), "no executable on the board")
 
@@ -219,7 +219,22 @@ class Setup(BusTest):
         r = subprocess.run(["bash", str(__import__("helpers").REPO / "setup-board.sh"), str(self.root), "--add-blocks",
                             "2"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue((self.root / "seq" / "4").is_dir())
+        self.assertEqual(stat.S_IMODE((self.root / "seq" / "4").stat().st_mode), 0o1777)
+
+    def test_setup_with_a_group(self):
+        import grp
+        from agentbus import setup
+        root = self.tmp / "group-board"
+        setup.setup_board(str(root), host=self.host(), group=grp.getgrgid(os.getgid()).gr_name, blocks=1)
+        setup.setup_board(str(root), add_blocks=1)
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o2755)
+        self.assertEqual(stat.S_IMODE((root / "seq" / "1").stat().st_mode), 0o3775)
+        with core.Board(str(root)) as board:
+            self.assertEqual(board.inbox_mode, 0o3775)
+
+    def test_node_mailbox_is_world_writable_and_sticky(self):
+        self.bus("mailbox", "test", check=True)
+        self.assertEqual(stat.S_IMODE((self.root / "inbox" / f"{core.USER}-test").stat().st_mode), 0o1777)
 
     def test_refuses_old_board_directory(self):
         old = self.tmp / "oldb"

@@ -13,5 +13,8 @@ use the board through it: `bus ls`, `bus cal`, `bus run`, `bus book`.
   no-show rule)
 - `archive/` ended entries; `log/<user>.jsonl` each member's own log
 
-A record counts only when its file owner is the user it names. Directories are setgid and sticky: anyone in the group
-adds files, and only a file's owner changes or removes it.
+A record counts only when its file owner is the user it names. Shared directories are sticky. A node-wide board
+allows any local user to add files. A group board uses setgid so files inherit the shared group.
+
+A root archived by `bus move-board` holds a `move.json` record that installed clients use to find the new board.
+Keep that root in place as a read-only archive.

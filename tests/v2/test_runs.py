@@ -753,7 +753,7 @@ printf '%s\\n' "$event" >> "{events}"
     def test_reply_and_mailbox(self):
         box = self.bus("mailbox", "talk", check=True).stdout.strip()
         self.assertEqual(box, f"{core.USER}-talk")
-        self.assertEqual(os.stat(self.root / "inbox" / box).st_mode & 0o7777, 0o3775)
+        self.assertEqual(os.stat(self.root / "inbox" / box).st_mode & 0o7777, 0o1777)
         d = self.start(SLEEP)
         m = self.request(d["id"], to_run="f" * 32, reply_to=box)
         msg = next(p.stem for p in (self.root / "inbox" / d["id"]).glob("*.json"))
