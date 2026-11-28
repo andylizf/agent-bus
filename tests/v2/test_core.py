@@ -240,7 +240,8 @@ class Setup(BusTest):
         self.assertFalse(os.stat(os.path.dirname(os.path.dirname(link))).st_mode & 0o022)
 
     def test_install_sh_writes_adopt_units(self):
-        env = dict(self.env, XDG_CONFIG_HOME=str(self.home / "xdg"), AGENT_BUS_TIMER="abt-adopt")
+        env = dict(self.env, XDG_CONFIG_HOME=str(self.home / "xdg"), AGENT_BUS_TIMER="abt-adopt",
+                   AGENT_BUS_SYSTEMD="off")
         r = subprocess.run(["bash", str(__import__("helpers").REPO / "bin" / "install.sh"), "--board", str(self.root)],
                            capture_output=True, text=True, env=env)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -250,6 +251,12 @@ class Setup(BusTest):
         self.assertIn("ConditionHost=", tim)
         self.assertIn("OnUnitActiveSec=30", tim)
         self.assertIn("Environment=AGENT_BUS_STATE=", svc)
+        upgrade_timer = self.home / "xdg" / "systemd" / "user" / f"{self.prefix}-auto-upgrade.timer"
+        self.assertIn("OnActiveSec=15min", upgrade_timer.read_text())
+        off = subprocess.run(["bash", str(__import__("helpers").REPO / "bin" / "install.sh"), "--board", str(self.root),
+                              "--no-auto-upgrade"], capture_output=True, text=True, env=env)
+        self.assertEqual(off.returncode, 0, off.stdout + off.stderr)
+        self.assertIn("auto-upgrade: off", off.stdout)
 
 
 if __name__ == "__main__":

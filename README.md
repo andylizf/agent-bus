@@ -155,6 +155,35 @@ process group waits until `bus reconcile <id>` confirms or the owner stops it. `
 in. Rolling back from a build that does not start uses the previous build's own entry point:
 `~/.local/share/agent-bus/builds/<previous>/bin/bus upgrade --build ~/.local/share/agent-bus/builds/<previous>`.
 
+### Automatic upgrades
+
+Every install enables automatic upgrades by default. On the board host, `bus-auto-upgrade.timer` checks the
+public `andylizf/agent-bus` Git repository about 15 minutes after the timer starts and daily after that. Each
+account waits at least 24 hours from when it first sees an exact `vX.Y.Z` tag object and commit. Moving the tag
+starts a new wait. The updater verifies the fetched tag and commit again before installing the build and switching
+supervisors at their next pass. It only upgrades to a higher version and stays within the installed major version
+unless you run `bus auto-upgrade on --allow-major`.
+
+Anyone who can push tags to `andylizf/agent-bus` can run code in every account with automatic upgrades enabled
+after the 24-hour soak. To opt out at install, pass `--no-auto-upgrade` to `bin/install.sh`. For an existing
+install, run `bus auto-upgrade off`. Run `bus auto-upgrade on` to turn it back on with the same-major rule.
+
+For an install on v2.0.0 through v2.0.8, fetch and check out a release that includes automatic upgrades in
+`~/src/agent-bus`, then run this one-time command on the board host:
+
+```sh
+~/src/agent-bus/bin/bus upgrade --build ~/src/agent-bus
+```
+
+The checkout's `bus` sets up the timer as part of the switch. `bus doctor` shows the current tag or build ID,
+timer availability, last check and result. The timer requires a systemd user manager with linger enabled. If
+you set those up later, run `bus auto-upgrade on` to start the timer. Automatic upgrades record the source
+version, destination tag and time in `~/.local/state/agent-bus/auto-upgrade.json`.
+
+Each supervisor publishes its running tag or build ID in the entry's `build` field and in the heartbeat file
+under `agents/.heartbeat/`. Use `bus ls --json` to see the version on each running entry. The heartbeat's
+modification time records when the supervisor last checked in.
+
 ## Setup
 
 Run once, on the GPU host, as yourself (or let your agent run it):

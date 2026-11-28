@@ -1,18 +1,19 @@
 #!/bin/bash
 # Install `bus` for yourself from this checkout, pinned to a v2 board. Run as yourself; rerun to update.
-#   bin/install.sh --board <board-dir> [--no-timer]
+#   bin/install.sh --board <board-dir> [--no-timer] [--no-auto-upgrade]
 # Copies this checkout's build to ~/.local/share/agent-bus/builds/<commit12>/ (chmod go-w), points ~/.local/bin/bus at
 # it, records the board's path, inode and filesystem id in ~/.config/agent-bus/board.conf, and writes the adopt timer
 # (bus-adopt.timer, every 30 s on the board's host only: home directories may be shared across nodes). Nothing runs
 # from the board itself. Then run the setup block in README.md (enable the timer, `bus doctor`).
 set -eu
 src=$(cd "$(dirname "$0")/.." && pwd)
-board=""; timer=1
+board=""; timer=1; upgrade=_auto-upgrade-setup
 while [ $# -gt 0 ]; do
   case $1 in
     --board) board=$2; shift 2 ;;
     --no-timer) timer=""; shift ;;
-    *) echo "usage: $0 --board <board-dir> [--no-timer]"; exit 2 ;;
+    --no-auto-upgrade) upgrade=off; shift ;;
+    *) echo "usage: $0 --board <board-dir> [--no-timer] [--no-auto-upgrade]"; exit 2 ;;
   esac
 done
 [ -n "$board" ] || { echo "need --board <v2-board-dir>"; exit 2; }
@@ -56,6 +57,11 @@ WantedBy=timers.target
 UNIT
   systemctl --user daemon-reload 2>/dev/null || echo "note: no user manager reachable now; run the setup block on $host"
   echo "adopt timer written: $U/$name.timer (ConditionHost=$fqdn); enable it: systemctl --user enable --now $name.timer"
+fi
+if [ "$upgrade" = off ]; then
+  "$py" -IB "$bin" auto-upgrade off
+else
+  "$py" -IB "$bin" _auto-upgrade-setup
 fi
 cat <<EOF2
 

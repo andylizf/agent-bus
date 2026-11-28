@@ -21,6 +21,7 @@ STATE_VERSION = int(os.environ.get("AGENT_BUS_TEST_STATE_VERSION") or 1)
 NONTERMINAL = ("starting", "running", "waiting-handoff", "stopping", "leader-exited", "needs-reconcile")
 EXIT_RELEASED = 75
 LEADER_EXIT_GRACE_S = 10
+BUILD_RELEASE = "release.json"
 MAIN_STATUS_FIELDS = ("LoadState", "ActiveState", "ExecMainStatus", "ExecMainCode", "ExecMainExitTimestampMonotonic",
                       "MainPID", "InvocationID", "ControlGroup")
 
@@ -94,6 +95,14 @@ def build_root(path=None):
 
 def build_id(root=None):
     return os.path.basename(root or build_root())
+
+
+def build_release(root=None):
+    return core.read_private(os.path.join(root or build_root(), BUILD_RELEASE)) or {}
+
+
+def build_version(root=None):
+    return build_release(root).get("tag") or build_id(root)
 
 
 def own_bus():
@@ -825,6 +834,7 @@ class Supervisor:
         self.child = fallback_child      # fallback: (pid, pgid, pidfd) of the job the client forked
         self.lock = Locked(os.path.join(runs_dir(), f"{rid}.lock"))
         self.passes = 0
+        self.version = build_version()
         self.enoent = 0
         self.hooks = None
         self.s = None
@@ -839,7 +849,7 @@ class Supervisor:
         e = dict(id=s["id"], user=core.USER, host=s["host"], gpus=s.get("held_gpus") or s["gpus"], **{"class": s["class"]},
                  booking=s.get("booking"), run=s["run"], started=s["started"], until=s["until"], kind=s["kind"],
                  exclusive=bool(s.get("exclusive")), note=s.get("note") or "", state=s["entry_state"],
-                 schema=core.SCHEMA)
+                 schema=core.SCHEMA, build=self.version)
         if s.get("stop_cost_min") is not None:
             e["stop_cost_min"] = s["stop_cost_min"]
         if s.get("booking_revision"):
@@ -1643,7 +1653,7 @@ class Supervisor:
             if with_board and s["state"] in NONTERMINAL:
                 self.write_entry(board)
                 hb = board.wdir("agents", ".heartbeat")
-                core.touch(hb, self.rid)
+                core.touch(hb, self.rid, data=(self.version + "\n").encode())
             s["last_pass"] = t
             s["last_pass_s"] = round(time.monotonic() - t0, 3)
             s["max_pass_s"] = max(s.get("max_pass_s") or 0, s["last_pass_s"])

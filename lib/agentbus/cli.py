@@ -2,7 +2,7 @@
 import argparse, hashlib, json, os, secrets, shlex, shutil, subprocess, sys, time
 
 from . import bookings as bk
-from . import core, runner
+from . import auto_upgrade, core, runner
 from .core import Refused, now
 
 USAGE = """bus: coordinate a shared GPU host through a board directory (agent-bus v2)
@@ -11,7 +11,7 @@ USAGE = """bus: coordinate a shared GPU host through a board directory (agent-bu
   reading:   ls, cal, watch
   bookings:  book, unbook, object
   messages:  send, reply, mailbox
-  install:   doctor, upgrade, adopt --all, stop-hook, page
+  install:   doctor, upgrade, auto-upgrade, adopt --all, stop-hook, page
 """
 
 
@@ -323,11 +323,7 @@ def cmd_doctor(a):
 
     def check(name, ok, detail=""):
         checks.append(dict(check=name, ok=bool(ok), detail=detail))
-    try:
-        lin = subprocess.run(["loginctl", "show-user", core.USER, "-p", "Linger", "--value"], capture_output=True,
-                             text=True, timeout=10).stdout.strip()
-    except (OSError, subprocess.TimeoutExpired) as e:
-        lin = repr(e)
+    lin = auto_upgrade.linger_status()
     check("linger", lin == "yes", lin)
     um = runner.user_manager_ok()
     check("user manager", um, "systemd mode" if um else "fallback mode: no adoption, no hot update, no exec")
@@ -365,38 +361,50 @@ def cmd_doctor(a):
                               f"and GPUs stay held; needs Linux 5.3+ and Python 3.9+")
     rc, o, _ = runner.sysctl("is-enabled", "bus-adopt.timer")
     check("adopt timer", o.strip() == "enabled", o.strip() or "not installed")
-    check("build", os.path.exists(core.BIN()), f"{core.BIN()} -> {runner.installed_build()}; this {runner.build_id()}")
+    running = runner.build_version()
+    check("build", os.path.exists(core.BIN()), f"{core.BIN()} -> {runner.installed_build()}; this {running}")
+    upgrade = auto_upgrade.doctor(um, lin == "yes")
     if a.json:
-        out(dict(ok=all(c["ok"] for c in checks), checks=checks))
+        out(dict(ok=all(c["ok"] for c in checks), checks=checks, build_version=running, auto_upgrade=upgrade))
     else:
         for c in checks:
             print(f"{'ok  ' if c['ok'] else 'FAIL'} {c['check']}: {c['detail']}")
+        last = upgrade["last_check"]
+        checked = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(last)) if last is not None else "never"
+        current = upgrade["current_tag"] or upgrade["current_build"] or "none"
+        print(f"auto-upgrade: {'on' if upgrade['enabled'] else 'off'} (timer {upgrade['timer']})")
+        print(f"  current tag or build: {current}; last check: {checked}; last result: {upgrade['last_result'] or '-'}")
     return 0 if all(c["ok"] for c in checks) else 1
 
 
-def copy_build(src):
-    """Copy a source tree into builds/<id> (id: the git commit's first 12, else a content hash) and return it."""
+def copy_build(src, release=None):
+    """Copy a source tree into builds/<id> and return the path of the staged build."""
     src = os.path.realpath(src)
     if not (os.path.isfile(os.path.join(src, "bin", "bus")) and os.path.isdir(os.path.join(src, "lib", "agentbus"))):
         raise Refused(f"{src} is not an agent-bus build (bin/bus and lib/agentbus/)")
     builds = core.BUILDS()
     if os.path.dirname(src) == os.path.realpath(builds):
         return src
-    try:
-        bid = subprocess.run(["git", "-C", src, "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True,
-                             timeout=10).stdout.strip()
-        dirty = subprocess.run(["git", "-C", src, "status", "--porcelain", "--", "bin", "lib"], capture_output=True,
-                               text=True, timeout=10).stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
-        bid, dirty = "", ""
-    h = hashlib.sha256()
-    for d, _, files in sorted(os.walk(os.path.join(src, "lib"))):
-        for f in sorted(files):
-            if f.endswith(".py"):
-                h.update(open(os.path.join(d, f), "rb").read())
-    h.update(open(os.path.join(src, "bin", "bus"), "rb").read())
-    if not bid or dirty:
-        bid = (bid + "-" if bid else "") + "w" + h.hexdigest()[:8]
+    if release is not None:
+        # Keep verified releases distinct from builds copied from local worktrees.
+        bid = f"release-{release['commit']}-{release['tag']}"
+    else:
+        try:
+            bid = auto_upgrade.git("-C", src, "rev-parse", "--short=12", "HEAD")
+            dirty = auto_upgrade.git("-C", src, "status", "--porcelain", "--", "bin", "lib")
+        except Refused:
+            bid, dirty = "", ""
+        if not bid or dirty:
+            h = hashlib.sha256()
+            for d, _, files in sorted(os.walk(os.path.join(src, "lib"))):
+                for f in sorted(files):
+                    if f.endswith(".py"):
+                        with open(os.path.join(d, f), "rb") as stream:
+                            h.update(stream.read())
+            with open(os.path.join(src, "bin", "bus"), "rb") as stream:
+                h.update(stream.read())
+            bid = (bid + "-" if bid else "") + "w" + h.hexdigest()[:8]
+        release = auto_upgrade.source_release(src, dirty) if bid and not bid.startswith("w") else {}
     dest = os.path.join(builds, bid)
     if not os.path.isdir(dest):
         os.makedirs(builds, exist_ok=True)
@@ -405,6 +413,8 @@ def copy_build(src):
         for part in ("bin", "lib"):
             shutil.copytree(os.path.join(src, part), os.path.join(tmp, part),
                             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        if release:
+            core.write_private(os.path.join(tmp, runner.BUILD_RELEASE), release)
         for d, dirs, files in os.walk(tmp):
             for n in dirs + files:
                 p = os.path.join(d, n)
@@ -423,14 +433,36 @@ def flip(build):
 
 
 def cmd_upgrade(a):
-    build = copy_build(a.build)
-    before = runner.installed_build()
-    flip(build)
+    with auto_upgrade.lock():
+        auto_upgrade.settle()
+        build = copy_build(a.build)
+        before = runner.installed_build()
+        prior = runner.build_root(core.BIN())
+        feature = os.path.join("lib", "agentbus", "auto_upgrade.py")
+        timer = None
+        if before and not os.path.isfile(os.path.join(prior, feature)) and os.path.isfile(os.path.join(build, feature)):
+            timer = auto_upgrade.sync_timer()
+        flip(build)
     live = [r["id"] for r in runner.cmd_runs() if r["state"] in runner.NONTERMINAL and r.get("host") == core.HOST]
     res = dict(previous=before, installed=os.path.basename(build), supervisors=live)
+    if timer is not None:
+        res["auto_upgrade"] = timer
     if a.json:
         return out(res)
     print(f"installed {res['installed']} (was {before}); {len(live)} supervisor(s) exec it at their next pass")
+    if timer is not None:
+        print(f"auto-upgrade: {timer}")
+
+
+def cmd_auto_upgrade(a):
+    if a.allow_major and a.action != "on":
+        raise Refused("use --allow-major with auto-upgrade on")
+    if a.action != "check":
+        print(f"auto-upgrade: {auto_upgrade.configure(a.action, a.allow_major)}")
+        return
+    result, code = auto_upgrade.check(copy_build, flip)
+    print(f"auto-upgrade: {result}")
+    return code
 
 
 def cmd_setup_board(a):
@@ -450,8 +482,10 @@ def cmd_setup_board(a):
 def cmd_install(a):
     """`bus _install --board DIR` (install.sh calls it): copy the build, flip the entry point, pin the board by inode
     and filesystem id in ~/.config/agent-bus/board.conf."""
-    build = copy_build(a.src)
-    flip(build)
+    with auto_upgrade.lock():
+        auto_upgrade.settle()
+        build = copy_build(a.src)
+        flip(build)
     conf = core.load_conf()
     b = core.Board(os.path.abspath(a.board))
     conf.update(path=b.path, inode=str(b.ino), fsid=str(b.fsid), host=b.host or "")
@@ -578,6 +612,10 @@ def parser():
     s = p("upgrade", cmd_upgrade, "install a build and flip ~/.local/bin/bus; supervisors exec it")
     s.add_argument("--build", required=True)
     s.add_argument("--json", action="store_true")
+    s = p("auto-upgrade", cmd_auto_upgrade, "turn automatic upgrades on or off, or check now")
+    s.add_argument("action", choices=("on", "off", "check"))
+    s.add_argument("--allow-major", action="store_true")
+    p("_auto-upgrade-setup", lambda a: print(f"auto-upgrade: {auto_upgrade.configure('setup')}"))
     s = p("_setup-board", cmd_setup_board)
     s.add_argument("board")
     s.add_argument("target", nargs="?", default=None)

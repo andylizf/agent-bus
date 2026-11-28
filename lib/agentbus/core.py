@@ -309,17 +309,20 @@ def replace(dirfd, name, data, mode=0o644):
         raise
 
 
-def touch(dirfd, name, mode=0o644):
-    """Touch one's own file through an O_NOFOLLOW descriptor; the mode is set only on a file this call creates. False
-    when the file there is not ours or not regular."""
-    flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+def touch(dirfd, name, mode=0o644, data=None):
+    """Refresh one's own regular file, updating its payload when supplied and changed."""
+    access = os.O_WRONLY if data is None else os.O_RDWR
+    flags = access | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
     created = False
     try:
-        fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dirfd)
-        created = True
-    except FileExistsError:
+        fd = os.open(name, flags, dir_fd=dirfd)
+    except FileNotFoundError:
         try:
-            fd = os.open(name, flags, dir_fd=dirfd)
+            if data is not None:
+                publish(dirfd, name, data, mode)
+                return True
+            fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dirfd)
+            created = True
         except OSError:
             return False
     except OSError:
@@ -328,6 +331,9 @@ def touch(dirfd, name, mode=0o644):
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != UID:
             return False
+        if data is not None and os.pread(fd, len(data) + 1, 0) != data:
+            replace(dirfd, name, data, mode)
+            return True
         if created:
             os.fchmod(fd, mode)
         os.utime(fd)
