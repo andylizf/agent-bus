@@ -247,8 +247,17 @@ if sys.argv[1] == '_upgrade-probe':
         self.assertFalse(au.doctor(False, False)["enabled"])
 
     def test_manual_switch_from_legacy_build_bootstraps_timer(self):
+        source = self.root / "upgrade-source"
+        au.git("init", "--quiet", str(source))
+        checkout = ("-C", str(source), "-c", "user.name=Test", "-c", "user.email=test@example.org")
+        au.git(*checkout, "commit", "--quiet", "--allow-empty", "-m", "Legacy release")
+        au.git(*checkout, "tag", "v2.0.8")
+        for part in ("bin", "lib"):
+            shutil.copytree(REPO / part, source / part, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        au.git(*checkout, "add", "bin", "lib")
+        au.git(*checkout, "commit", "--quiet", "-m", "Build with automatic upgrade support")
         env = dict(os.environ, AGENT_BUS_SYSTEMD="off")
-        proc = subprocess.run([sys.executable, "-IB", str(REPO / "bin" / "bus"), "upgrade", "--build", str(REPO),
+        proc = subprocess.run([sys.executable, "-IB", str(source / "bin" / "bus"), "upgrade", "--build", str(source),
                                "--json"], capture_output=True, text=True, timeout=10, env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         result = json.loads(proc.stdout)
@@ -256,7 +265,7 @@ if sys.argv[1] == '_upgrade-probe':
         self.assertIn("timer unavailable", result["auto_upgrade"])
         self.assertTrue((au.unit_dir() / "bus-auto-upgrade.timer").exists())
         self.assertEqual(runner.installed_build(), result["installed"])
-        self.assertEqual(runner.build_release(runner.build_root(core.BIN()))["base"], "v2.0.8")
+        self.assertEqual(runner.build_release(runner.build_root(core.BIN())), {"base": "v2.0.8"})
 
     def test_real_git_peels_and_fetches_annotated_tag(self):
         repo, src = str(self.root / "repo"), str(self.root / "fetch")
