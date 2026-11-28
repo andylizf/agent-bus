@@ -34,6 +34,7 @@ class AutoUpgrade(unittest.TestCase):
         self.calls = []
         self.broken = False
         self.list_delay = 0
+        self.delete_during_fetch = False
 
     def install_current(self, tag):
         target = self.root / "builds" / tag
@@ -59,6 +60,8 @@ class AutoUpgrade(unittest.TestCase):
         if action == "-c":
             self.assertEqual(args[3:5], ("fetch.fsckObjects=true", "fetch"))
             self.assertEqual(args[-2], au.REPO)
+            if self.delete_during_fetch:
+                raise core.Refused(f"git exited 128: fatal: couldn't find remote ref {args[-1]}")
             self.fetch = self.tags[args[-1].removeprefix("refs/tags/")] if self.fetch is None else self.fetch
             return ""
         if action == "rev-parse":
@@ -164,6 +167,19 @@ if sys.argv[1] == '_upgrade-probe':
         self.assertEqual(au.doctor(False, False)["last_result"], result)
         self.assertEqual(runner.installed_build(), "v2.0.8")
 
+    def test_explicit_fetch_deletion_forgets_observation_even_if_tag_returns_unchanged(self):
+        self.tags["v2.0.9"] = ("a" * 40, "a" * 40)
+        self.check()
+        self.now += au.SOAK_S
+        self.delete_during_fetch = True
+        result, rc = self.check()
+        self.assertEqual(rc, 1)
+        self.assertIn("disappeared during fetch", result)
+        self.assertNotIn("v2.0.9", au.read_state()["seen"])
+        self.delete_during_fetch = False
+        self.assertEqual(self.check(), ("waiting for the 24 h soak", 0))
+        self.assertEqual(au.read_state()["seen"]["v2.0.9"]["first"], self.now)
+
     def test_network_failure_and_busy_lock(self):
         with patch.object(au, "git", side_effect=core.Refused("no network")):
             self.assertEqual(au.check(cli.flip), ("failed: no network", 1))
@@ -219,10 +235,11 @@ if sys.argv[1] == '_upgrade-probe':
             service = (au.unit_dir() / "bus-auto-upgrade.service").read_text()
             self.assertIn(f"ConditionHost={core.HOST}", timer)
             self.assertIn("OnActiveSec=15min\nOnUnitActiveSec=1d", timer)
-            self.assertIn(f'"{au.driver()}" _auto-upgrade-timer', service)
-            self.assertIn(f'"{au.driver()}" _auto-upgrade-recover', service)
+            self.assertIn(f'"{au.service_entry()}" _auto-upgrade-timer', service)
+            self.assertIn(f'"{au.service_entry()}" _auto-upgrade-recover', service)
             adopt = (au.unit_dir() / "bus-adopt.service.d" / "auto-upgrade.conf").read_text()
-            self.assertIn(f'"{au.driver()}" adopt --all', adopt)
+            self.assertIn(f'"{au.service_entry()}" adopt --all', adopt)
+            self.assertIn(f"TimeoutStartSec={au.RECOVERY_TIMEOUT_S}", adopt)
             self.assertEqual(au.configure("off"), "off")
             systemctl.assert_called_with("disable", "--now", "bus-auto-upgrade.timer")
         self.assertEqual(self.check(), ("off", 0))
@@ -254,6 +271,9 @@ if sys.argv[1] == '_upgrade-probe':
             oid, commit = au.release_refs()["v2.0.9"]
             self.assertNotEqual(oid, commit)
             au.fetch(src, "v2.0.9", oid, commit)
+            au.git("-C", repo, "tag", "-d", "v2.0.9")
+            with self.assertRaisesRegex(au.TagDeleted, "v2.0.9 disappeared during fetch"):
+                au.fetch(str(self.root / "deleted"), "v2.0.9", oid, commit)
         self.assertFalse(Path(src, "committed").exists())
         self.assertEqual(au.git("-C", src, "show", f"{commit}:committed"), "tagged tree")
 
@@ -324,21 +344,21 @@ if sys.argv[1] == '_upgrade-probe':
         status = json.loads(proc.stdout)["auto_upgrade"]
         self.assertIn("loginctl enable-linger", status["timer"])
         self.assertEqual(runner.build_release(str(target)), {"legacy_build": target.name})
-        self.assertEqual(os.path.realpath(au.driver()), str(target / "bin" / "bus"))
+        self.assertTrue(Path(au.service_entry()).is_file())
         self.assertTrue((au.unit_dir() / "bus-auto-upgrade.timer").is_file())
         self.assertTrue((au.unit_dir() / "timers.target.wants" / "bus-auto-upgrade.timer").is_symlink())
 
     def test_known_good_timer_recovers_abandoned_switch_with_broken_cli(self):
         old = self.copy_without_release_metadata()
         cli.flip(str(old))
-        au.link_to_build(au.driver(), str(old))
+        au.install_timer()
         bad = self.root / "builds" / "bad"
         (bad / "bin").mkdir(parents=True)
         (bad / "bin" / "bus").write_text("raise SystemExit(7)\n")
         core.write_private(au.state_file(), dict(pending={"previous": str(old), "from": "v2.0.8", "to": "v2.0.9",
                                                          "commit": "b" * 40, "build": "bad"}))
         cli.flip(str(bad))
-        proc = subprocess.run([sys.executable, "-IB", au.driver(), "_auto-upgrade-recover"], capture_output=True,
+        proc = subprocess.run([sys.executable, "-IB", au.service_entry(), "_auto-upgrade-recover"], capture_output=True,
                               text=True, env=dict(os.environ, AGENT_BUS_SYSTEMD="off"), timeout=10)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(runner.installed_build(), old.name)
@@ -363,15 +383,75 @@ if sys.argv[1] == '_upgrade-probe':
             self.assertEqual(runner.cmd_adopt_all(), [{"started": True}])
         self.assertNotIn("pending", au.read_state())
 
-    def test_manual_rollback_moves_service_driver(self):
-        old = self.copy_without_release_metadata()
-        new = old.with_name("new")
-        shutil.copytree(old, new)
-        cli.flip(str(new))
-        au.link_to_build(au.driver(), str(new))
-        cli.cmd_upgrade(Mock(build=str(old), json=True))
-        self.assertEqual(runner.installed_build(), old.name)
-        self.assertEqual(os.path.realpath(au.driver()), str(old / "bin" / "bus"))
+    def test_services_follow_bus_after_legacy_only_rollback(self):
+        au.install_timer()
+        legacy = Path(core.BUILDS(), "v2.0.8", "bin", "bus")
+        legacy.write_text("""import os, sys
+from pathlib import Path
+if sys.argv[1] == 'upgrade':
+    link = Path(os.environ['AGENT_BUS_BIN'])
+    temp = link.with_suffix('.new')
+    temp.symlink_to(Path(sys.argv[3], 'bin', 'bus'))
+    temp.replace(link)
+elif sys.argv[1] == 'adopt':
+    print('legacy adopt')
+else:
+    raise SystemExit(7)
+""")
+        bad = self.root / "builds" / "bad"
+        (bad / "bin").mkdir(parents=True)
+        (bad / "bin" / "bus").write_text("raise SystemExit(8)\n")
+        cli.flip(str(bad))
+        command = [sys.executable, "-IB"]
+        subprocess.run([*command, str(legacy), "upgrade", "--build", str(legacy.parents[1])], check=True, timeout=5)
+        adopt = subprocess.run([*command, au.service_entry(), "adopt", "--all"], capture_output=True,
+                               text=True, check=True, timeout=5)
+        self.assertEqual(adopt.stdout.strip(), "legacy adopt")
+        upgrade = subprocess.run([*command, au.service_entry(), "_auto-upgrade-timer"], capture_output=True,
+                                 text=True, check=True, timeout=5)
+        self.assertIn("predates automatic upgrades", upgrade.stdout)
+        Path(au.state_file()).write_text("unreadable journal")
+        adopt = subprocess.run([*command, au.service_entry(), "adopt", "--all"], capture_output=True,
+                               text=True, check=True, timeout=5)
+        self.assertEqual(adopt.stdout.strip(), "legacy adopt")
+
+    def test_rollback_adopts_and_verifies_each_live_run_with_no_adopt_timer(self):
+        previous = runner.build_root(core.BIN())
+        self.install_current("v2.0.9")
+        active = {"run-a": "generation-a", "run-b": "generation-b"}
+        pending = {"previous": previous, "from": "v2.0.8", "to": "v2.0.9", "build": "v2.0.9",
+                   "commit": "b" * 40, "runs": active}
+        core.private_dir()
+        state = dict(pending=pending)
+
+        def verify(build, runs):
+            self.assertEqual((build, runs), ("v2.0.8", active))
+            self.assertEqual(runner.installed_build(), "v2.0.8")
+            self.assertIn("pending", au.read_state())
+
+        with patch.object(runner, "adopt_runs") as adopt, patch.object(au, "wait_for_takeover", side_effect=verify):
+            result = au.rollback(state, cli.flip, "candidate supervisor exited")
+            adopt.assert_called_once_with(only=set(active))
+        self.assertIn("previous build supervising all live runs", result)
+        self.assertNotIn("pending", au.read_state())
+
+    def test_rollback_records_unhealthy_restored_supervisor_and_can_resume(self):
+        previous = runner.build_root(core.BIN())
+        self.install_current("v2.0.9")
+        commit = "b" * 40
+        pending = {"previous": previous, "from": "v2.0.8", "to": "v2.0.9", "build": "v2.0.9",
+                   "commit": commit, "runs": {"run-a": "generation"}}
+        core.private_dir()
+        with patch.object(runner, "adopt_runs"), patch.object(au, "wait_for_takeover") as verify:
+            verify.side_effect = core.Refused("takeover deadline expired for run-a")
+            result = au.rollback(dict(pending=pending), cli.flip, "candidate died")
+            self.assertIn("rollback recovery failed: takeover deadline expired for run-a", result)
+            self.assertIn("pending", au.read_state())
+            self.assertEqual(runner.installed_build(), "v2.0.8")
+            verify.side_effect = None
+            self.assertIn("previous build supervising all live runs", au.settle(cli.flip))
+        self.assertNotIn("pending", au.read_state())
+        self.assertEqual(au.read_state()["retries"][commit]["attempts"], 1)
 
     def test_exclusive_upgrade_lock_keeps_launch_from_writing_run_state(self):
         command = [sys.executable, "-IB", str(REPO / "bin" / "bus"), "run", "--gpus", "0", "--", "true"]

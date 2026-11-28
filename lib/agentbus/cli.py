@@ -434,6 +434,8 @@ def flip(build):
 def cmd_upgrade(a):
     with auto_upgrade.lock():
         auto_upgrade.settle(flip)
+        if auto_upgrade.read_state().get("pending"):
+            raise Refused("previous upgrade recovery is incomplete; see bus doctor")
         build = copy_build(a.build)
         before = runner.installed_build()
         prior = runner.build_root(core.BIN())
@@ -442,18 +444,8 @@ def cmd_upgrade(a):
         timer = None
         if before and capable and not os.path.isfile(os.path.join(prior, feature)):
             auto_upgrade.probe(build, [])
-            timer = auto_upgrade.sync_timer(build)
+            timer = auto_upgrade.sync_timer()
         flip(build)
-        if timer is None and os.path.exists(auto_upgrade.driver()):
-            if capable:
-                try:
-                    auto_upgrade.probe(build, [])
-                    auto_upgrade.link_to_build(auto_upgrade.driver(), build)
-                except Refused as e:
-                    print(f"bus: kept the previous timer driver: {e}", file=sys.stderr)
-            else:
-                auto_upgrade.sync_timer(available=False)
-                auto_upgrade.link_to_build(auto_upgrade.driver(), build)
     live = [r["id"] for r in runner.cmd_runs() if r["state"] in runner.NONTERMINAL and r.get("host") == core.HOST]
     res = dict(previous=before, installed=os.path.basename(build), supervisors=live)
     if timer is not None:
@@ -521,6 +513,8 @@ def cmd_install(a):
     and filesystem id in ~/.config/agent-bus/board.conf."""
     with auto_upgrade.lock():
         auto_upgrade.settle(flip)
+        if auto_upgrade.read_state().get("pending"):
+            raise Refused("previous upgrade recovery is incomplete; see bus doctor")
         build = copy_build(a.src)
         flip(build)
     conf = core.load_conf()

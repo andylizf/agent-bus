@@ -2178,8 +2178,8 @@ def cmd_adopt_all():
         if not recovery.acquire():
             return []
         try:
-            recovered = auto_upgrade.settle(lambda build: auto_upgrade.link_to_build(core.BIN(), build), stale_only=True)
-            if not recovered and auto_upgrade.read_state().get("pending"):
+            auto_upgrade.settle(lambda build: auto_upgrade.link_to_build(core.BIN(), build), stale_only=True)
+            if auto_upgrade.read_state().get("pending"):
                 return []
         finally:
             recovery.release()

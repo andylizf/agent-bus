@@ -22,7 +22,8 @@ TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 OID = re.compile(r"[0-9a-f]{40}")
 PASS_ALLOWANCE_S = 6 * 60  # Up to two 60 s GPU views plus systemd, admission and hook waits in a pass.
 TAKEOVER_S = 2 * PASS_ALLOWANCE_S + 60
-SERVICE_TIMEOUT_S = 30 * 60
+SERVICE_TIMEOUT_S = 45 * 60  # Allows a candidate trial and a full rollback verification.
+RECOVERY_TIMEOUT_S = TAKEOVER_S + 2 * 60
 PENDING_STALE_S = TAKEOVER_S + 5 * 60  # Includes the probes before and after the switch.
 RETRY_DELAYS_S = (15 * 60, 60 * 60)
 WITHDRAWALS = "auto-upgrade-withdrawn"
@@ -35,6 +36,12 @@ class TagChanged(Refused):
                          f"got {actual[0]} ({actual[1]})")
 
 
+class TagDeleted(Refused):
+    def __init__(self, tag):
+        self.tag = tag
+        super().__init__(f"{tag} disappeared during fetch")
+
+
 def version(tag):
     match = TAG.fullmatch(tag)
     return tuple(map(int, match.groups())) if match else None
@@ -42,7 +49,7 @@ def version(tag):
 
 def git(*args, binary=False):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0")
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0", LC_ALL="C")
     return run("git", "-c", "credential.helper=", "-c", "http.followRedirects=false", *args, env=env, binary=binary)
 
 
@@ -75,7 +82,12 @@ def release_refs():
 def fetch(src, tag, oid, commit):
     ref = f"refs/tags/{tag}"
     git("init", "--quiet", "--template=", src)
-    git("-C", src, "-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--depth=1", "--no-tags", REPO, ref)
+    try:
+        git("-C", src, "-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--depth=1", "--no-tags", REPO, ref)
+    except Refused as e:
+        if str(e).partition("\n")[0].endswith(f"fatal: couldn't find remote ref {ref}"):
+            raise TagDeleted(tag) from e
+        raise
     actual_oid = git("-C", src, "rev-parse", "FETCH_HEAD")
     try:
         actual_commit = git("-C", src, "rev-parse", "FETCH_HEAD^{commit}")
@@ -172,8 +184,8 @@ def linger_status():
         return repr(e)
 
 
-def driver():
-    return os.path.join(core.STATE(), "upgrade-driver")
+def service_entry():
+    return os.path.join(core.STATE(), "service-entry.py")
 
 
 def link_to_build(link, build):
@@ -196,7 +208,7 @@ def bootstrap():
     metadata = Path(build, runner.BUILD_RELEASE)
     if metadata.is_file():
         current = runner.build_release(build)
-        if "legacy_build" not in current or os.path.exists(driver()) or settings().get("enabled") == "off":
+        if "legacy_build" not in current or os.path.exists(service_entry()) or settings().get("enabled") == "off":
             return
     upgrade_lock = lock()
     if not upgrade_lock.acquire():
@@ -205,7 +217,7 @@ def bootstrap():
         if not metadata.is_file():
             bid = runner.build_id(build)
             core.write_private(metadata, {"legacy_build": bid})
-        sync_timer(build)
+        sync_timer()
     finally:
         upgrade_lock.release()
 
@@ -220,23 +232,35 @@ def install_timer():
     core.component(fqdn, "board host")
     units = unit_dir()
     units.mkdir(parents=True, exist_ok=True)
+    entry = service_entry()
+    path = os.path.join(runner.build_root(), "bin", "service-entry.py")
+    core.private_dir()
+    tmp = entry + f".new{secrets.token_hex(3)}"
+    try:
+        shutil.copyfile(path, tmp)
+        os.replace(tmp, entry)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     name = unit_name()
     env = "\n".join(f"Environment={json.dumps(key + '=' + os.environ[key].replace('%', '%%'))}"
                     for key in ("AGENT_BUS_BIN", "AGENT_BUS_CONFIG", "AGENT_BUS_STATE", "AGENT_BUS_BUILDS",
                                 "AGENT_BUS_UNIT_PREFIX") if key in os.environ)
     executable = " ".join(json.dumps(p.replace("%", "%%").replace("$", "$$"))
-                          for p in (sys.executable, "-IB", driver()))
+                          for p in (sys.executable, "-IB", entry))
     unit = f"[Unit]\nDescription=agent-bus automatic upgrade\nConditionHost={fqdn}\n"
     (units / f"{name}.service").write_text(
         f"{unit}\n[Service]\nType=oneshot\n{env}\nExecStart={executable} _auto-upgrade-timer\n"
-        f"ExecStopPost={executable} _auto-upgrade-recover\nTimeoutStartSec={SERVICE_TIMEOUT_S}\n")
+        f"ExecStopPost={executable} _auto-upgrade-recover\nTimeoutStartSec={SERVICE_TIMEOUT_S}\n"
+        f"TimeoutStopSec={RECOVERY_TIMEOUT_S}\n")
     (units / f"{name}.timer").write_text(
         f"{unit}\n[Timer]\nOnActiveSec=15min\nOnUnitActiveSec=1d\n\n[Install]\nWantedBy=timers.target\n")
     adopt = core.component(os.environ.get("AGENT_BUS_TIMER") or "bus-adopt", "adopt unit")
     if (units / f"{adopt}.service").is_file():
         drop_in = units / f"{adopt}.service.d"
         drop_in.mkdir(exist_ok=True)
-        (drop_in / "auto-upgrade.conf").write_text(f"[Service]\nExecStart=\nExecStart={executable} adopt --all\n")
+        (drop_in / "auto-upgrade.conf").write_text(
+            f"[Service]\nExecStart=\nExecStart={executable} adopt --all\nTimeoutStartSec={RECOVERY_TIMEOUT_S}\n")
 
 
 def lock(shared=False):
@@ -253,12 +277,10 @@ def configure(action, allow_major=False):
         return sync_timer()
 
 
-def sync_timer(build=None, available=True):
-    enabled = available and settings().get("enabled") != "off"
+def sync_timer():
+    enabled = settings().get("enabled") != "off"
     timer = unit_name() + ".timer"
     if enabled:
-        if build or not os.path.exists(driver()):
-            link_to_build(driver(), build or runner.build_root(core.BIN()))
         install_timer()
     elif not (unit_dir() / timer).exists():
         return "off"
@@ -325,11 +347,31 @@ def rollback(state, flip, reason):
     pending = state["pending"]
     if "failure" not in pending:
         pending["failure"] = reason
-        state["last_result"] = record_failure(state, pending["to"], pending["commit"], pending["build"], reason)
+        pending["failure_result"] = record_failure(state, pending["to"], pending["commit"], pending["build"], reason)
+    result = pending.get("failure_result") or state["last_result"]
+    state["last_result"] = result
     core.write_private(state_file(), state)
-    if runner.build_root(core.BIN()) != pending["previous"]:
-        flip(pending["previous"])
-    del state["pending"]
+    try:
+        previous = pending["previous"]
+        current = runner.build_root(core.BIN())
+        if current != previous and os.path.basename(current) == pending["build"]:
+            flip(previous)
+        elif current != previous:
+            # The operator used another entry point while the trial was pending.
+            state["last_result"] = f"{result}; kept operator-selected build {os.path.basename(current)}"
+            del state["pending"]
+            core.write_private(state_file(), state)
+            return state["last_result"]
+        active = pending.get("runs")
+        if active is None:
+            active = {r["id"]: r["run"] for r in live_runs() if r["mode"] == "systemd"}
+        if active:
+            runner.adopt_runs(only=set(active))
+            wait_for_takeover(os.path.basename(previous), active)
+            state["last_result"] = f"{result}; previous build supervising all live runs"
+        del state["pending"]
+    except (OSError, Refused) as e:
+        state["last_result"] = f"{result}; rollback recovery failed: {e}"
     core.write_private(state_file(), state)
     return state["last_result"]
 
@@ -476,7 +518,7 @@ def check(flip):
                 return state["last_result"], 0
             runs = live_runs()
             active = {r["id"]: r["run"] for r in runs if r["mode"] == "systemd"}
-            pending["time"] = wall_time()
+            pending.update(time=wall_time(), runs=active)
             state["pending"] = pending
             state.pop("last_result", None)
             core.write_private(state_file(), state)
@@ -488,7 +530,7 @@ def check(flip):
             flip(build)
             wait_for_takeover(pending["build"], active)
             probe(build, [r["id"] for r in live_runs()])
-            entry = {k: v for k, v in pending.items() if k != "previous"}
+            entry = {k: v for k, v in pending.items() if k not in ("previous", "runs")}
             entry["time"] = wall_time()
             confirmed = dict(state, last_result=f"upgraded {pending['from']} to {pending['to']}",
                              upgrades=state.get("upgrades", []) + [entry])
@@ -502,17 +544,17 @@ def check(flip):
             state["last_result"] = f"failed: {e}; 24 h soak restarted"
             core.write_private(state_file(), state)
             return state["last_result"], 1
+        except TagDeleted as e:
+            state.setdefault("seen", {}).pop(e.tag, None)
+            state["last_result"] = f"failed: {e}; cleared its soak observation"
+            core.write_private(state_file(), state)
+            return state["last_result"], 1
         except (OSError, Refused) as e:
             if "pending" in state:
                 return rollback(state, flip, str(e)), 1
             state["last_result"] = f"failed: {e}"
             core.write_private(state_file(), state)
             return state["last_result"], 1
-        try:
-            link_to_build(driver(), build)
-        except OSError as e:
-            # The confirmed build is installed. The old, healthy driver can still run the next check.
-            print(f"bus: upgrade driver kept at its previous build: {e}", file=sys.stderr)
         return confirmed["last_result"], 0
     finally:
         upgrade_lock.release()

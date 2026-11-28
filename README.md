@@ -170,12 +170,15 @@ the old pass and the new pass, plus one minute for re-exec or adoption. A pass c
 serial GPU queries, with the rest of the allowance for systemd, admission, and hook waits. An existing run can
 report a healthy pass from its re-executed supervisor or from a supervisor adopted by the new build.
 
-The timer and `bus auto-upgrade check` start the same systemd service. The service keeps its previous entry
-point until it confirms takeover. A failed or interrupted switch restores the previous build. If the recovery
-hook leaves a switch pending, the adopt service recovers it after 18 minutes. Failed commits can retry after
-15 minutes and then one hour. A third failure quarantines the commit. A manual rollback also moves the service
-entry point to the selected build. New launches share the updater's lock during download. The updater takes it
-exclusively before switching builds, so a launch already in progress defers the switch.
+The timer and `bus auto-upgrade check` start the same systemd service. Both user services follow the installed
+`bus` entry point. While a switch is pending, the launcher uses the previous build for recovery. A failed or
+interrupted switch restores the previous build and waits for healthy supervisors on every live run. This also
+works with `--no-timer`, which skips periodic adoption and leaves automatic upgrades enabled. If recovery
+cannot verify a supervisor, `bus doctor` reports which run is waiting. The adopt service can resume recovery
+after 18 minutes. Failed commits can retry after 15 minutes and then one hour. A third failure quarantines the
+commit. Rolling back to a build that predates automatic upgrades restores adoption and leaves upgrade checks
+idle. New launches share the updater's lock during download. The updater takes it exclusively before switching
+builds, so a launch already in progress defers the switch.
 
 To recall a release, remove its tag from the public repository and publish the replacement under a higher version.
 A release can also include a root-level `auto-upgrade-withdrawn` file listing older `vX.Y.Z` tags, one per line.
@@ -205,6 +208,10 @@ unavailable. Automatic upgrades record the source version, destination tag and t
 Each supervisor publishes its running tag or build ID in the entry's `build` field and in the heartbeat file
 under `agents/.heartbeat/`. Use `bus ls --json` to see the version on each running entry. The heartbeat's
 modification time records when the supervisor last checked in.
+
+On the board host, run `python3 tools/auto_upgrade_gate.py` from the release checkout to verify rollback with
+systemd. The gate creates a temporary board, a sleep job, and a deliberately broken candidate. It checks the
+same job invocation and PID, a fresh heartbeat from the restored build, and adoption through the service launcher.
 
 ## Setup
 
