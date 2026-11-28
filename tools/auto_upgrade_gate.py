@@ -18,6 +18,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 
+def healthy_supervisor_pid(supervisor, build_id, after_ns, proc_identity):
+    if (supervisor.get("code") != build_id or not supervisor.get("healthy")
+            or supervisor.get("completed_ns", 0) <= after_ns):
+        return None
+    identity = {key: supervisor[key] for key in ("pid", "ticks", "boot_id")}
+    return identity["pid"] if proc_identity(identity["pid"]) == identity else None
+
+
 def main():
     argparse.ArgumentParser(description=__doc__).parse_args()
     if not sys.platform.startswith("linux"):
@@ -141,16 +149,18 @@ def main():
 
             original_job = job_identity()
 
-            def healthy_after(build, label, mtime):
+            def healthy_after(build, label, mtime, after_ns):
                 state = runner.load_state(rid)
                 sup = state.get("supervisor") or {}
-                if sup.get("code") != runner.build_id(build) or not sup.get("healthy") or not heartbeat.exists():
-                    return None
-                if heartbeat.stat().st_mtime_ns <= mtime or heartbeat.read_text().strip() != label:
-                    return None
                 self.assertEqual(state["run"], info["run"])
-                self.assertEqual(core.proc_identity(sup["pid"]), {k: sup[k] for k in ("pid", "ticks", "boot_id")})
-                return sup["pid"]
+                pid = healthy_supervisor_pid(sup, runner.build_id(build), after_ns, core.proc_identity)
+                if pid is None:
+                    return None
+                try:
+                    if heartbeat.stat().st_mtime_ns > mtime and heartbeat.read_text().strip() == label:
+                        return pid
+                except FileNotFoundError:
+                    return None
 
             def candidate(name, injected):
                 source = self.tmp / name
@@ -167,19 +177,21 @@ def main():
                         patch.object(auto_upgrade, "TAKEOVER_S", 15):
                     return auto_upgrade.check(cli.flip)
 
-            self.wait_for(lambda: healthy_after(previous, version, 0), "initial healthy supervisor")
+            self.wait_for(lambda: healthy_after(previous, version, 0, 0), "initial healthy supervisor")
             marker = self.tmp / "candidate-reached-supervise"
             bad = candidate("broken-candidate", "import sys\nfrom pathlib import Path\n"
                             f"if sys.argv[1:2] == ['supervise']:\n    Path({str(marker)!r}).touch()\n"
                             "    raise SystemExit(7)\n")
             before = heartbeat.stat().st_mtime_ns
+            trial_started_ns = time.monotonic_ns()
             result, rc = trial(bad, "gate-broken", "a" * 40)
             self.assertEqual(rc, 1, result)
             self.assertIn("takeover deadline expired", result)
             self.assertIn("previous build supervising all live runs", result)
             self.assertTrue(marker.is_file(), "the deliberately broken supervisor never started")
             self.assertNotIn("pending", auto_upgrade.read_state())
-            recovered_pid = self.wait_for(lambda: healthy_after(previous, version, before), "heartbeat after rollback")
+            recovered_pid = self.wait_for(lambda: healthy_after(previous, version, before, trial_started_ns),
+                                          "heartbeat after rollback")
             self.assertEqual(job_identity(), original_job)
             print(f"rollback: main PID {original_job[1]}, supervisor {recovered_pid}, version {version}", flush=True)
 
@@ -190,6 +202,7 @@ def main():
                           "broken supervisor leaving the fixture job orphaned")
             self.assertEqual(job_identity(), original_job)
             cli.flip(previous)
+            adoption_started_ns = time.monotonic_ns()
             adopt = f"{self.prefix}-adopt.service"
             with patch.dict(os.environ, AGENT_BUS_TIMER=adopt.removesuffix(".service")):
                 units = auto_upgrade.unit_dir()
@@ -206,20 +219,25 @@ def main():
             for adoption in adoptions:
                 if adoption.get("unit"):
                     self.record_unit(adoption["unit"])
-            self.assertTrue(any(a.get("id") == rid and a.get("started") for a in adoptions), output)
-            adopted_pid = self.wait_for(lambda: healthy_after(previous, version, before), "heartbeat after adopt service")
+            adoption = next((a for a in adoptions if a.get("id") == rid and a.get("started")), None)
+            self.assertIsNotNone(adoption, output)
+            adopted_pid = self.wait_for(lambda: healthy_after(previous, version, before, adoption_started_ns),
+                                         "heartbeat after adopt service")
             self.assertNotEqual(adopted_pid, recovered_pid)
             self.assertEqual(job_identity(), original_job)
-            print(f"adopt: main PID {original_job[1]}, supervisor {adopted_pid}, version {version}", flush=True)
+            print(f"adopt: main PID {original_job[1]}, invocation {original_job[0]}, supervisor {adopted_pid}, "
+                  f"version {version}, unit {adoption['unit']}", flush=True)
 
             label = "v9999.0.1" if version != "v9999.0.1" else "v9999.0.2"
             good = candidate("healthy-candidate", "# Healthy gate candidate\n")
             core.write_private(Path(good, runner.BUILD_RELEASE), dict(tag=label, base=label, commit="b" * 40))
             before = heartbeat.stat().st_mtime_ns
+            trial_started_ns = time.monotonic_ns()
             result, rc = trial(good, label, "b" * 40)
             self.assertEqual(rc, 0, result)
             self.assertIn(f"upgraded {version} to {label}", result)
-            new_pid = self.wait_for(lambda: healthy_after(good, label, before), "new-version heartbeat after upgrade")
+            new_pid = self.wait_for(lambda: healthy_after(good, label, before, trial_started_ns),
+                                    "new-version heartbeat after upgrade")
             self.assertEqual(job_identity(), original_job)
             print(f"upgrade: main PID {original_job[1]}, supervisor {new_pid}, version {label}", flush=True)
 
