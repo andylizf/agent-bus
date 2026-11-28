@@ -424,10 +424,11 @@ else:
         core.private_dir()
         state = dict(pending=pending)
 
-        def verify(build, runs):
+        def verify(build, runs, after_ns):
             self.assertEqual((build, runs), ("v2.0.8", active))
             self.assertEqual(runner.installed_build(), "v2.0.8")
             self.assertIn("pending", au.read_state())
+            self.assertGreater(after_ns, 0)
 
         with patch.object(runner, "adopt_runs") as adopt, patch.object(au, "wait_for_takeover", side_effect=verify):
             result = au.rollback(state, cli.flip, "candidate supervisor exited")
@@ -452,6 +453,44 @@ else:
             self.assertIn("previous build supervising all live runs", au.settle(cli.flip))
         self.assertNotIn("pending", au.read_state())
         self.assertEqual(au.read_state()["retries"][commit]["attempts"], 1)
+
+    def test_rollback_waits_if_old_supervisor_already_read_candidate_before_exec(self):
+        rid = "run-a"
+        previous = runner.build_root(core.BIN())
+        self.install_current("v2.0.9")
+        candidate = os.path.realpath(core.BIN())
+        identity = dict(pid=123, ticks=10, boot_id="test")
+        supervisor = runner.Supervisor(rid)
+        supervisor.s = dict(mode="systemd", state="running", run="generation",
+                            supervisor=dict(identity, code="v2.0.8", healthy=True, completed_ns=99))
+        supervisor.lock = Mock()
+        core.write_private(runner.state_path(rid), supervisor.s)
+        pending = {"previous": previous, "from": "v2.0.8", "to": "v2.0.9", "build": "v2.0.9",
+                   "commit": "b" * 40, "runs": {rid: "generation"}}
+
+        def stall_before_exec():
+            result = au.rollback(dict(pending=pending), cli.flip, "candidate failure")
+            self.assertIn(f"rollback recovery failed: takeover deadline expired for {rid}", result)
+            self.assertIn("pending", au.read_state())
+            self.assertEqual(runner.build_root(core.BIN()), previous)
+            supervisor.lock.release.assert_not_called()
+
+        with patch.object(au, "TAKEOVER_S", 0), patch.object(au.time, "monotonic_ns", return_value=100), \
+                patch.object(runner, "lock_free", return_value=False), \
+                patch.object(runner, "adopt_runs"), patch.object(core, "proc_identity", return_value=identity):
+            with patch.object(runner, "build_id", return_value="v2.0.8"), \
+                    patch.object(runner, "installed_build", return_value="v2.0.9"), \
+                    patch.object(supervisor, "save", side_effect=stall_before_exec), \
+                    patch.object(runner.os, "execv", side_effect=RuntimeError("exec intercepted")) as do_exec:
+                with self.assertRaisesRegex(RuntimeError, "exec intercepted"):
+                    supervisor.maybe_upgrade()
+                self.assertEqual(do_exec.call_args.args[1][2], candidate)
+
+            identity["pid"] = 124
+            supervisor.s["supervisor"].update(identity, completed_ns=101)
+            core.write_private(runner.state_path(rid), supervisor.s)
+            self.assertIn("previous build supervising all live runs", au.settle(cli.flip))
+        self.assertNotIn("pending", au.read_state())
 
     def test_exclusive_upgrade_lock_keeps_launch_from_writing_run_state(self):
         command = [sys.executable, "-IB", str(REPO / "bin" / "bus"), "run", "--gpus", "0", "--", "true"]

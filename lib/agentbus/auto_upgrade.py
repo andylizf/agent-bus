@@ -362,12 +362,13 @@ def rollback(state, flip, reason):
             del state["pending"]
             core.write_private(state_file(), state)
             return state["last_result"]
+        restored_at_ns = time.monotonic_ns()
         active = pending.get("runs")
         if active is None:
             active = {r["id"]: r["run"] for r in live_runs() if r["mode"] == "systemd"}
         if active:
             runner.adopt_runs(only=set(active))
-            wait_for_takeover(os.path.basename(previous), active)
+            wait_for_takeover(os.path.basename(previous), active, after_ns=restored_at_ns)
             state["last_result"] = f"{result}; previous build supervising all live runs"
         del state["pending"]
     except (OSError, Refused) as e:
@@ -445,7 +446,7 @@ def probe(build, runs):
     raise Refused("candidate did not report its private state version from the dry-adopt probe")
 
 
-def wait_for_takeover(build, runs):
+def wait_for_takeover(build, runs, after_ns=None):
     deadline = time.monotonic() + TAKEOVER_S
     waiting = dict(runs)
     next_adopt = 0
@@ -459,6 +460,8 @@ def wait_for_takeover(build, runs):
                 continue
             sup = s.get("supervisor") or {}
             if sup.get("code") != build or not sup.get("healthy") or not sup.get("pid"):
+                continue
+            if after_ns is not None and sup.get("completed_ns", 0) <= after_ns:
                 continue
             identity = core.proc_identity(sup["pid"])
             if (identity == {k: sup.get(k) for k in ("pid", "boot_id", "ticks")}

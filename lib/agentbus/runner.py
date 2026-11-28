@@ -1522,6 +1522,10 @@ class Supervisor:
 
     # --- one pass
 
+    def save_completed_pass(self):
+        self.s["supervisor"].update(healthy=True, completed_ns=time.monotonic_ns())
+        self.save()
+
     def one_pass(self):
         s = self.s
         t0 = time.monotonic()
@@ -1547,7 +1551,7 @@ class Supervisor:
                 if s["state"] == "ended":
                     return
                 s["last_pass"] = t
-                self.save()
+                self.save_completed_pass()
                 return
             if s["mode"] == "systemd" and s["state"] in ("running", "leader-exited", "stopping", "needs-reconcile") \
                     and not s["units"].get("cgroup_path"):
@@ -1676,7 +1680,7 @@ class Supervisor:
             s["last_pass"] = t
             s["last_pass_s"] = round(time.monotonic() - t0, 3)
             s["max_pass_s"] = max(s.get("max_pass_s") or 0, s["last_pass_s"])
-            self.save()
+            self.save_completed_pass()
         finally:
             if board is not None:
                 board.close()
@@ -1738,9 +1742,6 @@ class Supervisor:
                         time.sleep(core.PASS_S())
                         continue
                     self.one_pass()
-                    if s["state"] in NONTERMINAL and not s["supervisor"].get("healthy"):
-                        s["supervisor"]["healthy"] = True
-                        self.save()
                 except (OSError, TimeoutError, ValueError, KeyError, Refused) as e:
                     # an incomplete pass touches nothing; the next pass tries again
                     s.setdefault("pass_errors", []).append(f"{now()} {type(e).__name__}: {str(e)[:200]}")

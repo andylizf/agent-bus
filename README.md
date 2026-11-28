@@ -172,7 +172,8 @@ report a healthy pass from its re-executed supervisor or from a supervisor adopt
 
 The timer and `bus auto-upgrade check` start the same systemd service. Both user services follow the installed
 `bus` entry point. While a switch is pending, the launcher uses the previous build for recovery. A failed or
-interrupted switch restores the previous build and waits for healthy supervisors on every live run. This also
+interrupted switch restores the previous build and waits for every live run to complete a healthy pass on that
+build after the switch back. This also
 works with `--no-timer`, which skips periodic adoption and leaves automatic upgrades enabled. If recovery
 cannot verify a supervisor, `bus doctor` reports which run is waiting. The adopt service can resume recovery
 after 18 minutes. Failed commits can retry after 15 minutes and then one hour. A third failure quarantines the
@@ -210,8 +211,10 @@ under `agents/.heartbeat/`. Use `bus ls --json` to see the version on each runni
 modification time records when the supervisor last checked in.
 
 On the board host, run `python3 tools/auto_upgrade_gate.py` from the release checkout to verify rollback with
-systemd. The gate creates a temporary board, a sleep job, and a deliberately broken candidate. It checks the
-same job invocation and PID, a fresh heartbeat from the restored build, and adoption through the service launcher.
+systemd. The gate creates a temporary board, a sleep job, and two candidates. It checks the same job invocation
+and PID throughout, a fresh heartbeat from the restored build after a forced failure, adoption through the service
+launcher, and a new-version heartbeat after a successful takeover. Cleanup uses the exact unit names and
+invocation IDs recorded by the gate.
 
 ## Setup
 
