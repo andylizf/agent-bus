@@ -159,10 +159,21 @@ in. Rolling back from a build that does not start uses the previous build's own 
 
 Every install enables automatic upgrades by default. On the board host, `bus-auto-upgrade.timer` checks the
 public `andylizf/agent-bus` Git repository about 15 minutes after the timer starts and daily after that. Each
-account waits at least 24 hours from when it first sees an exact `vX.Y.Z` tag object and commit. Moving the tag
-starts a new wait. The updater verifies the fetched tag and commit again before installing the build and switching
-supervisors at their next pass. It only upgrades to a higher version and stays within the installed major version
-unless you run `bus auto-upgrade on --allow-major`.
+account waits at least 24 hours from when it first sees an exact `vX.Y.Z` tag object and commit. If a check sees a
+tag change or disappear, it starts a fresh wait when the tag returns, even when it returns to the same commit.
+The updater picks the newest eligible version. It stays within the installed major version unless you run
+`bus auto-upgrade on --allow-major`, and it requires a higher version in either mode.
+
+The updater builds from regular files in the verified Git commit. The previous build drives the switch and
+checks that the candidate can load existing run state. It waits up to 60 seconds for live supervisors to report a
+healthy pass on the candidate. A failed or interrupted switch restores the previous build and quarantines the
+failed commit. The timer uses a separate entry point that stays on the previous build until takeover is confirmed.
+
+To recall a release, remove its tag from the public repository and publish the replacement under a higher version.
+A release can also include a root-level `auto-upgrade-withdrawn` file listing older `vX.Y.Z` tags, one per line.
+Once an account checks the newer verified release after its soak, it remembers those withdrawals even if takeover
+fails. A recalled tag stops being a candidate for that account. An account already running it waits for a higher
+eligible version.
 
 Anyone who can push tags to `andylizf/agent-bus` can run code in every account with automatic upgrades enabled
 after the 24-hour soak. To opt out at install, pass `--no-auto-upgrade` to `bin/install.sh`. For an existing
@@ -175,10 +186,13 @@ For an install on v2.0.0 through v2.0.8, fetch and check out a release that incl
 ~/src/agent-bus/bin/bus upgrade --build ~/src/agent-bus
 ```
 
-The checkout's `bus` sets up the timer as part of the switch. `bus doctor` shows the current tag or build ID,
-timer availability, last check and result. The timer requires a systemd user manager with linger enabled. If
-you set those up later, run `bus auto-upgrade on` to start the timer. Automatic upgrades record the source
-version, destination tag and time in `~/.local/state/agent-bus/auto-upgrade.json`.
+The checkout's `bus` sets up the timer as part of the switch. If the installed older `bus` performs the upgrade,
+the new build sets up the timer and creates `release.json` on its first invocation. Its first check identifies the
+installed tag from the commit and installed files. `bus doctor` shows the current tag or build ID, timer
+availability, last check, result, and quarantine reasons. The timer requires a systemd user manager with linger
+enabled. Run `loginctl enable-linger "$USER"`, then `bus auto-upgrade on` to start the timer when it was
+unavailable. Automatic upgrades record the source version, destination tag and time in
+`~/.local/state/agent-bus/auto-upgrade.json`.
 
 Each supervisor publishes its running tag or build ID in the entry's `build` field and in the heartbeat file
 under `agents/.heartbeat/`. Use `bus ls --json` to see the version on each running entry. The heartbeat's

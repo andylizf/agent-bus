@@ -85,6 +85,13 @@ def load_state(rid):
     return s
 
 
+def state_for_supervision(rid):
+    s = migrate(load_state(rid))
+    if s.get("host") and s["host"] != core.HOST:
+        raise Refused(f"{rid} runs on {s['host']}, not here")
+    return s
+
+
 def build_root(path=None):
     """The build directory a `bus` entry point or this package lives in (builds/<id>/ or a source checkout)."""
     p = os.path.realpath(path or __file__)
@@ -1693,18 +1700,14 @@ class Supervisor:
             print(f"bus: another supervisor holds {self.rid}; this one exits", file=sys.stderr)
             return 3
         try:
-            raw = load_state(self.rid)
             try:
-                self.s = migrate(raw)
+                self.s = state_for_supervision(self.rid)
             except Refused as e:
                 with open(os.path.join(core.private_dir(), "notices.jsonl"), "a") as f:
                     f.write(json.dumps(dict(event="refused", id=self.rid, time=now(), detail=str(e))) + "\n")
                 print(f"bus: {e}", file=sys.stderr)
                 return 1
             s = self.s
-            if s.get("host") and s["host"] != core.HOST:
-                print(f"bus: {self.rid} runs on {s['host']}, not here", file=sys.stderr)
-                return 1
             self.hooks = Hooks(s.get("on_message"))
             self.check_pidfd()
             prev = s.get("supervisor") or {}
@@ -1723,6 +1726,9 @@ class Supervisor:
                         time.sleep(core.PASS_S())
                         continue
                     self.one_pass()
+                    if s["state"] in NONTERMINAL and not s["supervisor"].get("healthy"):
+                        s["supervisor"]["healthy"] = True
+                        self.save()
                 except (OSError, TimeoutError, ValueError, KeyError, Refused) as e:
                     # an incomplete pass touches nothing; the next pass tries again
                     s.setdefault("pass_errors", []).append(f"{now()} {type(e).__name__}: {str(e)[:200]}")
@@ -1778,12 +1784,11 @@ class Supervisor:
         if not inst or inst == build_id():
             return
         target = os.path.realpath(core.BIN())
-        self.save()
-        self.lock.release()
         self.s["exec_at"] = time.time()
-        core.write_private(state_path(self.rid), self.s)
+        self.save()
         try:
             sys.stdout.flush()
+            self.lock.release()
             os.execv(sys.executable, [sys.executable, "-IB", target, "supervise", self.rid, "--adopt"])
         except OSError as e:
             with open(os.path.join(core.private_dir(), "notices.jsonl"), "a") as f:
@@ -2138,6 +2143,9 @@ def cmd_reconcile(rid, confirm):
 def cmd_adopt_all():
     """Start a supervisor for every nonterminal run of this host whose supervisor lock is free."""
     out = []
+    from . import auto_upgrade
+    if auto_upgrade.read_state().get("pending"):
+        return out
     if not user_manager_ok():
         return [dict(error="no user manager: adoption needs one")]
     for name in sorted(os.listdir(runs_dir())):

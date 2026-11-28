@@ -2,9 +2,10 @@
 hot update (design 3.3-3.8, 4.1-4.3). Needs a systemd user manager with cgroup delegation (the Rocky 9 container in
 tests/container, or the GPU host); every unit is named with a test prefix and removed after."""
 import json, os, secrets, shutil, signal, subprocess, sys, time, unittest
+from unittest.mock import patch
 
 from helpers import BUS, PY, REPO, SCALE, BusTest, need_systemd, wait_for
-from agentbus import core, runner
+from agentbus import auto_upgrade, cli, core, runner
 
 SLEEP = "sleep 300"
 
@@ -568,6 +569,38 @@ printf '%s\\n' "$event" >> "{events}"
         back = self.bus_json("upgrade", "--build", str(self.home / "builds" / r["previous"]), "--json")
         wait_for(lambda: self.state(d["id"])["supervisor"]["code"] == back["installed"], 20, what="rolled back")
         print(f"\n[upgrade] exec gap {gap:.3f} s", file=sys.stderr)
+
+    def test_auto_upgrade_confirms_real_supervisor_and_rolls_back_failed_pass(self):
+        d = self.start(SLEEP)
+        rid = d["id"]
+        before = self.state(rid)["supervisor"]["pid"]
+
+        def trial(src, version, commit):
+            previous = runner.build_root(core.BIN())
+            build = cli.copy_build(str(src))
+            pending = dict(previous=previous, build=os.path.basename(build), commit=commit, to=version,
+                           **{"from": os.path.basename(previous), "time": time.time()})
+            with patch.object(auto_upgrade, "update", return_value=(build, pending)):
+                return auto_upgrade.check(cli.flip)
+
+        first, rc = trial(self.other_build("auto-healthy"), "v2.0.9", "a" * 40)
+        self.assertEqual(rc, 0, first)
+        good = runner.installed_build()
+        adopted = self.state(rid)["supervisor"]
+        self.assertEqual((adopted["code"], adopted["pid"], adopted["healthy"]), (good, before, True))
+
+        bad = self.other_build("auto-unhealthy")
+        path = bad / "lib" / "agentbus" / "runner.py"
+        text = path.read_text().replace("    def one_pass(self):\n",
+                                        "    def one_pass(self):\n        raise Refused('test: no healthy pass')\n")
+        path.write_text(text)
+        with patch.object(auto_upgrade, "TAKEOVER_S", 4 * SCALE):
+            result, rc = trial(bad, "v2.0.10", "b" * 40)
+        self.assertEqual(rc, 1, result)
+        self.assertIn("takeover deadline expired", result)
+        self.assertEqual(runner.installed_build(), good)
+        wait_for(lambda: self.state(rid)["supervisor"]["code"] == good, 20, what="supervisor returned to known build")
+        self.assertEqual(self.props(d["main_unit"], "ActiveState")["ActiveState"], "active")
 
     def test_failed_exec_supervisor_exits_and_is_adopted_after_rollback(self):
         d = self.start(SLEEP)

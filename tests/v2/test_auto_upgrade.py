@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -41,7 +42,7 @@ class AutoUpgrade(unittest.TestCase):
         core.write_private(target / runner.BUILD_RELEASE, dict(tag=tag, base=tag))
         cli.flip(str(target))
 
-    def fake_git(self, *args):
+    def fake_git(self, *args, binary=False):
         self.calls.append(args)
         if args[:2] == ("ls-remote", "--tags"):
             self.assertEqual(args[2], au.REPO)
@@ -54,24 +55,37 @@ class AutoUpgrade(unittest.TestCase):
             return "\n".join(lines)
         if args[0] == "init":
             return ""
-        src, action = Path(args[1]), args[2]
-        if action == "fetch":
+        action = args[2]
+        if action == "-c":
+            self.assertEqual(args[3:5], ("fetch.fsckObjects=true", "fetch"))
             self.assertEqual(args[-2], au.REPO)
             self.fetch = self.tags[args[-1].removeprefix("refs/tags/")] if self.fetch is None else self.fetch
             return ""
         if action == "rev-parse":
             return self.fetch[0 if args[3] == "FETCH_HEAD" else 1]
-        self.assertEqual(action, "checkout")
-        self.assertEqual(args[-1], self.fetch[1])
-        (src / "bin").mkdir()
-        (src / "lib" / "agentbus").mkdir(parents=True)
-        (src / "bin" / "bus").write_text("raise SystemExit(7)\n" if self.broken else "print('bus help')\n")
-        self.fetch = None
-        return ""
+        if action == "ls-tree":
+            self.assertEqual(args[4], self.fetch[1])
+            self.fetch = None
+            files = [b"100755 blob bus\tbin/bus", b"100644 blob lib\tlib/agentbus/__init__.py"]
+            if getattr(self, "withdrawn", None):
+                files.append(b"100644 blob withdrawn\tauto-upgrade-withdrawn")
+            return b"\0".join(files) + b"\0"
+        self.assertEqual(action, "cat-file")
+        if args[-1] == "lib":
+            return b""
+        if args[-1] == "withdrawn":
+            return self.withdrawn
+        if self.broken:
+            return b"raise SystemExit(7)\n"
+        return b"""import json, sys
+from pathlib import Path
+if sys.argv[1] == '_upgrade-probe':
+    print(json.dumps({'build': Path(__file__).resolve().parents[1].name, 'state_version': 1}))
+"""
 
     def check(self):
         with patch.object(au, "git", side_effect=self.fake_git):
-            return au.check(cli.copy_build, cli.flip)
+            return au.check(cli.flip)
 
     def test_soak_semver_and_annotated_tag(self):
         before = os.readlink(core.BIN())
@@ -149,7 +163,7 @@ class AutoUpgrade(unittest.TestCase):
 
     def test_network_failure_and_busy_lock(self):
         with patch.object(au, "git", side_effect=core.Refused("no network")):
-            self.assertEqual(au.check(cli.copy_build, cli.flip), ("failed: no network", 1))
+            self.assertEqual(au.check(cli.flip), ("failed: no network", 1))
         with au.lock():
             proc = subprocess.run([sys.executable, "-IB", str(REPO / "bin" / "bus"), "auto-upgrade", "check"],
                                   capture_output=True, text=True, timeout=5, env=os.environ.copy())
@@ -163,10 +177,10 @@ class AutoUpgrade(unittest.TestCase):
         self.check()
         self.now += au.SOAK_S
         with patch.object(cli, "flip", side_effect=OSError("cannot replace symlink")):
-            self.assertEqual(self.check(), ("failed: cannot replace symlink", 1))
+            self.assertEqual(self.check(), ("failed: v2.0.9 quarantined: cannot replace symlink", 1))
         self.assertEqual(runner.installed_build(), "v2.0.8")
         self.assertNotIn("upgrades", au.read_state())
-        self.assertEqual(au.doctor(False, False)["last_result"], "failed: cannot replace symlink")
+        self.assertEqual(au.doctor(False, False)["last_result"], "failed: v2.0.9 quarantined: cannot replace symlink")
 
     def test_timer_default_opt_out_and_early_daily_schedule(self):
         with patch.object(runner, "user_manager_ok", return_value=True), \
@@ -178,7 +192,8 @@ class AutoUpgrade(unittest.TestCase):
             service = (au.unit_dir() / "bus-auto-upgrade.service").read_text()
             self.assertIn(f"ConditionHost={core.HOST}", timer)
             self.assertIn("OnActiveSec=15min\nOnUnitActiveSec=1d", timer)
-            self.assertIn(f'"{core.BIN()}" auto-upgrade check', service)
+            self.assertIn(f'"{au.driver()}" _auto-upgrade-timer', service)
+            self.assertIn(f'"{au.driver()}" _auto-upgrade-recover', service)
             self.assertEqual(au.configure("off"), "off")
             systemctl.assert_called_with("disable", "--now", "bus-auto-upgrade.timer")
         self.assertEqual(self.check(), ("off", 0))
@@ -209,9 +224,148 @@ class AutoUpgrade(unittest.TestCase):
         with patch.object(au, "REPO", Path(repo).as_uri()):
             oid, commit = au.release_refs()["v2.0.9"]
             self.assertNotEqual(oid, commit)
-            au.checkout(src, "v2.0.9", oid, commit)
-        self.assertEqual(Path(src, "committed").read_text(), "tagged tree\n")
-        self.assertEqual(au.git("-C", src, "rev-parse", "HEAD"), commit)
+            au.fetch(src, "v2.0.9", oid, commit)
+        self.assertFalse(Path(src, "committed").exists())
+        self.assertEqual(au.git("-C", src, "show", f"{commit}:committed"), "tagged tree")
+
+    def test_failed_takeover_rolls_back_and_newer_release_withdraws_older(self):
+        self.tags = {"v2.0.9": ("a" * 40, "a" * 40), "v2.0.10": ("b" * 40, "b" * 40)}
+        self.withdrawn = b"v2.0.9\n"
+        self.check()
+        self.now += au.SOAK_S
+
+        def fails_on_candidate(build, active):
+            self.assertEqual(runner.installed_build(), build)
+            self.assertIn("verifying takeover", au.doctor(False, False)["last_result"])
+            self.assertNotIn("upgrades", au.read_state())
+            raise core.Refused("existing job did not take over")
+
+        with patch.object(au, "wait_for_takeover", side_effect=fails_on_candidate), \
+                patch.object(runner, "cmd_adopt_all") as adopt:
+            result, rc = self.check()
+            adopt.assert_called_once()
+        self.assertEqual(rc, 1)
+        self.assertIn("v2.0.10 quarantined: existing job did not take over", result)
+        self.assertEqual(runner.installed_build(), "v2.0.8")
+        self.assertIn("b" * 40, au.read_state()["quarantine"])
+        self.assertEqual(self.check(), ("newer releases are withdrawn or quarantined", 0))
+        self.assertEqual(len([a for a in self.calls if "fetch" in a]), 1)
+
+    def test_a_tag_that_reverts_has_to_soak_again(self):
+        self.tags["v2.0.9"] = ("a" * 40, "b" * 40)
+        self.check()
+        self.now += au.SOAK_S - 1
+        self.tags["v2.0.9"] = ("c" * 40, "b" * 40)
+        self.check()
+        self.now += 2
+        self.tags["v2.0.9"] = ("a" * 40, "b" * 40)
+        self.assertEqual(self.check(), ("waiting for the 24 h soak", 0))
+
+    def copy_without_release_metadata(self):
+        target = self.root / "builds" / ("a" * 12)
+        for part in ("bin", "lib"):
+            shutil.copytree(REPO / part, target / part, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        return target
+
+    def test_old_upgrader_copy_bootstraps_on_first_invocation(self):
+        target = self.copy_without_release_metadata()
+        cli.flip(str(target))
+        proc = subprocess.run([sys.executable, "-IB", core.BIN(), "doctor", "--json"], capture_output=True,
+                              text=True, env=dict(os.environ, AGENT_BUS_SYSTEMD="off"), timeout=10)
+        status = json.loads(proc.stdout)["auto_upgrade"]
+        self.assertIn("loginctl enable-linger", status["timer"])
+        self.assertEqual(runner.build_release(str(target)), {"legacy_build": target.name})
+        self.assertEqual(os.path.realpath(au.driver()), str(target / "bin" / "bus"))
+        self.assertTrue((au.unit_dir() / "bus-auto-upgrade.timer").is_file())
+        self.assertTrue((au.unit_dir() / "timers.target.wants" / "bus-auto-upgrade.timer").is_symlink())
+
+    def test_known_good_timer_recovers_abandoned_switch_with_broken_cli(self):
+        old = self.copy_without_release_metadata()
+        cli.flip(str(old))
+        au.link_to_build(au.driver(), str(old))
+        bad = self.root / "builds" / "bad"
+        (bad / "bin").mkdir(parents=True)
+        (bad / "bin" / "bus").write_text("raise SystemExit(7)\n")
+        core.write_private(au.state_file(), dict(pending={"previous": str(old), "from": "v2.0.8", "to": "v2.0.9",
+                                                         "commit": "b" * 40, "build": "bad"}))
+        cli.flip(str(bad))
+        proc = subprocess.run([sys.executable, "-IB", au.driver(), "_auto-upgrade-recover"], capture_output=True,
+                              text=True, env=dict(os.environ, AGENT_BUS_SYSTEMD="off"), timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(runner.installed_build(), old.name)
+        self.assertIn("takeover was interrupted", au.doctor(False, False)["last_result"])
+
+    def test_takeover_requires_live_same_process_and_healthy_pass(self):
+        identity = dict(pid=123, ticks=10, boot_id="test")
+        state = dict(run="generation", state="running", supervisor=dict(identity, code="new", healthy=True))
+        runs = {"test-run": ("generation", identity)}
+        with patch.object(runner, "load_state", return_value=state), patch.object(runner, "lock_free", return_value=False), \
+                patch.object(core, "proc_identity", return_value=identity), patch.object(au, "TAKEOVER_S", 0):
+            au.wait_for_takeover("new", runs)
+            state["supervisor"]["healthy"] = False
+            with self.assertRaisesRegex(core.Refused, "deadline expired for test-run"):
+                au.wait_for_takeover("new", runs)
+            state["supervisor"]["healthy"] = True
+            with self.assertRaisesRegex(core.Refused, "deadline expired for test-run"):
+                au.wait_for_takeover("new", {"test-run": ("generation", dict(identity, pid=124))})
+
+    def test_candidate_dry_adopts_without_writing_and_refuses_newer_state(self):
+        rid = "test-run"
+        path = Path(runner.state_path(rid))
+        core.write_private(path, dict(host=core.HOST, state_version=runner.STATE_VERSION, id=rid))
+        before = path.read_bytes()
+        self.assertEqual(au.probe(str(REPO), [rid]), runner.STATE_VERSION)
+        self.assertEqual(path.read_bytes(), before)
+        core.write_private(path, dict(host=core.HOST, state_version=runner.STATE_VERSION + 1, id=rid))
+        with self.assertRaisesRegex(core.Refused, "state version .* newer"):
+            au.probe(str(REPO), [rid])
+
+    def test_empty_run_reservation_does_not_block_upgrade_but_corrupt_state_does(self):
+        path = Path(runner.state_path("test-run"))
+        path.touch()
+        self.assertEqual(au.live_runs(), [])
+        path.write_text("unreadable private state")
+        with self.assertRaisesRegex(core.Refused, "no run test-run"):
+            au.live_runs()
+
+    def test_verified_git_blobs_bypass_cache_and_refuse_symlinks(self):
+        repo = self.root / "release"
+        au.git("init", "--quiet", str(repo))
+        (repo / "bin").mkdir()
+        (repo / "lib" / "agentbus").mkdir(parents=True)
+        bus = repo / "bin" / "bus"
+        bus.write_bytes(b"#!/usr/bin/env python3\nprint('verified commit')  \n")
+        bus.chmod(0o755)
+        (repo / "lib" / "agentbus" / "__init__.py").write_bytes(b"\x23\xff\n")
+
+        def commit():
+            au.git("-C", str(repo), "add", ".")
+            au.git("-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "-qm", "test")
+            return au.git("-C", str(repo), "rev-parse", "HEAD")
+
+        good = commit()
+        first, _ = au.stage_release(str(repo), "v2.0.9", good)
+        (Path(first) / "bin" / "bus").write_text("cached tampered bytes\n")
+        second, _ = au.stage_release(str(repo), "v2.0.9", good)
+        self.assertNotEqual(first, second)
+        self.assertEqual((Path(second) / "bin" / "bus").read_bytes(), bus.read_bytes())
+        self.assertEqual((Path(second) / "lib" / "agentbus" / "__init__.py").read_bytes(), b"\x23\xff\n")
+        (repo / "bin" / "link").symlink_to(self.root / "outside")
+        bad = commit()
+        with self.assertRaisesRegex(core.Refused, "not a regular file: bin/link"):
+            au.stage_release(str(repo), "v2.0.10", bad)
+
+    def test_reinstall_does_not_reuse_build_missing_release_metadata(self):
+        short = "b" * 12
+        old = Path(core.BUILDS(), short)
+        (old / "bin").mkdir(parents=True)
+        (old / "bin" / "bus").write_text("legacy copy")
+        with patch.object(au, "git", side_effect=[short, ""]), \
+                patch.object(au, "source_release", return_value=dict(tag="v2.0.9", base="v2.0.9")):
+            result = cli.copy_build(str(REPO))
+        self.assertNotEqual(result, str(old))
+        self.assertEqual(runner.build_release(result)["tag"], "v2.0.9")
+        self.assertEqual((old / "bin" / "bus").read_text(), "legacy copy")
 
     def test_supervisor_entry_and_heartbeat_publish_running_tag(self):
         with patch.object(runner, "build_root", return_value=runner.build_root(core.BIN())):

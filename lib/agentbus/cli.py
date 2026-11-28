@@ -374,10 +374,12 @@ def cmd_doctor(a):
         current = upgrade["current_tag"] or upgrade["current_build"] or "none"
         print(f"auto-upgrade: {'on' if upgrade['enabled'] else 'off'} (timer {upgrade['timer']})")
         print(f"  current tag or build: {current}; last check: {checked}; last result: {upgrade['last_result'] or '-'}")
+        for commit, bad in upgrade["quarantine"].items():
+            print(f"  quarantined {bad['build'] or commit}: {bad['reason']}")
     return 0 if all(c["ok"] for c in checks) else 1
 
 
-def copy_build(src, release=None):
+def copy_build(src):
     """Copy a source tree into builds/<id> and return the path of the staged build."""
     src = os.path.realpath(src)
     if not (os.path.isfile(os.path.join(src, "bin", "bus")) and os.path.isdir(os.path.join(src, "lib", "agentbus"))):
@@ -385,27 +387,27 @@ def copy_build(src, release=None):
     builds = core.BUILDS()
     if os.path.dirname(src) == os.path.realpath(builds):
         return src
-    if release is not None:
-        # Keep verified releases distinct from builds copied from local worktrees.
-        bid = f"release-{release['commit']}-{release['tag']}"
-    else:
-        try:
-            bid = auto_upgrade.git("-C", src, "rev-parse", "--short=12", "HEAD")
-            dirty = auto_upgrade.git("-C", src, "status", "--porcelain", "--", "bin", "lib")
-        except Refused:
-            bid, dirty = "", ""
-        if not bid or dirty:
-            h = hashlib.sha256()
-            for d, _, files in sorted(os.walk(os.path.join(src, "lib"))):
-                for f in sorted(files):
-                    if f.endswith(".py"):
-                        with open(os.path.join(d, f), "rb") as stream:
-                            h.update(stream.read())
-            with open(os.path.join(src, "bin", "bus"), "rb") as stream:
-                h.update(stream.read())
-            bid = (bid + "-" if bid else "") + "w" + h.hexdigest()[:8]
-        release = auto_upgrade.source_release(src, dirty) if bid and not bid.startswith("w") else {}
+    try:
+        bid = auto_upgrade.git("-C", src, "rev-parse", "--short=12", "HEAD")
+        dirty = auto_upgrade.git("-C", src, "status", "--porcelain", "--", "bin", "lib")
+    except Refused:
+        bid, dirty = "", ""
+    if not bid or dirty:
+        h = hashlib.sha256()
+        for d, _, files in sorted(os.walk(os.path.join(src, "lib"))):
+            for f in sorted(files):
+                if f.endswith(".py"):
+                    with open(os.path.join(d, f), "rb") as stream:
+                        h.update(stream.read())
+        with open(os.path.join(src, "bin", "bus"), "rb") as stream:
+            h.update(stream.read())
+        bid = (bid + "-" if bid else "") + "w" + h.hexdigest()[:8]
+    release = auto_upgrade.source_release(src, dirty) if not bid.startswith("w") else {}
     dest = os.path.join(builds, bid)
+    if os.path.isdir(dest):
+        existing = runner.build_release(dest)
+        if not existing or (release.get("base") and not existing.get("base")):
+            dest += f"-metadata-{secrets.token_hex(3)}"
     if not os.path.isdir(dest):
         os.makedirs(builds, exist_ok=True)
         tmp = dest + f".tmp{secrets.token_hex(3)}"
@@ -413,8 +415,7 @@ def copy_build(src, release=None):
         for part in ("bin", "lib"):
             shutil.copytree(os.path.join(src, part), os.path.join(tmp, part),
                             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        if release:
-            core.write_private(os.path.join(tmp, runner.BUILD_RELEASE), release)
+        core.write_private(os.path.join(tmp, runner.BUILD_RELEASE), release or dict(build=bid))
         for d, dirs, files in os.walk(tmp):
             for n in dirs + files:
                 p = os.path.join(d, n)
@@ -425,23 +426,19 @@ def copy_build(src, release=None):
 
 
 def flip(build):
-    link = core.BIN()
-    os.makedirs(os.path.dirname(link), exist_ok=True)
-    tmp = link + f".new{secrets.token_hex(3)}"
-    os.symlink(os.path.join(build, "bin", "bus"), tmp)
-    os.replace(tmp, link)
+    auto_upgrade.link_to_build(core.BIN(), build)
 
 
 def cmd_upgrade(a):
     with auto_upgrade.lock():
-        auto_upgrade.settle()
+        auto_upgrade.settle(flip)
         build = copy_build(a.build)
         before = runner.installed_build()
         prior = runner.build_root(core.BIN())
         feature = os.path.join("lib", "agentbus", "auto_upgrade.py")
         timer = None
         if before and not os.path.isfile(os.path.join(prior, feature)) and os.path.isfile(os.path.join(build, feature)):
-            timer = auto_upgrade.sync_timer()
+            timer = auto_upgrade.sync_timer(build)
         flip(build)
     live = [r["id"] for r in runner.cmd_runs() if r["state"] in runner.NONTERMINAL and r.get("host") == core.HOST]
     res = dict(previous=before, installed=os.path.basename(build), supervisors=live)
@@ -460,9 +457,33 @@ def cmd_auto_upgrade(a):
     if a.action != "check":
         print(f"auto-upgrade: {auto_upgrade.configure(a.action, a.allow_major)}")
         return
-    result, code = auto_upgrade.check(copy_build, flip)
+    return cmd_auto_timer(a, force=True)
+
+
+def cmd_auto_timer(a, force=False):
+    if not force and (not runner.user_manager_ok() or auto_upgrade.linger_status() != "yes"):
+        print('auto-upgrade: timer unavailable; run loginctl enable-linger "$USER"')
+        return
+    result, code = auto_upgrade.check(flip)
     print(f"auto-upgrade: {result}")
     return code
+
+
+def cmd_auto_recover(a):
+    lock = auto_upgrade.lock()
+    if lock.acquire():
+        try:
+            result = auto_upgrade.settle(flip)
+            if result:
+                print(f"auto-upgrade: {result}")
+        finally:
+            lock.release()
+
+
+def cmd_upgrade_probe(a):
+    for rid in a.runs:
+        runner.state_for_supervision(rid)
+    out(dict(build=runner.build_id(), state_version=runner.STATE_VERSION))
 
 
 def cmd_setup_board(a):
@@ -483,7 +504,7 @@ def cmd_install(a):
     """`bus _install --board DIR` (install.sh calls it): copy the build, flip the entry point, pin the board by inode
     and filesystem id in ~/.config/agent-bus/board.conf."""
     with auto_upgrade.lock():
-        auto_upgrade.settle()
+        auto_upgrade.settle(flip)
         build = copy_build(a.src)
         flip(build)
     conf = core.load_conf()
@@ -616,6 +637,9 @@ def parser():
     s.add_argument("action", choices=("on", "off", "check"))
     s.add_argument("--allow-major", action="store_true")
     p("_auto-upgrade-setup", lambda a: print(f"auto-upgrade: {auto_upgrade.configure('setup')}"))
+    p("_auto-upgrade-timer", cmd_auto_timer)
+    p("_auto-upgrade-recover", cmd_auto_recover)
+    p("_upgrade-probe", cmd_upgrade_probe).add_argument("runs", nargs="*")
     s = p("_setup-board", cmd_setup_board)
     s.add_argument("board")
     s.add_argument("target", nargs="?", default=None)
@@ -659,6 +683,13 @@ def main(argv=None):
         if not a.argv:
             print("bus: give the command after --", file=sys.stderr)
             return 2
+    explicit_opt_out = a.cmd == "auto-upgrade" and a.action == "off"
+    if not explicit_opt_out and a.cmd not in ("_install", "_auto-upgrade-setup", "_auto-upgrade-timer",
+                                             "_auto-upgrade-recover", "_upgrade-probe"):
+        try:
+            auto_upgrade.bootstrap()
+        except (Refused, OSError) as e:
+            print(f"bus: automatic upgrade setup: {e}", file=sys.stderr)
     try:
         rc = a.f(a)
     except Refused as e:
