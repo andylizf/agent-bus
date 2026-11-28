@@ -300,8 +300,8 @@ def dumps(obj):
     return (json.dumps(obj, indent=1, ensure_ascii=False, sort_keys=True) + "\n").encode()
 
 
-def _tmp(dirfd, data, mode=0o644):
-    name = f".tmp-{secrets.token_hex(8)}"
+def _tmp(dirfd, data, mode=0o644, *, name=None):
+    name = name or f".tmp-{secrets.token_hex(8)}"
     fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600,
                  dir_fd=dirfd)
     try:
@@ -313,9 +313,9 @@ def _tmp(dirfd, data, mode=0o644):
     return name
 
 
-def publish(dirfd, name, data, mode=0o644):
+def publish(dirfd, name, data, mode=0o644, *, temp_name=None):
     """Publish a new file once: temp (O_EXCL, 0600, fchmod), then link to its name. FileExistsError if taken."""
-    tmp = _tmp(dirfd, data, mode)
+    tmp = _tmp(dirfd, data, mode, name=temp_name)
     try:
         os.link(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
     finally:

@@ -278,7 +278,7 @@ def launch_units_absent(rid):
         return True
     stem = "*-" + rid.replace("-", "_")
     rc, out, _ = sysctl("list-units", "--all", "--plain", "--no-legend", "--no-pager", stem + "-main.service",
-                        stem + "-sup*.service", stem + ".slice", timeout=3)
+                        stem + "-sup*.service", stem + "-exec-*.scope", stem + ".slice", timeout=3)
     return rc == 0 and not out.strip()
 
 
@@ -707,14 +707,14 @@ def unit_exists(unit):
 def cmd_exec(rid, run, argv, cwd=None):
     """bus exec: admitted, launching (the launcher's identity recorded), then registered by the guard that runs inside
     the new scope just before the command (bus _exec-guard), or cancelled."""
-    s = load_state(rid)
-    if s.get("mode") != "systemd":
-        raise Refused(f"{rid} runs in fallback mode (no user manager): no exec into it")
     eid = secrets.token_hex(6)
     with admit_lock(rid):
+        s = load_state(rid)
         a = admit_read(rid)
-        if a.get("admission") != "open":
+        if s.get("state") in ("preparing", "ended") or a.get("admission") != "open":
             raise Refused(f"admission to {rid} is closed (the run is stopping or has ended)")
+        if s.get("mode") != "systemd":
+            raise Refused(f"{rid} runs in fallback mode (no user manager): no exec into it")
         if a.get("run") != run:
             raise Refused(f"{rid} is now run {a.get('run')}, not {run}: refusing a stale exec")
         ident = core.proc_identity(os.getpid())
@@ -775,6 +775,40 @@ def close_admission(rid):
                 admit_write(rid, a)
     except Refused:
         pass
+
+
+def end_abandoned_run(rid, state, end, board_pin):
+    """Fence exec in this install and verify that an earlier admission cannot still start a process."""
+    with admit_lock(rid):
+        path, _ = admit_paths(rid)
+        a = core.read_private(path)
+        if a is None and os.path.lexists(path):
+            raise Refused("the exec admission ledger is unreadable")
+        s = dict(state or {})
+        a = a if a is not None else dict(run=s.get("run"), inflight=[])
+        if (not isinstance(a, dict) or not isinstance(a.get("inflight"), list)
+                or any(not isinstance(it, dict) or "exec_id" not in it or "state" not in it for it in a["inflight"])):
+            raise Refused("the exec admission ledger is malformed")
+        if s.get("run") and a.get("run") not in (None, s["run"]):
+            raise Refused("the exec admission ledger belongs to another run generation")
+        a["admission"] = "closed"
+        admit_write(rid, a)
+        for intent in a["inflight"]:
+            launcher = intent.get("launcher")
+            launcher_gone = (intent["state"] in ("admitted", "cancelled") if launcher is None
+                             else core.identity_gone(launcher))
+            if not core.identity_gone(intent.get("client")) or not launcher_gone:
+                raise Refused(f"exec {intent['exec_id']}: client or launcher is alive or its exit is unverified")
+        if not launch_units_absent(rid):
+            raise Refused("a run or exec unit exists or its absence could not be verified")
+        for intent in a["inflight"]:
+            intent["state"] = "cancelled"
+        admit_write(rid, a)
+        s.update(state_version=STATE_VERSION, id=rid, user=core.USER, host=core.HOST, board=board_pin,
+                 state="ended", entry_state="ended", never_started=True, ended=end["ended"],
+                 end_reason=end["end_reason"])
+        s.setdefault("run", a.get("run"))
+        core.write_private(state_path(rid), s)
 
 
 def resolve_intents(rid):
@@ -2048,7 +2082,6 @@ def launch_run(a, launch):
                  checkpoint_dir=a.checkpoint_dir, requests={}, release=None, lapsed=[],
                  session=os.environ.get("CLAUDE_CODE_SESSION_ID"), supervisor=None, notices=[])
         core.write_private(state_path(rid), s)
-        admit_write(rid, dict(run=gen, admission="handoff" if handoff else "open", inflight=[]))
         if os.path.exists(log) is False:
             open(log, "a").close()
             os.chmod(log, 0o600)
@@ -2058,7 +2091,9 @@ def launch_run(a, launch):
             raise Refused(f"the inbox for {rid} changed during launch")
         os.fchmod(fd, board.inbox_mode)
         s["state"] = "starting"
-        core.write_private(state_path(rid), s)
+        with admit_lock(rid):
+            core.write_private(state_path(rid), s)
+            admit_write(rid, dict(run=gen, admission="handoff" if handoff else "open", inflight=[]))
     finally:
         board.close()
     print(f"bus: {prot_text}", file=sys.stderr)

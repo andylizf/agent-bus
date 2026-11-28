@@ -285,6 +285,7 @@ def cmd_gc(a):
                                        note="no supervisor holds it: `bus adopt --all` (systemd mode) or stop its "
                                             "processes by hand (fallback mode)"))
     res["unknown"] = []
+    blocked = {}
     with board(write=True) as b:
         if b.ok:
             entries = {e["id"]: e for e in b.entries() if e["user"] == core.USER}
@@ -317,6 +318,12 @@ def cmd_gc(a):
                             if end is None:
                                 res["unknown"].append(rid)
                                 continue
+                            try:
+                                runner.end_abandoned_run(rid, st, end, b.pin_fields())
+                            except Refused as err:
+                                res["unknown"].append(rid)
+                                blocked[rid] = str(err)
+                                continue
                         elif not st:
                             res["unknown"].append(rid)
                             continue
@@ -329,16 +336,19 @@ def cmd_gc(a):
                                 or str(pinned.get("fsid")) != str(b.fsid)):
                             res["unknown"].append(rid)
                             continue
-                        if not e:
-                            sup = runner.Supervisor(rid)
-                            sup.s = st
-                            try:
-                                e = sup.entry()
-                            except KeyError:
-                                res["unknown"].append(rid)
-                                continue
-                        end = dict(core.clean(e), state="ended", ended=st.get("ended", now()),
-                                   end_reason=st.get("end_reason"))
+                        if st.get("never_started") is True and not e:
+                            end = move.abandoned_end(rid, st.get("end_reason"), st.get("ended"))
+                        else:
+                            if not e:
+                                sup = runner.Supervisor(rid)
+                                sup.s = st
+                                try:
+                                    e = sup.entry()
+                                except KeyError:
+                                    res["unknown"].append(rid)
+                                    continue
+                            end = dict(core.clean(e), state="ended", ended=st.get("ended", now()),
+                                       end_reason=st.get("end_reason"))
                     if not move.valid_archive_entry(end, b.ngpus) or not move.end_record(end):
                         res["unknown"].append(rid)
                         continue
@@ -355,13 +365,15 @@ def cmd_gc(a):
                 finally:
                     lk.release()
     if a.json:
+        if blocked:
+            res["blocked"] = blocked
         return out(res)
     for o in res["orphans"]:
         print(f"orphan {o['id']} ({o['state']}, {o['mode']}): {o['note']}")
     for x in res["archived"]:
         print(f"archived {x} (its run has ended)")
     for x in res["unknown"]:
-        print(f"left {x}: run end or abandoned launch could not be verified")
+        print(f"left {x}: {blocked.get(x, 'run end or abandoned launch could not be verified')}")
 
 
 def cmd_doctor(a):

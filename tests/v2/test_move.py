@@ -176,6 +176,7 @@ class BoardMove(BusTest):
                         runner.cmd_run(args)
                 inbox, = (p for p in (self.root / "inbox").iterdir() if p.name.endswith(args.slug))
                 self.assertEqual(stat.S_IMODE(inbox.stat().st_mode), runner.PREPARING_INBOX_MODE if before_state else 0o1777)
+                self.assertEqual(runner.admit_read(inbox.name)["admission"], "closed")
                 self.assertIn(inbox.name, self.bus_json("gc", "--mine", "--json")["unknown"])
                 aged = int(inbox.stat().st_ctime) + move.ABANDONED_INBOX_S + 2
                 gc = cli.parser().parse_args(["gc", "--mine", "--json"])
@@ -188,6 +189,47 @@ class BoardMove(BusTest):
                     self.assertEqual(out.call_args.args[0]["archived"], [inbox.name])
                 archived = next((self.root / "archive").glob(inbox.name + "-*.json"))
                 self.assertIn("run never started", json.loads(archived.read_bytes())["end_reason"])
+                self.assertEqual(runner.load_state(inbox.name)["state"], "ended")
+        self.cutover()
+
+    def test_gc_closes_admission_and_waits_for_exec_client_and_launcher(self):
+        sup = self.supervisor()
+        rid = sup.rid
+        inbox = self.root / "inbox" / rid
+        inbox.mkdir()
+        with core.Board.from_conf() as b:
+            sup.s.update(state="preparing", mode="systemd", user=core.USER, board=b.pin_fields())
+        sup.save()
+        client, launcher = {"pid": 123}, {"pid": 456}
+        intent = dict(exec_id="fixture", state="launching", client=client, launcher=launcher)
+        runner.admit_write(rid, dict(run=sup.s["run"], admission="open", inflight=[intent]))
+        with patch.object(runner.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(core.Refused, "admission .* is closed"):
+                runner.cmd_exec(rid, sup.s["run"], ["true"])
+            spawn.assert_not_called()
+        gc = cli.parser().parse_args(["gc", "--mine", "--json"])
+        aged = int(inbox.stat().st_ctime) + move.ABANDONED_INBOX_S + 2
+        with patch.object(core, "now", return_value=aged), self.installed_code(), patch.object(cli, "out") as out, \
+                patch.object(runner, "launch_units_absent", return_value=True):
+            for live in (client, launcher):
+                with patch.object(core, "identity_gone", side_effect=lambda identity: identity != live):
+                    cli.cmd_gc(gc)
+                self.assertIn("client or launcher is alive", out.call_args.args[0]["blocked"][rid])
+                self.assertEqual(runner.admit_read(rid)["admission"], "closed")
+                self.assertEqual(runner.load_state(rid)["state"], "preparing")
+                self.assertEqual(list((self.root / "archive").iterdir()), [])
+            with patch.object(core, "identity_gone", return_value=True), \
+                    patch.object(core, "publish", side_effect=OSError("interrupted archive")):
+                cli.cmd_gc(gc)
+            self.assertEqual(runner.load_state(rid)["state"], "ended")
+            self.assertEqual(runner.admit_read(rid)["inflight"][0]["state"], "cancelled")
+            self.assertEqual(list((self.root / "archive").iterdir()), [])
+            cli.cmd_gc(gc)
+            self.assertEqual(out.call_args.args[0]["archived"], [rid])
+        with patch.object(runner.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(core.Refused, "admission .* is closed"):
+                runner.cmd_exec(rid, sup.s["run"], ["true"])
+            spawn.assert_not_called()
         self.cutover()
 
     def test_end_record_from_a_hyphenated_name_prefix_cannot_clear_another_users_inbox(self):
@@ -391,7 +433,7 @@ class BoardMove(BusTest):
 
         def interrupt(fd, name, data, *args, **kwargs):
             if name == core.MOVE_PENDING:
-                core._tmp(fd, data[:6])
+                core._tmp(fd, data[:6], name=kwargs["temp_name"])
                 raise OSError("interrupted marker")
             return publish(fd, name, data, *args, **kwargs)
 
@@ -400,12 +442,17 @@ class BoardMove(BusTest):
                 move.command(str(self.root), str(self.target))
         self.assertTrue(self.root.exists())
         temp, = self.target.iterdir()
+        with core.Board(str(self.root)) as old:
+            journal = move.owned_json(old, move.PREPARE)
+        self.assertEqual(temp.name, f"{core.MOVE_PENDING}.{journal['nonce']}.tmp")
         self.assertFalse((self.target / core.MOVE_PENDING).exists())
-        unrelated = self.target / ".tmp-unrelated"
-        unrelated.touch()
-        self.assertIn("destination must be empty", self.cutover(check=False).stderr)
-        self.assertTrue(temp.exists())
-        unrelated.unlink()
+        for name in (".tmp-" + "a" * 16, f"{core.MOVE_PENDING}.{'b' * 32}.tmp"):
+            unrelated = self.target / name
+            unrelated.write_bytes(temp.read_bytes())
+            self.assertIn("destination must be empty", self.cutover(check=False).stderr)
+            self.assertTrue(temp.exists())
+            self.assertTrue(unrelated.exists())
+            unrelated.unlink()
         self.cutover()
         self.assertFalse(temp.exists())
 

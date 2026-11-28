@@ -2,6 +2,7 @@
 import fcntl
 import os
 import re
+import secrets
 import stat
 
 from . import core, setup
@@ -9,12 +10,13 @@ from .core import Refused
 
 RECORD = "move.json"
 SEAL = ".move-seal"
+PREPARE = ".move-prepare"
 CLIENT_PREFIX = "account-build-"
 MOVE_PROTOCOL = 2
 PUBLISHER_LOOKBACK_S = 14 * 86400
 ABANDONED_INBOX_S = 120
 RUN_INBOX = re.compile(r"\d{8}-\d{6}-.+")
-PUBLISH_TEMP = re.compile(r"\.tmp-[0-9a-f]{16}")
+MOVE_NONCE = re.compile(r"[0-9a-f]{32}")
 
 
 def confirmed():
@@ -154,11 +156,15 @@ def abandoned_inbox(board, rid, state):
     if (state.get("main_started") or state.get("main_pin_required") or state.get("supervisor")
             or state.get("leader") or state.get("pgid") or (state.get("units") or {}).get("cgroup_path")
             or os.path.lexists(os.path.join(core.STATE(), "ctl", rid, "main-cgroup.json"))
-            or (hb is not None and core.read_file(hb, rid, 4096) is not None)
-            or not runner.launch_units_absent(rid)):
+            or (hb is not None and core.read_file(hb, rid, 4096) is not None)):
         return None
+    return abandoned_end(rid, "run never started: launch stopped before admission", core.now())
+
+
+def abandoned_end(rid, reason, ended):
+    from . import runner
     end = dict(id=rid, user=core.USER, host=core.HOST, state="ended", never_started=True, build=runner.build_version(),
-               end_reason="run never started: launch stopped before admission", ended=core.now())
+               end_reason=reason, ended=ended)
     if confirmed():
         end["move_protocol"] = MOVE_PROTOCOL
     return end
@@ -309,23 +315,36 @@ def prepare(old, path):
             core.take_flock(fd, fcntl.LOCK_EX, core.BOARD_ADMIN_LEASE_S, path)
             marker = core.read_json(fd, core.MOVE_PENDING)
             pin = old.pin_fields()
+            ino, fsid = core.identity(fd)
+            target = dict(path=path, inode=ino, fsid=fsid)
             if marker is None:
                 temps = os.listdir(fd)
-                for temp in temps:
+                journal = owned_json(old, PREPARE)
+                if journal is None:
+                    if temps:
+                        raise Refused(f"{path}: destination must be empty")
+                    journal = dict(target=target, nonce=secrets.token_hex(16))
+                    core.publish(old.fd, PREPARE, core.dumps(journal))
+                nonce = journal.get("nonce")
+                if journal.get("target") != target or not isinstance(nonce, str) or not MOVE_NONCE.fullmatch(nonce):
+                    raise Refused(f"{path}: destination differs from the move journal")
+                temp = f"{core.MOVE_PENDING}.{nonce}.tmp"
+                if temps:
+                    if temps != [temp]:
+                        raise Refused(f"{path}: destination must be empty except for this move's pending file")
                     st = os.stat(temp, dir_fd=fd, follow_symlinks=False)
-                    if (not PUBLISH_TEMP.fullmatch(temp) or not stat.S_ISREG(st.st_mode)
+                    if (not stat.S_ISREG(st.st_mode)
                             or st.st_uid != old.creator or st.st_nlink != 1 or st.st_mode & 0o022):
                         raise Refused(f"{path}: destination must be empty")
                 os.fchmod(fd, 0o700)
-                for temp in temps:
+                if temps:
                     core.unlink_own(fd, temp)
-                core.publish(fd, core.MOVE_PENDING, core.dumps(pin))
+                core.publish(fd, core.MOVE_PENDING, core.dumps(pin), temp_name=temp)
             elif marker[0] != pin or marker[1].st_uid != old.creator or marker[1].st_mode & 0o022:
                 raise Refused(f"{path}: destination belongs to another transaction")
             os.fchmod(fd, 0o700)
             populate_destination(old, fd)
-            ino, fsid = core.identity(fd)
-            return dict(path=path, inode=ino, fsid=fsid)
+            return target
         finally:
             os.close(fd)
     finally:
