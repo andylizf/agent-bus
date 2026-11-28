@@ -23,11 +23,13 @@ def when(t):
     return time.strftime("%a %m-%d %H:%M", time.localtime(t)) if isinstance(t, (int, float)) else "-"
 
 
-def board():
+def board(*, write=False):
     b = core.Board.from_conf()
     if b.pending:
         b.close()
         raise Refused(f"{b.path} is a prepared destination; the source is still active")
+    if write:
+        move.announce(b, runner.build_version())
     return b
 
 
@@ -84,7 +86,7 @@ def cmd_cal(a):
 # ------------------------------------------------------------------------------------------------ bookings
 
 def cmd_book(a):
-    with board() as b:
+    with board(write=True) as b:
         gpus = core.parse_gpus(a.gpus, b.ngpus)
         res = bk.publish_booking(b, gpus, bk.parse_when(a.start), bk.parse_when(a.end),
                                  bk.parse_duration(a.objection) if a.objection else None, a.kind, a.note or "",
@@ -99,13 +101,13 @@ def cmd_book(a):
 
 def cmd_unbook(a):
     core.component(a.id, "booking id")
-    with board() as b:
+    with board(write=True) as b:
         bk.unbook(b, a.id)
     print(f"removed booking {a.id}")
 
 
 def cmd_object(a):
-    with board() as b:
+    with board(write=True) as b:
         if a.withdraw:
             bk.withdraw_objection(b, a.withdraw)
             return print(f"withdrew objection {a.withdraw}")
@@ -129,12 +131,12 @@ def own_mailbox(b, name="mail"):
 
 
 def cmd_mailbox(a):
-    with board() as b:
+    with board(write=True) as b:
         print(own_mailbox(b, a.name))
 
 
 def cmd_send(a):
-    with board() as b:
+    with board(write=True) as b:
         b.writable()
         to_run = a.to_run
         if a.kind == "request" and not to_run:
@@ -169,7 +171,7 @@ def my_boxes(b):
 
 
 def cmd_reply(a):
-    with board() as b:
+    with board(write=True) as b:
         b.writable()
         for box in my_boxes(b):
             m = next((m for m in b.messages(box) if m["id"] == a.msg), None)
@@ -485,6 +487,12 @@ def cmd_auto_timer(a):
         print('auto-upgrade: timer unavailable; run loginctl enable-linger "$USER"')
         return
     result, code = auto_upgrade.check(flip)
+    if runner.build_root() == runner.build_root(core.BIN()):
+        try:
+            with core.Board.from_conf() as b:
+                move.announce(b, runner.build_version())
+        except (OSError, Refused):
+            pass
     print(f"auto-upgrade: {result}")
     return code
 

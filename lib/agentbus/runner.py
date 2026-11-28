@@ -869,6 +869,8 @@ class Supervisor:
                  booking=s.get("booking"), run=s["run"], started=s["started"], until=s["until"], kind=s["kind"],
                  exclusive=bool(s.get("exclusive")), note=s.get("note") or "", state=s["entry_state"],
                  schema=core.SCHEMA, build=self.version)
+        if move.confirmed():
+            e["move_protocol"] = move.MOVE_PROTOCOL
         if s.get("stop_cost_min") is not None:
             e["stop_cost_min"] = s["stop_cost_min"]
         if s.get("booking_revision"):
@@ -896,6 +898,7 @@ class Supervisor:
         self.write_entry(board)
         if not core.touch(board.wdir("agents", ".heartbeat"), self.rid, data=(self.version + "\n").encode()):
             raise Refused(f"could not publish heartbeat {self.rid}")
+        move.announce(board, self.version)
 
     def archive_entry(self, board):
         """Archive the run's entry if it is on the board. Decided by the board, not by the state's entry_on_board: a
@@ -1568,9 +1571,9 @@ class Supervisor:
                 return
             if moved:
                 try:
-                    board.repin_conf(s["board"])
-                    s["board"] = board.pin_fields()
-                    self.save()
+                    if board.repin_conf(s["board"]):
+                        s["board"] = board.pin_fields()
+                        self.save()
                 except OSError as e:
                     s["board_error"] = str(e)
             if s["mode"] == "systemd" and s["state"] in ("running", "leader-exited", "stopping", "needs-reconcile") \
@@ -1945,6 +1948,8 @@ def classify(board, rows, gpus, scheduled, t):
         if t >= b["end"]:
             raise Refused(f"{scheduled} ended at {time.strftime('%m-%d %H:%M', time.localtime(b['end']))}")
     other = bk.standing_active_on(rows, gpus, t, exclude=scheduled)
+    other.extend(b for b in move.unreplayed_standing(board, t)
+                 if b["id"] != scheduled and set(b["gpus"]) & set(gpus))
     if other:
         o = other[0]
         raise Refused(f"GPUs {core.gpu_text(sorted(set(o['gpus']) & set(gpus)))} are inside {o['user']}'s standing "
@@ -2048,6 +2053,10 @@ def launch_run(a, launch):
         if os.path.exists(log) is False:
             open(log, "a").close()
             os.chmod(log, 0o600)
+        # Finish can run as soon as this lease is released, before either systemd unit exists.
+        reservation = Supervisor(rid)
+        reservation.s = s
+        core.publish(board.wdir("agents"), f"{rid}.json", core.dumps(reservation.entry()))
     finally:
         board.close()
     print(f"bus: {prot_text}", file=sys.stderr)

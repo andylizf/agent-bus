@@ -10,6 +10,26 @@ from .core import Refused
 
 RECORD = "move.json"
 SEAL = ".move-seal"
+CLIENT_PREFIX = "account-build-"
+MOVE_PROTOCOL = 1
+PUBLISHER_LOOKBACK_S = 14 * 86400
+CUTOVER_MARGIN_S = 300
+RECEIPT_DRAIN_S = 3
+
+
+def confirmed():
+    from . import auto_upgrade
+    return not auto_upgrade.read_state().get("pending")
+
+
+def announce(board, build):
+    if not board.ok or board.pending or not confirmed():
+        return
+    try:
+        data = core.dumps(dict(user=core.USER, build=build, move_protocol=MOVE_PROTOCOL))
+        core.touch(board.wdir("agents", ".heartbeat"), CLIENT_PREFIX + core.USER + ".json", data=data)
+    except (OSError, Refused):
+        pass
 
 
 def retired(pin):
@@ -54,7 +74,7 @@ def destination(old, pin):
 
 def follow(pin):
     """The archive must be the exact pinned source, even if someone reuses its old name."""
-    if pin.get("host") != core.HOST:
+    if pin.get("host") != core.HOST or not confirmed():
         return None
     try:
         old = core.Board(retired(pin))
@@ -139,7 +159,7 @@ def replay(old, new):
     # This lock is private to the author. Its shared completion marker is published after the last record.
     lock = os.path.join(core.private_dir("board-moves"), f"{new.fsid}-{new.ino}.lock")
     with open(lock, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+        core.take_flock(f, fcntl.LOCK_EX, core.BOARD_LEASE_S, "author replay")
         marker = f"{core.USER}.json"
         fd = new.wdir("migration")
         done = core.read_file(fd, marker)
@@ -250,6 +270,115 @@ def require_owner(board):
         raise Refused(f"{board.path}: run this as the board owner with an owner-writable root and config")
 
 
+def capable(row):
+    return row.get("move_protocol") == MOVE_PROTOCOL and bool(row.get("build")) and core.note_ok(row["build"], 128)
+
+
+def names_in(board, *parts):
+    fd = board.dir(*parts)
+    names, _ = core.scan(fd) if fd is not None else ([], 0)
+    if names is None:
+        raise Refused(f"cannot enumerate {'/'.join(parts)} for cutover")
+    return names
+
+
+def publisher_readiness(board, entries, receipts, t):
+    authors, versions, old_runs = set(), {}, []
+
+    def observe(user, when, build=None, is_capable=False):
+        if when >= t - PUBLISHER_LOOKBACK_S:
+            authors.add(user)
+        if build is not None and when >= versions.get(user, (0, "", False))[0]:
+            versions[user] = when, build, is_capable
+
+    heartbeat = board.dir("agents", ".heartbeat")
+    for e in entries:
+        hb = core.read_file(heartbeat, e["id"], 4096) if heartbeat is not None else None
+        matching = not hb or (
+            core.owner_name(hb[1].st_uid) == e["user"] and not hb[1].st_mode & 0o022
+            and hb[0].decode("utf-8", "replace").strip() == e.get("build"))
+        observe(e["user"], max(e["_ctime"], hb[1].st_ctime if hb and matching else 0),
+                e.get("build", "unknown"), capable(e) and matching)
+        if not capable(e) or not matching:
+            old_runs.append(f"{e['id']} ({e['user']}, {e.get('build', 'unknown')})")
+
+    for name in names_in(board, "archive"):
+        if not name.endswith(".json"):
+            continue
+        row = core.read_json(board.dir("archive"), name)
+        if row:
+            e, st, _ = row
+            user = core.owner_name(st.st_uid)
+            if core.check_entry(e, board.ngpus) and e["user"] == user and not st.st_mode & 0o022:
+                observe(user, st.st_ctime, e.get("build", "unknown"), capable(e))
+
+    for e in [*board.bookings_raw(), *board.objections(), *board.arrivals(), *receipts.values()]:
+        observe(e["user"], e["_ctime"])
+    for name in names_in(board, "log"):
+        st = os.stat(name, dir_fd=board.dir("log"), follow_symlinks=False)
+        if stat.S_ISREG(st.st_mode) and name == core.owner_name(st.st_uid) + ".jsonl":
+            observe(core.owner_name(st.st_uid), st.st_ctime)
+    for box in names_in(board, "inbox"):
+        if board.inbox_owner(box) is not None:
+            for m in board.messages(box):
+                observe(m["sender"], m["_ctime"])
+
+    for name in names_in(board, "agents", ".heartbeat"):
+        if not name.startswith(CLIENT_PREFIX) or not name.endswith(".json"):
+            continue
+        row = core.read_json(heartbeat, name, 4096)
+        if row:
+            e, st, _ = row
+            user = core.owner_name(st.st_uid)
+            if (name == CLIENT_PREFIX + user + ".json" and e.get("user") == user and not st.st_mode & 0o022
+                    and core.note_ok(e.get("build"), 128)):
+                observe(user, st.st_ctime, e["build"], capable(e))
+    missing = [f"{user} ({versions.get(user, (0, 'unknown', False))[1]})" for user in sorted(authors)
+               if not versions.get(user, (0, "", False))[2]]
+    return missing, sorted(old_runs)
+
+
+def quiet(board, *, drain_receipts=False):
+    from . import bookings
+
+    deadline = time.monotonic() + (RECEIPT_DRAIN_S if drain_receipts else 0)
+    while True:
+        t = core.now()
+        entries = bookings.entries_with_occupancy(board)
+        receipts = board.receipts()
+        rows = bookings.evaluate(board, t, entries=entries, receipts=receipts, record=False)
+        incomplete = [r["id"] for r in rows if r["end"] > t and r["state"] == "unpublished"]
+        if not incomplete or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    if incomplete:
+        raise Refused("booking revision has no completed receipt: " + ", ".join(incomplete))
+    missing, old_runs = publisher_readiness(board, entries, receipts, t)
+    open_windows = [r["id"] for r in rows if r["state"] == "pending" or t < (r.get("objection_close") or 0)]
+    overlaps = [r["id"] for r in rows if r["user"] != core.USER and r["state"] == "standing"
+                and r["end"] > t and max(r["start"], r["objection_close"]) <= t + CUTOVER_MARGIN_S]
+    reasons = []
+    for reason, records in (("accounts without a move-capable build", missing),
+                            ("runs without a move-capable build", old_runs),
+                            ("open objection windows", open_windows),
+                            ("other accounts' bookings within five minutes", overlaps)):
+        if records:
+            reasons.append(reason + ": " + ", ".join(records))
+    if board.warnings:
+        reasons.append("source records could not be read completely")
+    if reasons:
+        raise Refused("cutover requires a quiet board\n" + "\n".join(reasons))
+
+
+def unreplayed_standing(board, t):
+    old = getattr(board, "origin", {}).get("bookings", [])
+    if not old:
+        return []
+    ready = completed(board)
+    return [b for b in old if b["user"] not in ready and b["state"] == "standing"
+            and max(b["start"], b["objection_close"]) <= t < b["end"]]
+
+
 def stage(old, new):
     require_owner(old)
     require_owner(new)
@@ -257,6 +386,7 @@ def stage(old, new):
         raise Refused("use two boards on this host with the same GPU count and booking limits")
     if old.pending or new.origin or new.entries() or any(artifact_refs(new)) or new.warnings:
         raise Refused("the source must be active and the destination empty")
+    quiet(old)
     if new.pending:
         if owned_json(new, core.MOVE_PENDING) != old.pin_fields():
             raise Refused("the destination is reserved for another move")
@@ -266,11 +396,9 @@ def stage(old, new):
 
 
 def write_dirs(old):
-    seq = old.dir("seq")
-    blocks, _ = core.scan(seq) if seq is not None else ([], 0)
-    if blocks is None:
-        raise Refused("cannot enumerate receipt blocks")
-    return [("seq", name) for name in blocks if name.isdecimal()] + [
+    blocks = [("seq", name) for name in names_in(old, "seq") if name.isdecimal()]
+    mailboxes = [("inbox", name) for name in names_in(old, "inbox") if old.inbox_owner(name)]
+    return blocks + mailboxes + [
         ("bookings",), ("objections",), ("arrivals",), ("agents",), ("agents", ".heartbeat"),
         ("inbox",), ("archive",), ("log",), ("seq",), ("migration",)]
 
@@ -298,6 +426,7 @@ def finish(old, new, fenced_at):
     archive = retired(pin)
     if owned_json(new, core.MOVE_PENDING) != pin or os.path.lexists(archive):
         raise Refused("the destination is not staged for this source or the archive name is taken")
+    quiet(old, drain_receipts=True)
     parent = core.walk(os.path.dirname(old.path))
     modes = {}
     switched = False
@@ -315,6 +444,7 @@ def finish(old, new, fenced_at):
             modes = saved
         for part, mode in modes.items():
             directory_mode(old, part.split("/"), mode & ~0o222)
+        quiet(old)
         origin = manifest(old, fenced_at)
         origin["staged_at"] = owner_file(new, core.MOVE_PENDING)[1].st_mtime
         if new.dir("seq", str((origin["floor"] + 1) // 10000)) is None:

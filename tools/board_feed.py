@@ -24,7 +24,8 @@ sys.path.insert(0, str(lib))
 from agentbus import core, page
 
 data = page.collect(core.load_conf(), history=False)
-if data['board'] != '/scratch/agent-bus-v2' or [g['gpu'] for g in data['gpus'] if g['available']] != list(range(8)):
+boards = ('/scratch/gpfs/TRIDAO/agent-bus-v2', '/scratch/agent-bus-v2')
+if data['board'] not in boards or [g['gpu'] for g in data['gpus'] if g['available']] != list(range(8)):
     sys.exit('incomplete board reading')
 print(json.dumps(page.public_feed(data), separators=(',', ':')))
 '''

@@ -165,10 +165,6 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
         rt = times[slot][0]
         info = dict(slot=slot, order=slot, receipt_time=rt, objection_close=rt + b["objection_s"], replaced=repl,
                     inherited=False)
-        carried = inherited.get(b["id"])
-        if carried and carried["revision"] == rev and info["objection_close"] > origin["at"]:
-            ready_at = ready.get(b["user"], t)
-            info["objection_close"] += max(0, ready_at - origin["at"])
         prev = b.get("previous")
         if isinstance(prev, str) and depth < CHAIN_MAX and not (depth == 0 and b["id"] in revoked):
             try:

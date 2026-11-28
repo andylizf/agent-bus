@@ -7,8 +7,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from helpers import BusTest, PY, REPO
-from agentbus import bookings, cli, core, move, runner, setup
+from helpers import BusTest, PY, REPO, wait_for
+from agentbus import auto_upgrade, bookings, cli, core, move, runner, setup
 
 
 class BoardMove(BusTest):
@@ -33,6 +33,14 @@ class BoardMove(BusTest):
     def activate(self):
         self.move("stage")
         self.move("finish")
+
+    def book(self, board, gpu=0, start=None):
+        move.announce(board, runner.build_version())
+        start = core.now() + 600 if start is None else start
+        return bookings.publish_booking(board, [gpu], start, start + 600, objection_s=1)
+
+    def close_window(self, booking):
+        wait_for(lambda: core.now() >= booking["objection_close"], 4, what="objection window closing")
 
     def supervisor(self):
         rid = core.new_id("move")
@@ -147,9 +155,12 @@ class BoardMove(BusTest):
         self.assertEqual(core.load_conf(), self.pin)
         self.assertFalse((self.target / "agents" / name).exists())
         self.bus("mailbox", "between-stage-and-finish", check=True)
-        t = core.now()
         with core.Board.from_conf() as board:
-            info = bookings.publish_booking(board, [1], t + 120, t + 600, objection_s=60)
+            info = self.book(board, 1)
+        result = self.move("finish", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("open objection windows", result.stderr)
+        self.close_window(info)
         self.move("finish")
         sup.one_pass()
         self.assertTrue((self.target / "agents" / name).exists())
@@ -168,29 +179,35 @@ class BoardMove(BusTest):
         self.assertEqual(sup.s["state"], "running")
 
     def test_finish_drains_aware_writer_and_seals_legacy_descriptor(self):
+        box = self.bus("mailbox", "seal", check=True).stdout.strip()
         self.move("stage")
         afd = core.walk(str(self.root / "arrivals"))
+        mailbox = core.walk(str(self.root / "inbox" / box))
         try:
             with core.Board.from_conf() as board:
                 command = [PY, "-IB", self.entry_point(), "move-board", "finish",
                            str(self.root), str(self.target), "--wait", "0"]
                 p = subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                t = core.now()
-                info = bookings.publish_booking(board, [1], t + 120, t + 600, objection_s=60)
+                info = self.book(board, 1)
+                self.close_window(info)
                 self.assertTrue(self.root.exists())
             stdout, stderr = p.communicate(timeout=10)
             self.assertEqual(p.returncode, 0, (stdout, stderr))
             self.assertFalse(self.root.exists())
             with self.assertRaises(PermissionError):
                 core.publish(afd, "legacy-arrival.json", b"{}")
+            with self.assertRaises(PermissionError):
+                core.publish(mailbox, "legacy-mail.json", b"{}")
             self.assertEqual(self.bus_json("ls", "--json")["bookings"][0]["id"], info["id"])
         finally:
             os.close(afd)
+            os.close(mailbox)
 
     def test_two_same_user_clients_replay_once_and_reserve_original_slots(self):
         t = core.now()
         with core.Board.from_conf() as board:
-            info = bookings.publish_booking(board, [0], t + 120, t + 600, objection_s=60)
+            info = self.book(board)
+        self.close_window(info)
         self.activate()
         command = [PY, "-IB", self.entry_point(), "ls", "--json"]
         clients = [subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
@@ -243,11 +260,13 @@ class BoardMove(BusTest):
         self.assertEqual(sup.s["board"]["path"], str(self.target))
         self.assertTrue(sup.s["inbox_unavailable"])
 
-    def test_objection_clock_pauses_until_booking_replay_and_missing_objector_cannot_grant_it(self):
+    def test_replay_keeps_closed_objection_clock_and_missing_objector_cannot_grant_booking(self):
         t = core.now()
         with core.Board.from_conf() as board:
-            old = bookings.publish_booking(board, [0], t + 120, t + 600, objection_s=60)
+            old = self.book(board)
             self.assertTrue(bookings.record_arrival(board, old["id"], old["revision"], core.new_id("arrival"), "a" * 32))
+        self.assertIn("open objection windows", self.move("stage", check=False).stderr)
+        self.close_window(old)
         self.activate()
         with core.Board.from_conf() as board:
             self.assertEqual(board.arrivals()[0]["revision"], old["revision"])
@@ -255,9 +274,100 @@ class BoardMove(BusTest):
             seen = core.read_private(os.path.join(core.STATE(), "slots.json"))["slots"]
             with patch.object(move, "completed", return_value={core.USER: board.origin["at"] + 20}):
                 row = bookings.evaluate(board, t + 90, seen=seen, record=False)[0]
-            self.assertEqual(row["objection_close"], old["objection_close"] + 20)
+            self.assertEqual(row["objection_close"], old["objection_close"])
             self.assertEqual(row["state"], "pending")
             self.assertIn("waiting for an objection", row["why"])
+
+    def test_recent_foreign_author_requires_owned_build_announcement(self):
+        foreign_uid = core.UID + 1
+        (self.root / "log" / "author.jsonl").write_text("{}\n")
+        hb = self.root / "agents" / ".heartbeat" / (move.CLIENT_PREFIX + "author.json")
+        hb.write_bytes(core.dumps(dict(user="author", build="v2.0.10", move_protocol=move.MOVE_PROTOCOL)))
+        read = core.read_json
+        original_stat = os.stat
+
+        def by_owner(fd, name, *args):
+            row = read(fd, name, *args)
+            if name == hb.name and row:
+                return row[0], SimpleNamespace(st_uid=foreign_uid, st_ctime=row[1].st_ctime, st_mode=row[1].st_mode), row[2]
+            return row
+
+        def record_stat(path, *args, **kwargs):
+            st = original_stat(path, *args, **kwargs)
+            if path == "author.jsonl":
+                return SimpleNamespace(st_uid=foreign_uid, st_mode=st.st_mode, st_ctime=st.st_ctime)
+            return st
+
+        with core.Board(str(self.root)) as old, patch.object(core.os, "stat", side_effect=record_stat), \
+                patch.object(core, "owner_name", side_effect=lambda uid: "author" if uid == foreign_uid else core.USER):
+            with self.assertRaisesRegex(core.Refused, r"accounts without a move-capable build: author"):
+                move.quiet(old)
+            with patch.object(core, "read_json", side_effect=by_owner):
+                move.quiet(old)
+
+    def test_new_account_cannot_launch_during_an_unreplayed_foreign_booking(self):
+        with core.Board.from_conf() as board:
+            info = self.book(board, start=core.now() + 3)
+        self.close_window(info)
+        with core.Board(str(self.root)) as old, patch.object(core, "USER", "another-user"):
+            with self.assertRaisesRegex(core.Refused, "other accounts' bookings within five minutes"):
+                move.quiet(old)
+        self.activate()
+        with core.Board(str(self.target)) as board, patch.object(core, "USER", "another-user"):
+            with self.assertRaisesRegex(core.Refused, "standing booking"):
+                runner.classify(board, [], [0], None, info["start"] + 5)
+
+    def test_finish_refuses_legacy_booking_revision_without_receipt(self):
+        self.move("stage")
+        t = core.now()
+        with core.Board.from_conf() as board:
+            move.announce(board, runner.build_version())
+            with patch.object(bookings, "claim_receipt", side_effect=core.Refused("legacy writer interrupted")):
+                with self.assertRaisesRegex(core.Refused, "legacy writer interrupted"):
+                    bookings.publish_booking(board, [0], t + 600, t + 1200, objection_s=1)
+        result = self.move("finish", check=False)
+        self.assertIn("booking revision has no completed receipt", result.stderr)
+        self.assertTrue(self.root.exists())
+        self.assertFalse(self.retired.exists())
+
+    def test_pending_upgrade_leaves_both_pins_on_source_until_confirmed(self):
+        sup = self.supervisor()
+        sup.one_pass()
+        self.activate()
+        core.write_private(auto_upgrade.state_file(), {"pending": {"build": "candidate"}})
+        sup.one_pass()
+        self.assertEqual(core.load_conf(), self.pin)
+        self.assertEqual(sup.s["board"]["path"], str(self.root))
+        self.assertFalse((self.target / "agents" / f"{sup.rid}.json").exists())
+        core.write_private(auto_upgrade.state_file(), {})
+        sup.one_pass()
+        self.assertEqual(core.load_conf()["path"], str(self.target))
+        self.assertEqual(sup.s["board"]["path"], str(self.target))
+
+    def test_exclusive_board_lock_times_out_and_private_cleanup_runs(self):
+        sup = self.supervisor()
+        with core.Board(str(self.root)).lease(exclusive=True), patch.object(core, "BOARD_LEASE_S", 0.03):
+            sup.one_pass()
+        sup.leader_exit_step.assert_called_once()
+        self.assertFalse(sup.leader_exit_step.call_args.args[0].ok)
+        self.assertIn("lock busy", sup.s["notices"][-1]["detail"])
+
+    def test_launch_has_migratable_entry_before_starting_systemd_unit(self):
+        self.move("stage")
+        args = cli.parser().parse_args(["run", "--gpus", "0", "--detach", "true"])
+
+        def start(rid, state):
+            with core.Board(str(self.root)).lease(exclusive=True) as old:
+                runs = move.manifest(old, core.now())["runs"]
+                self.assertIn(dict(id=rid, user=core.USER, gpus=[0], run=state["run"]), runs)
+            return 0, ""
+
+        with patch.object(runner, "user_manager_ok", return_value=True), \
+                patch.object(runner, "start_main_unit", side_effect=start) as main, \
+                patch.object(runner, "cgroup_of", return_value="/fixture"), \
+                patch.object(runner, "systemd_run", return_value=(0, "")):
+            self.assertEqual(runner.cmd_run(args), 0)
+            main.assert_called_once()
 
     def test_install_checks_expected_owner_and_local_host(self):
         a = SimpleNamespace(board=str(self.target), board_owner=None, src=str(REPO), print_host=False)

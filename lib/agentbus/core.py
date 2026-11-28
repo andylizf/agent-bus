@@ -40,6 +40,8 @@ MAX_MESSAGES_PER_HOUR = 128
 MOVE_PENDING = ".move-pending"
 MOVE_ORIGIN = ".move-origin"
 MOVE_LIMIT = 4 * 1024 * 1024
+BOARD_LEASE_S = 0.5
+BOARD_ADMIN_LEASE_S = 10.0
 DEFAULT_BOARD = "/scratch/agent-bus-v2"
 DEFAULT_BOARD_OWNER = "al9080"
 DEFAULT_BOARD_HOST = "della-tridao"
@@ -189,6 +191,19 @@ def proc_cgroup(pid):
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+
+
+def take_flock(fd, mode, timeout, description):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, mode | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Refused(f"{description}: lock busy; retry") from None
+            time.sleep(min(remaining, 0.05))
 
 
 def walk(path):
@@ -639,10 +654,14 @@ class Board:
         return dict(path=self.path, inode=self.ino, fsid=self.fsid)
 
     def repin_conf(self, old):
+        from . import move
+        if not move.confirmed():
+            return False
         conf = load_conf()
         if (conf.get("path"), conf.get("inode"), conf.get("fsid")) == (
                 old["path"], str(old["inode"]), str(old["fsid"])):
             save_conf(dict(conf, **self.pin_fields(), host=self.host))
+        return True
 
     def read_move(self):
         self.pending = read_file(self.fd, MOVE_PENDING, 4096) is not None
@@ -653,7 +672,8 @@ class Board:
     def lease(self, *, exclusive=False):
         """Keep a board transaction on one side of a cutover, even when it holds child descriptors."""
         try:
-            fcntl.flock(self.fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            take_flock(self.fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
+                       BOARD_ADMIN_LEASE_S if exclusive else BOARD_LEASE_S, self.path)
             self.leased = True
             self.read_move()
         except BaseException:
@@ -670,7 +690,9 @@ class Board:
             if fd is not None:
                 os.close(fd)
         self._dirs = {}
-        os.close(self.fd)
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
 
     def __enter__(self):
         return self
@@ -754,6 +776,7 @@ class Board:
                 continue
             obj = dict(obj)
             obj["_mode"], obj["_sha"], obj["_mtime"] = stat.S_IMODE(st.st_mode), sha, st.st_mtime
+            obj["_ctime"] = st.st_ctime
             out.append(obj)
         return out
 
@@ -835,7 +858,7 @@ class Board:
                 if (not check_receipt(obj) or obj["slot"] != slot or st.st_mode & 0o022
                         or owner_name(st.st_uid) != obj["user"]):
                     continue
-                obj = dict(obj, _sha=sha)
+                obj = dict(obj, _sha=sha, _ctime=st.st_ctime)
                 out[slot] = obj
                 if cache is not None:
                     cache[key] = obj

@@ -39,11 +39,11 @@ class Gate(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         return Path(directory.name).resolve()
 
-    def command(self, script, *args, env=None):
+    def command(self, script, *args, env=None, expected=0):
         result = subprocess.run([sys.executable, "-IB", str(script), *map(str, args)], env=env,
                                 capture_output=True, text=True, timeout=40)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        return result.stdout
+        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        return result.stderr if expected else result.stdout
 
     def wait_for(self, test, what):
         deadline = time.monotonic() + 20
@@ -78,8 +78,9 @@ class Gate(unittest.TestCase):
         if pid is None or pin.get("path") != str(board):
             return None
         try:
-            if (heartbeat.read_text().strip() == client["label"]
-                    and json.loads(entry.read_bytes()).get("build") == client["label"]):
+            row = json.loads(entry.read_bytes())
+            if (heartbeat.read_text().strip() == client["label"] and row.get("build") == client["label"]
+                    and (not client.get("upgraded") or move.capable(row))):
                 return pid
         except FileNotFoundError:
             return None
@@ -120,7 +121,7 @@ class Gate(unittest.TestCase):
                 result, rc = auto_upgrade.check(cli.flip)
             self.assertEqual(rc, 0, result)
             self.assertEqual(result, f"upgraded {client['label']} to {label}")
-            client.update(build=candidate, label=label)
+            client.update(build=candidate, label=label, upgraded=True)
             pid = self.wait_for(lambda: self.healthy(client, board, after_ns), f"upgraded supervisor on {board}")
             self.assertEqual(self.identity(client), client["original_job"])
             return pid
@@ -162,6 +163,8 @@ class Gate(unittest.TestCase):
         from agentbus import setup
         for board in (self.old, self.new):
             setup.setup_board(str(board), host=core.HOST, gpus=1, blocks=3)
+            with (board / "config").open("a") as f:
+                f.write("min_objection_s=1\n")
         with core.Board(str(self.old)) as old, core.Board(str(self.new)) as new:
             self.archive = Path(move.retired(old.pin_fields()))
             report(f"start: {core.HOST}, source fsid {old.fsid}, destination fsid {new.fsid}, previous {self.args.previous}")
@@ -169,32 +172,44 @@ class Gate(unittest.TestCase):
         early = self.start("early")
         late = self.start("late")
         self.upgrade(early, self.old)
+        refusal = self.command(ROOT / "bin" / "bus", "move-board", "stage", self.old, self.new,
+                               env=self.env, expected=1)
+        self.assertIn("runs without a move-capable build", refusal)
+        self.assertIn(late["info"]["id"], refusal)
+        report("stage refused while one real supervisor was still on the pre-move build")
+        self.upgrade(late, self.old)
         self.command(ROOT / "bin" / "bus", "move-board", "stage", self.old, self.new, env=self.env)
         t = core.now()
         booked = json.loads(self.command(late["bus"], "book", "--gpus", "0", "--from", t + 3600, "--to", t + 7200,
-                                          "--objection", "10m", "--json", env=late["env"]))
+                                          "--objection", "3s", "--json", env=late["env"]))
+        refusal = self.command(ROOT / "bin" / "bus", "move-board", "finish", self.old, self.new, "--wait", 0,
+                               env=self.env, expected=1)
+        self.assertIn("open objection windows", refusal)
+        report("finish refused a booking opened after stage")
+        self.wait_for(lambda: core.now() >= booked["objection_close"], "objection window closing")
         afd = core.walk(str(self.old / "arrivals"))
+        mailbox = core.walk(str(self.old / "inbox" / late["info"]["id"]))
         try:
             report(self.command(ROOT / "bin" / "bus", "move-board", "finish", self.old, self.new, "--wait", 0,
                                 env=self.env).strip())
             with self.assertRaises(PermissionError):
                 core.publish(afd, "test-arrival.json", b"{}")
+            with self.assertRaises(PermissionError):
+                core.publish(mailbox, "test-mail.json", b"{}")
         finally:
             os.close(afd)
+            os.close(mailbox)
         early_pid = self.wait_for(lambda: self.healthy(early, self.new), "early supervisor re-pinning")
-        self.wait_for(lambda: self.state(late).get("identity_alarm"), "late supervisor detecting retired source")
-        self.assertEqual(self.state(late)["board"]["path"], str(self.old))
+        late_pid = self.wait_for(lambda: self.healthy(late, self.new), "late supervisor re-pinning")
         self.assertEqual(self.identity(early), early["original_job"])
         self.assertEqual(self.identity(late), late["original_job"])
-        report(f"staggered cutover: early main PID {early['original_job'][0]}, supervisor {early_pid}; "
-               f"late main PID {late['original_job'][0]} still on old build")
-        late_pid = self.upgrade(late, self.new)
+        report(f"cutover: early main PID {early['original_job'][0]}, supervisor {early_pid}; "
+               f"late main PID {late['original_job'][0]}, supervisor {late_pid}")
         cal = json.loads(self.command(late["bus"], "cal", "--json", env=late["env"]))
         replayed = next(b for b in cal["bookings"] if b["id"] == booked["id"])
         self.assertEqual((replayed["slot"], replayed["revision"]), (booked["slot"], booked["revision"]))
-        self.assertGreaterEqual(replayed["objection_close"], booked["objection_close"])
-        report(f"late upgrade: same main PID {late['original_job'][0]}, supervisor {late_pid}, "
-               f"build {late['label']}, original receipt {replayed['slot']}")
+        self.assertEqual(replayed["objection_close"], booked["objection_close"])
+        report(f"replay: build {late['label']}, original receipt {replayed['slot']} and objection close preserved")
 
 
 def main():

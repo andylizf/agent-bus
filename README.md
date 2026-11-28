@@ -253,9 +253,9 @@ The timer uses the verified local hostname.
 
 ### Move an installed board
 
-The move build ships through the normal release channel after automatic upgrades are active. Each account's
-24-hour soak starts when it first sees the release, so accounts can switch at different times. Once the board
-owner's install has the move build, the owner runs the following on `della-tridao`.
+The move build ships through the normal release channel. Each account's 24-hour soak starts when it sees the
+release. Wait for a quiet window after those upgrades, then have the board owner run these commands on
+`della-tridao`.
 
 ```sh
 OLD=/scratch/gpfs/TRIDAO/agent-bus-v2
@@ -266,21 +266,29 @@ bus move-board finish "$OLD" "$NEW"
 ```
 
 The roots must have the same owner, host, GPU count and booking limits. Stage prepares the destination while
-the old board accepts writes. Finish waits for in-flight transactions that already hold a board lock, seals
-the old publication directories, and renames the original root to `$OLD.retired-<inode>`. New transactions
-follow the signed move record. Keep the archive in place and use it as read-only. Jobs keep running and
-launchers keep their normal configuration.
+the old board accepts writes. Stage and finish both check that the latest entry or heartbeat from each account
+that published in the last 14 days reports a confirmed move-capable build. The gate also checks every unarchived
+run, every open objection window, and standing bookings of other accounts that overlap the next five minutes.
+Supervisors and board commands report their build automatically. An idle account reports it on its next
+automatic upgrade check after installation.
 
-A move-aware client replays its own records before it saves the new pin. Supervisors do this at a pass boundary,
-including after the regular hot upgrade. The replay keeps receipt slots, booking history and the seven-day
-budget. An open objection window keeps its remaining time when the booking reappears. A booking with an
+Finish drains in-flight board transactions and gives any incomplete booking revision three seconds to receive
+its receipt. If the revision is still unpublished, the owner of that booking must repair or withdraw it before
+the move can finish. Finish then seals the old publication directories and mailboxes owned by the board owner,
+rechecks the gate, and renames the original root to `$OLD.retired-<inode>`. The same board lease drains writers
+in mailboxes owned by other accounts. Unix permissions leave their directory modes under their respective
+owners' control. Keep the archive in place and use it as read-only.
+
+A confirmed move-capable client replays its own records before it saves the new pin. Supervisors do this on
+their next pass, so the cutover takes a few passes instead of spanning clients' release soak. An upgrade trial
+leaves both pins on the source until takeover is confirmed. The replay keeps receipt slots, objection
+deadlines, booking history and the seven-day budget. An unreplayed standing booking still blocks overlapping
+new launches during its window. A booking with an
 outstanding old objection or an earlier overlapping booking stays pending while it awaits the relevant
 author's records. Mailbox names are recreated by their owners. Senders replay messages they published after
 stage. Earlier messages and logs stay in the archive.
 
-Finish activates the destination without waiting for every account to upgrade. It observes replay for 10
-seconds by default and lists remaining runs and bookings. Older clients keep their jobs running and leave
-the board on their next pass. A run whose end or takeover has yet to be
+Finish observes replay for 10 seconds by default and lists remaining runs and bookings. A run whose end or takeover has yet to be
 confirmed is shown as occupancy unknown and holds its GPUs for exclusive handoff, even after its old heartbeat
 expires. The page shows those holds, bookings awaiting replay, and GPU telemetry, including identifiable
 processes without current entries.
