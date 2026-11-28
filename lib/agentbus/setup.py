@@ -1,7 +1,7 @@
 """setup-board.sh's work, done from pinned directory descriptors: the parent is reached by the openat walk with
-O_NOFOLLOW, every directory is created and then opened relative to its parent's descriptor, and a mode or group is set
-only on what this run created. A symlink or another account's directory at any level stops the setup, so nothing a
-member puts in the group-writable parent can redirect it."""
+O_NOFOLLOW, and every directory is opened relative to its parent's descriptor. Setup sets permissions on new
+directories. An interrupted move also repairs the board owner's directories in its reserved destination.
+A symlink or another account's directory at any level stops setup."""
 import grp, os, stat
 
 from . import core
@@ -10,7 +10,7 @@ from .core import Refused
 DIRS = ("agents", "agents/.heartbeat", "inbox", "bookings", "objections", "arrivals", "seq", "archive", "log")
 
 
-def _dir(parent_fd, name, mode, gid, made, fixed=False):
+def _dir(parent_fd, name, mode, gid, made, fixed=False, repair=False):
     """Create (or open an existing directory of ours) `name` under parent_fd; returns its descriptor. `fixed` names
     come from DIRS or are block numbers, not from the caller."""
     if not fixed:
@@ -24,15 +24,19 @@ def _dir(parent_fd, name, mode, gid, made, fixed=False):
     fd = core.sub(parent_fd, name)
     if fd is None:
         raise Refused(f"{name} exists and is not a directory (a symlink or a file): stopping")
-    st = os.fstat(fd)
-    if st.st_uid != core.UID:
-        os.close(fd)
-        raise Refused(f"{name} belongs to {core.owner_name(st.st_uid)}: stopping")
-    if created:
-        if gid is not None:
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != core.UID:
+            raise Refused(f"{name} belongs to {core.owner_name(st.st_uid)}: stopping")
+        if created and gid is not None:
             os.fchown(fd, -1, gid)
-        os.fchmod(fd, mode)
-        made.append(name)
+        if created or (repair and mode != stat.S_IMODE(st.st_mode)):
+            os.fchmod(fd, mode)
+        if created:
+            made.append(name)
+    except BaseException:
+        os.close(fd)
+        raise
     return fd
 
 
@@ -52,15 +56,15 @@ def _file(dir_fd, name, data, replace_own=False):
         pass
 
 
-def populate(rfd, config, blocks, gid, made, readme=None):
+def populate(rfd, config, blocks, gid, made, readme=None, *, repair=False):
     shared = 0o3775 if os.fstat(rfd).st_mode & stat.S_ISGID else 0o1777
     fds = {"": rfd}
     try:
         for d in DIRS:
             head, _, tail = d.rpartition("/")
-            fds[d] = _dir(fds[head], tail, shared, gid, made, fixed=True)
+            fds[d] = _dir(fds[head], tail, shared, gid, made, fixed=True, repair=repair)
         for k in range(blocks):
-            os.close(_dir(fds["seq"], str(k), shared, gid, made, fixed=True))
+            os.close(_dir(fds["seq"], str(k), shared, gid, made, fixed=True, repair=repair))
         _file(rfd, "config", config)
         if readme:
             _file(rfd, "README.md", readme, replace_own=True)

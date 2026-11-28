@@ -16,8 +16,12 @@ RUN_INBOX = re.compile(r"\d{8}-\d{6}-.+")
 
 
 def confirmed():
-    from . import auto_upgrade
-    return not auto_upgrade.read_state().get("pending")
+    from . import auto_upgrade, runner
+    state = auto_upgrade.read_state()
+    if state.get("pending") or runner.build_root() != runner.build_root(core.BIN()):
+        return False
+    build = runner.build_id()
+    return state.get("manual_build") == build or any(e.get("build") == build for e in state.get("upgrades", []))
 
 
 def announce(board, build, *, idle=False):
@@ -98,6 +102,27 @@ def names_in(board, *parts):
     return names
 
 
+def archive_entries(board):
+    archive = board.dir("archive")
+    for name in names_in(board, "archive"):
+        if not name.endswith(".json"):
+            continue
+        row = core.read_json(archive, name)
+        if row:
+            e, st, _ = row
+            if (core.check_entry(e, board.ngpus) and e["user"] == core.owner_name(st.st_uid)
+                    and not st.st_mode & 0o022 and re.fullmatch(re.escape(e["id"]) + r"-\d+\.json", name)):
+                yield e, st
+
+
+def end_record(entry):
+    return entry["state"] == "ended" and core.is_int(entry.get("ended"))
+
+
+def run_inbox(user, box):
+    return core.owned_id(box, user) and RUN_INBOX.fullmatch(box[len(user) + 1:]) is not None
+
+
 def publishers(board, entries, receipts, t):
     """Pair a run heartbeat with its entry. A newer legacy entry or heartbeat supersedes an earlier claim."""
     authors, versions, archived = set(), {}, set()
@@ -117,18 +142,10 @@ def publishers(board, entries, receipts, t):
             build = hb[0].decode("utf-8", "replace").strip() or "unknown"
             observe(e["user"], hb[1].st_ctime, build, capable(e) and build == e.get("build"))
 
-    archive = board.dir("archive")
-    for name in names_in(board, "archive"):
-        if not name.endswith(".json"):
-            continue
-        row = core.read_json(archive, name)
-        if row:
-            e, st, _ = row
-            user = core.owner_name(st.st_uid)
-            if (core.check_entry(e, board.ngpus) and e["user"] == user and not st.st_mode & 0o022
-                    and re.fullmatch(re.escape(e["id"]) + r"-\d+\.json", name)):
-                archived.add(e["id"])
-                observe(user, st.st_ctime, e.get("build") or "unknown", capable(e))
+    for e, st in archive_entries(board):
+        if end_record(e):
+            archived.add(e["id"])
+        observe(e["user"], st.st_ctime, e.get("build") or "unknown", capable(e))
 
     for e in [*board.bookings_raw(), *board.objections(), *board.arrivals(), *receipts.values()]:
         observe(e["user"], e["_ctime"], "unreported")
@@ -140,7 +157,6 @@ def publishers(board, entries, receipts, t):
         if stat.S_ISREG(st.st_mode) and name == core.owner_name(st.st_uid) + ".jsonl":
             observe(core.owner_name(st.st_uid), st.st_ctime, "unreported")
 
-    idle = {}
     for name in names_in(board, "agents", ".heartbeat"):
         if not name.startswith(CLIENT_PREFIX) or not name.endswith(".json"):
             continue
@@ -151,27 +167,16 @@ def publishers(board, entries, receipts, t):
             if (name == CLIENT_PREFIX + user + ".json" and e.get("user") == user and not st.st_mode & 0o022
                     and core.note_ok(e.get("build"), 128)):
                 observe(user, st.st_ctime, e["build"], capable(e))
-                if capable(e) and e.get("idle") is True:
-                    idle[user] = st.st_ctime
-
-    # Run admission creates the inbox while holding the board lease. An account's idle report can clear
-    # earlier orphaned inboxes. A later inbox must wait for its own entry or the next idle report.
-    run_ids = {e["id"] for e in entries} | archived
+    # Admission creates the inbox before starting the job. An end record covers just that run.
     unaccounted = []
-    inbox = board.dir("inbox")
     for box in names_in(board, "inbox"):
         user = board.inbox_owner(box)
         if user is None:
             continue
         for m in board.messages(box):
             observe(m["sender"], m["_ctime"], "unreported")
-        if box.startswith(user + "-") and RUN_INBOX.fullmatch(box[len(user) + 1:]) and box not in run_ids:
-            try:
-                st = os.stat(box, dir_fd=inbox, follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            if core.owner_name(st.st_uid) != user or st.st_mtime >= idle.get(user, 0):
-                unaccounted.append(f"{box} ({user})")
+        if run_inbox(user, box) and box not in archived:
+            unaccounted.append(f"{box} ({user})")
     missing = [f"{user} ({versions.get(user, (0, 'unknown', False))[1]})" for user in sorted(authors)
                if not versions.get(user, (0, "", False))[2]]
     return missing, unaccounted
@@ -199,7 +204,7 @@ def require_empty(board):
                 open_windows.append(r["id"])
     reasons = [
         ("runs (including unknown occupancy)", [f"{e['id']} ({e['user']})" for e in entries if e["state"] != "ended"]),
-        ("unaccounted run inboxes", unaccounted),
+        ("run inbox without an end record", unaccounted),
         ("pending or standing bookings", [r["id"] for r in rows
                                            if r["state"] == "pending" or r["state"] == "standing" and r["end"] > t]),
         ("open objection windows", open_windows),
@@ -235,6 +240,15 @@ def directory_mode(old, parts, mode=None):
         os.close(fd)
 
 
+def populate_destination(old, fd):
+    config = owner_file(old, "config")
+    if config is None:
+        raise Refused("the source config is unavailable")
+    blocks = sum(name.isdecimal() for name in names_in(old, "seq"))
+    readme = owner_file(old, "README.md", core.MAX_RECORD)
+    setup.populate(fd, config[0], blocks, None, [], readme[0] if readme else None, repair=True)
+
+
 def prepare(old, path):
     """Keep a partial target private; the same command can finish an interrupted transaction."""
     pfd = core.walk(os.path.dirname(path))
@@ -257,14 +271,11 @@ def prepare(old, path):
             if marker is None:
                 if os.listdir(fd):
                     raise Refused(f"{path}: destination must be empty")
-                os.fchmod(fd, 0o700)
                 core.publish(fd, core.MOVE_PENDING, core.dumps(pin))
             elif marker[0] != pin or marker[1].st_uid != old.creator or marker[1].st_mode & 0o022:
                 raise Refused(f"{path}: destination belongs to another transaction")
-            config = owner_file(old, "config")[0]
-            blocks = sum(name.isdecimal() for name in names_in(old, "seq"))
-            readme = owner_file(old, "README.md", core.MAX_RECORD)
-            setup.populate(fd, config, blocks, None, [], readme[0] if readme else None)
+            os.fchmod(fd, 0o700)
+            populate_destination(old, fd)
             ino, fsid = core.identity(fd)
             return dict(path=path, inode=ino, fsid=fsid)
         finally:
@@ -273,7 +284,7 @@ def prepare(old, path):
         os.close(pfd)
 
 
-def activate(old, new, source):
+def activate(old, new, source, *, recover=False):
     require_owner(new)
     if (not matches(old, source) or old.creator != new.creator or new.host != core.HOST
             or owned_json(old, RECORD) != dict(new.pin_fields(), host=new.host)):
@@ -281,6 +292,9 @@ def activate(old, new, source):
     if new.pending:
         if owned_json(new, core.MOVE_PENDING) != source:
             raise Refused("the destination belongs to another transaction")
+        if recover:
+            os.fchmod(new.fd, 0o700)
+            populate_destination(old, new.fd)
         os.fchmod(new.fd, 0o755)
         core.unlink_own(new.fd, core.MOVE_PENDING)
 
@@ -338,7 +352,8 @@ def cutover(old, new_path):
 
 
 def command(old_path, new_path):
-    if not confirmed():
+    from . import auto_upgrade
+    if auto_upgrade.read_state().get("pending"):
         raise Refused("the installed upgrade is awaiting confirmation")
     old_path, new_path = os.path.abspath(old_path), os.path.abspath(new_path)
     if os.path.commonpath((old_path, new_path)) in (old_path, new_path):
@@ -357,7 +372,7 @@ def command(old_path, new_path):
                     raise Refused("the destination has no move from this source")
                 archive = retired(pin)
                 with core.Board(archive) as old:
-                    activate(old, new, pin)
+                    activate(old, new, pin, recover=True)
     except (OSError, ValueError) as e:
         raise Refused(f"board move: {e}") from e
     print(f"source sealed at {archive}; board active at {new_path}", flush=True)

@@ -262,26 +262,25 @@ NEW=/scratch/agent-bus-v2
 bus move-board "$OLD" "$NEW"
 ```
 
-The command lists blockers and leaves the source active. Retry when there are zero runs, including runs with
-unknown occupancy or a launch inbox awaiting its first entry, zero pending or standing bookings, and zero open
-objection windows. Unreceipted future booking revisions also block. Each account that published in the past
-14 days must report a confirmed move-capable build. Board writes, supervisor passes and automatic timers report
-the build. The adopt timer also checks the account's private runs, so an old launch inbox can clear after its
-owner's client confirms the account is idle. Allow up to 30 seconds for other clients to observe a new receipt
-when checking whether its objection window has closed.
+The command lists blockers and leaves the source active. Retry when there are zero runs, zero pending or
+standing bookings, and zero open objection windows. Each run inbox needs its own archived end record.
+The owner can use `bus gc --mine` to complete an archive when the same run's private state confirms it ended.
+Unreceipted future booking revisions also block. Each account that published in the past 14 days must report
+a confirmed move-capable build. Board writes, supervisor passes and automatic timers report the build.
+Allow up to 30 seconds for other clients to observe a new receipt when checking its objection deadline.
 
 The move takes the source write lock, seals board-owned publication directories and mailboxes, and checks again
 before creating the new board with the same host, GPU count and booking limits. Setup can use an empty protected
 destination directory already owned by `al9080`. The owner signs the new pin with `move.json` and archives the
 original root at `$OLD.retired-<inode>`. Unix keeps the modes of other users' mailboxes under their owners' control.
-Keep the GPFS archive in place and treat it as read-only.
+An old client mid-send may still report success when it writes to another user's archived inbox through an open
+descriptor. The message stays in the archive. Keep the GPFS archive in place and treat it as read-only.
 
-Clients re-pin on their next board access after their upgrade is confirmed. Entries, bookings, objections,
-arrivals, receipts and messages stay in the archive. For seven days, the new board counts each account's
-previously charged booking intervals and GPU counts in its rolling budget. It stores only those budget inputs
-in owner-authenticated metadata and starts a fresh receipt sequence. Old clients with the original pin can't
-write to the new board. The new page starts with no Agent Bus entries or bookings and continues to show live
-GPU telemetry.
+The installed, confirmed build re-pins on its next board access. Entries, bookings, objections, arrivals,
+receipts and messages stay in the archive. The new board stores each charged booking interval and its GPU
+count in owner-authenticated metadata. Each charge remains in the rolling budget until seven days after its
+own end, including bookings that lapsed after a no-show. The new board starts a fresh receipt sequence.
+The new page starts with no Agent Bus entries or bookings and continues to show live GPU telemetry.
 
 Before cutover, the source remains active. After an interruption, rerun the same command with the same paths.
 To move again after cutover, wait for an empty window and use a fresh destination, keeping the original archive.

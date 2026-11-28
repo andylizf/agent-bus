@@ -109,24 +109,27 @@ def over_budget(mine, b, lim):
 
 
 def previous_usage(board, t, user):
-    origin = getattr(board, "origin", {})
-    if t >= origin.get("budget_until", 0):
-        return []
-    return [dict(start=start, end=end, gpus=range(count))
-            for start, end, count in origin["usage"].get(user, [])]
+    usage = getattr(board, "origin", {}).get("usage", {})
+    cutoff = t - board.limits["budget_span_s"]
+    return [dict(start=b["start"], end=b["end"], gpus=range(b["gpus"]))
+            for b in usage.get(user, []) if b["charged"] and b["end"] > cutoff]
 
 
 def cutover_budget(board, rows, t):
     """Keep the booked intervals required to evaluate the same rolling budget across cutover."""
     span = board.limits["budget_span_s"]
     usage = {}
+
+    def carry(user, b):
+        usage.setdefault(user, []).append(dict(start=b["start"], end=b["end"], gpus=len(b["gpus"]), charged=True))
+
     for user in getattr(board, "origin", {}).get("usage", {}):
-        usage[user] = [[b["start"], b["end"], len(b["gpus"])] for b in previous_usage(board, t, user)
-                       if b["end"] > t - span]
+        for b in previous_usage(board, t, user):
+            carry(user, b)
     for b in rows:
         if b["state"] in ("standing", "lapsed") and b["end"] > t - span:
-            usage.setdefault(b["user"], []).append([b["start"], b["end"], len(b["gpus"])])
-    return dict(budget_until=t + span, usage={user: bands for user, bands in usage.items() if bands})
+            carry(b["user"], b)
+    return dict(usage=usage)
 
 
 def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=None, record=True, cache=None):

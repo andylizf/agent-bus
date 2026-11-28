@@ -287,32 +287,49 @@ def cmd_gc(a):
     res["unknown"] = []
     with board(write=True) as b:
         if b.ok:
-            for e in b.entries():
-                if e["user"] != core.USER:
-                    continue
+            entries = {e["id"]: e for e in b.entries() if e["user"] == core.USER}
+            ended = {e["id"] for e, _ in move.archive_entries(b) if move.end_record(e)}
+            inboxes = {rid for rid in my_boxes(b) if move.run_inbox(core.USER, rid) and rid not in ended}
+            for rid in sorted(entries.keys() | inboxes):
                 # decided under the run's own supervisor lock, from its private state read now: only a run that is
                 # positively ended is archived; one with no private state, or live, is left and listed
-                lk = runner.Locked(os.path.join(runner.runs_dir(), f"{e['id']}.lock"))
+                lk = runner.Locked(os.path.join(runner.runs_dir(), f"{rid}.lock"))
                 if not lk.acquire():
                     continue                         # a supervisor holds it: live
                 try:
-                    st = core.read_private(runner.state_path(e["id"]))
+                    st = core.read_private(runner.state_path(rid))
                     if not st or st.get("state") != "ended":
                         if not st:
-                            res["unknown"].append(e["id"])
+                            res["unknown"].append(rid)
                         continue
+                    e = entries.get(rid)
                     pinned = st.get("board") or {}
-                    if (st.get("run") != e.get("run") or str(pinned.get("inode")) != str(b.ino)
+                    if (st.get("id") != rid or (e and st.get("run") != e.get("run"))
+                            or st.get("host", core.HOST) != core.HOST or str(pinned.get("inode")) != str(b.ino)
                             or str(pinned.get("fsid")) != str(b.fsid)):
-                        res["unknown"].append(e["id"])   # another generation or another board: not this run's entry
+                        res["unknown"].append(rid)
                         continue
-                    afd, gfd = b.dir("agents"), b.dir("archive")
+                    if not e:
+                        sup = runner.Supervisor(rid)
+                        sup.s = st
+                        try:
+                            e = sup.entry()
+                        except KeyError:
+                            res["unknown"].append(rid)
+                            continue
+                    end = dict(core.clean(e), state="ended", ended=st.get("ended", now()),
+                               end_reason=st.get("end_reason"))
+                    if not core.check_entry(end, b.ngpus) or not move.end_record(end):
+                        res["unknown"].append(rid)
+                        continue
                     try:
-                        os.rename(f"{e['id']}.json", f"{e['id']}-{now()}.json", src_dir_fd=afd, dst_dir_fd=gfd)
-                        res["archived"].append(e["id"])
+                        core.publish(b.wdir("archive"), f"{rid}-{time.time_ns()}.json", core.dumps(end))
+                        if rid in entries:
+                            core.unlink_own(b.wdir("agents"), f"{rid}.json")
+                        res["archived"].append(rid)
                         hb = b.dir("agents", ".heartbeat")
                         if hb is not None:
-                            core.unlink_own(hb, e["id"])
+                            core.unlink_own(hb, rid)
                     except OSError:
                         pass
                 finally:
@@ -456,6 +473,7 @@ def cmd_upgrade(a):
             auto_upgrade.probe(build, [])
             timer = auto_upgrade.sync_timer()
         flip(build)
+        auto_upgrade.confirm_manual(build)
     live = [r["id"] for r in runner.cmd_runs() if r["state"] in runner.NONTERMINAL and r.get("host") == core.HOST]
     res = dict(previous=before, installed=os.path.basename(build), supervisors=live)
     if timer is not None:
@@ -552,6 +570,7 @@ def cmd_install(a):
         build = copy_build(a.src)
         flip(build)
         core.save_conf(conf)
+        auto_upgrade.confirm_manual(build)
     if a.print_host:
         print(os.uname().nodename)
     else:
@@ -569,9 +588,9 @@ def cmd_adopt(a):
         lock = auto_upgrade.lock()
         if lock.acquire():
             try:
-                if runner.build_root() == runner.build_root(core.BIN()) and move.confirmed():
+                if move.confirmed():
                     idle = all(r["state"] == "ended" or r["host"] != core.HOST for r in runner.cmd_runs())
-                    with core.Board.from_conf() as b:
+                    with core.Board.from_conf(upgrade_locked=True) as b:
                         move.announce(b, runner.build_version(), idle=idle)
             finally:
                 lock.release()

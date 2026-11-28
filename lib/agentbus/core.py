@@ -608,7 +608,7 @@ class Board:
         self.host = self.settings.get("host")
 
     @classmethod
-    def from_conf(cls, conf=None, path=None):
+    def from_conf(cls, conf=None, path=None, *, upgrade_locked=False):
         conf = conf if conf is not None else load_conf()
         p = path or conf.get("path")
         if not p:
@@ -618,7 +618,8 @@ class Board:
         board = cls.from_pin(conf)
         if board.path != p and not board.pending:
             try:
-                board.repin_conf(conf)
+                if not board.repin_conf(conf, upgrade_locked=upgrade_locked):
+                    raise Refused("the installed build changed during the board move; retry using the installed bus")
             except BaseException:
                 board.close()
                 raise
@@ -649,15 +650,17 @@ class Board:
     def pin_fields(self):
         return dict(path=self.path, inode=self.ino, fsid=self.fsid)
 
-    def repin_conf(self, old):
-        from . import move
-        if not move.confirmed():
-            return False
-        conf = load_conf()
-        if (conf.get("path"), conf.get("inode"), conf.get("fsid")) == (
-                old["path"], str(old["inode"]), str(old["fsid"])):
-            save_conf(dict(conf, **self.pin_fields(), host=self.host))
-        return True
+    def repin_conf(self, old, *, upgrade_locked=False):
+        from contextlib import nullcontext
+        from . import auto_upgrade, move
+        with (nullcontext() if upgrade_locked else auto_upgrade.lock(shared=True)):
+            if not move.confirmed():
+                return False
+            conf = load_conf()
+            if (conf.get("path"), conf.get("inode"), conf.get("fsid")) == (
+                    old["path"], str(old["inode"]), str(old["fsid"])):
+                save_conf(dict(conf, **self.pin_fields(), host=self.host))
+            return True
 
     def read_move(self):
         self.pending = read_file(self.fd, MOVE_PENDING, 4096) is not None

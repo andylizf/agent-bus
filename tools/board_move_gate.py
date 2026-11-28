@@ -196,12 +196,16 @@ class Gate(unittest.TestCase):
         with patch.dict(os.environ, early["env"], clear=True), core.Board.from_conf() as old:
             with patch.object(time, "time", return_value=t - 86400):
                 historical = bookings.publish_booking(old, [0], t - 7200, t - 3600, objection_s=objection_s)
-            move.announce(old, early["label"])
             receipt = old.receipts()[historical["slot"]]
-        orphan = self.old / "inbox" / core.new_id("orphan")
-        orphan.mkdir()
-        self.assertIn("unaccounted run inboxes", refused())
+        rid = early["info"]["id"]
+        archived, = (self.old / "archive").glob(f"{rid}-*.json")
+        archived.write_bytes(core.dumps(dict(json.loads(archived.read_bytes()), state="running")))
+        self.assertIn("run inbox without an end record", refused())
         self.command(early["bus"], "adopt", "--all", env=early["env"])
+        self.assertIn("run inbox without an end record", refused())
+        gc = json.loads(self.command(early["bus"], "gc", "--mine", "--json", env=early["env"]))
+        self.assertEqual(gc["archived"], [rid])
+        report("an idle report left the unarchived inbox blocked until owner gc wrote its end record")
         ready_at = receipt["_ctime"] + bookings.SEEN_GAP_S + objection_s + 1
         self.wait_for(lambda: core.now() >= ready_at, "all readers' historical objection windows closing", timeout=40)
         afd = core.walk(str(self.old / "arrivals"))
@@ -227,7 +231,7 @@ class Gate(unittest.TestCase):
             self.assertEqual(pin["inode"], str(self.new.stat().st_ino))
             self.assertEqual(pin["fsid"], str(os.statvfs(self.new).f_fsid))
         self.assertEqual(list((self.new / "inbox").iterdir()), [])
-        self.assertTrue((self.archive / "inbox" / orphan.name).is_dir())
+        self.assertTrue((self.archive / "inbox" / rid).is_dir())
         self.assertTrue((self.archive / "bookings" / (historical["id"] + ".json")).exists())
         with core.Board(str(self.new)) as new:
             self.assertEqual(new.receipts(), {})
@@ -236,6 +240,13 @@ class Gate(unittest.TestCase):
         self.assertIn("over your budget", refusal)
         report("both confirmed clients re-pinned on their next CLI call; the legacy client stayed pinned until upgrade")
         report("history stayed on GPFS; XFS started empty and enforced the prior GPU-hour budget")
+        quick = dict(late, info=json.loads(self.command(late["bus"], "run", "--gpus", "0", "--slug", "quick",
+                                                       "--detach", "--", "true", env=late["env"])))
+        self.clients.append(quick)
+        self.wait_for(lambda: self.state(quick).get("state") == "ended", "short job ending on XFS")
+        with core.Board(str(self.new)) as board:
+            self.assertIn(quick["info"]["id"], {e["id"] for e, _ in move.archive_entries(board) if move.end_record(e)})
+        report("a short job on XFS left an archived end record")
 
 
 def main():

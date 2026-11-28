@@ -312,6 +312,13 @@ def read_state():
     return core.read_private(state_file()) or {}
 
 
+def confirm_manual(build):
+    """Record an explicit install or upgrade while its caller holds the upgrade lock."""
+    state = read_state()
+    state["manual_build"] = runner.build_id(build)
+    core.write_private(state_file(), state)
+
+
 def request_check():
     if settings().get("enabled") == "off":
         return "off", 0

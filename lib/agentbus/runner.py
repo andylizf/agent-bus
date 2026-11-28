@@ -899,8 +899,7 @@ class Supervisor:
         move.announce(board, self.version)
 
     def archive_entry(self, board):
-        """Archive the run's entry if it is on the board. Decided by the board, not by the state's entry_on_board: a
-        supervisor killed between writing its first entry and saving its state leaves that flag unset."""
+        """Record the end of a run with an entry or an inbox on this board."""
         if not board.ok:
             return
         afd, gfd = board.dir("agents"), board.dir("archive")
@@ -908,6 +907,13 @@ class Supervisor:
             st = os.stat(f"{self.rid}.json", dir_fd=afd, follow_symlinks=False)
         except FileNotFoundError:
             self.s["entry_on_board"] = False
+            if board.inbox_owner(self.rid) == core.USER:
+                # A short-lived job can end before its supervisor publishes the first entry.
+                e = dict(self.entry(), state="ended", end_reason=self.s.get("end_reason"), ended=now())
+                try:
+                    core.publish(board.wdir("archive"), f"{self.rid}-{time.time_ns()}.json", core.dumps(e))
+                except (OSError, Refused) as err:
+                    self.s["archive_error"] = f"publish end record: {err}"
             return
         if st.st_uid != core.UID:
             return
@@ -1971,7 +1977,7 @@ def cmd_run(a):
 
 def launch_run(a, launch):
     conf = core.load_conf()
-    board = core.Board.from_conf(conf)
+    board = core.Board.from_conf(conf, upgrade_locked=True)
     try:
         board.writable()
         if board.host and board.host not in (core.HOST, os.uname().nodename) and not os.environ.get("AGENT_BUS_ANY_HOST"):

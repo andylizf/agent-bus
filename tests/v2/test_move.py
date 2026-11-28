@@ -6,6 +6,7 @@ import subprocess
 import tarfile
 import time
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from helpers import BusTest, PY, REPO, wait_for
@@ -28,6 +29,11 @@ class BoardMove(BusTest):
 
     def cutover(self, check=True):
         return self.bus("move-board", str(self.root), str(self.target), check=check)
+
+    def installed_code(self):
+        build_root = runner.build_root
+        installed = build_root(core.BIN())
+        return patch.object(runner, "build_root", side_effect=lambda path=None: build_root(path) if path else installed)
 
     def supervisor(self):
         rid = core.new_id("move")
@@ -72,7 +78,7 @@ class BoardMove(BusTest):
                 return obj, SimpleNamespace(st_uid=st.st_uid + 1, st_mode=st.st_mode), sha
             return result
 
-        with patch.object(core, "read_json", side_effect=changed_owner):
+        with self.installed_code(), patch.object(core, "read_json", side_effect=changed_owner):
             with self.assertRaises(core.Refused):
                 core.Board.from_conf()
         (self.retired / move.RECORD).chmod(0o666)
@@ -90,7 +96,7 @@ class BoardMove(BusTest):
                 return SimpleNamespace(st_mode=st.st_mode, st_ino=ino, st_uid=st.st_uid + 1)
             return st
 
-        with patch.object(core.os, "fstat", side_effect=changed_owner):
+        with self.installed_code(), patch.object(core.os, "fstat", side_effect=changed_owner):
             with self.assertRaises(core.Refused):
                 core.Board.from_conf()
         self.assertEqual(core.load_conf(), self.pin)
@@ -128,21 +134,47 @@ class BoardMove(BusTest):
         self.assertIn(sup.rid, self.cutover(check=False).stderr)
         self.assertFalse(self.target.exists())
 
-    def test_older_orphan_inbox_clears_after_owner_adoption_reports_idle(self):
-        rid = core.new_id("orphan")
-        (self.root / "inbox" / rid).mkdir()
-        self.assertIn(rid, self.cutover(check=False).stderr)
+    def test_orphan_inbox_requires_its_owners_archived_end_record(self):
+        sup = self.supervisor()
+        (self.root / "inbox" / sup.rid).mkdir()
+        data = sup.entry()
+        (self.root / "archive" / f"{sup.rid}-123.json").write_bytes(core.dumps(data))
         self.bus("adopt", "--all", check=True)
+        self.assertIn("run inbox without an end record", self.cutover(check=False).stderr)
+        self.assertEqual(self.bus_json("gc", "--mine", "--json")["unknown"], [sup.rid])
+        sup.s.update(state="ended", entry_state="ended", ended=core.now())
+        sup.save()
+        self.assertEqual(self.bus_json("gc", "--mine", "--json")["archived"], [sup.rid])
         self.cutover()
-        self.assertTrue((self.retired / "inbox" / rid).exists())
+        self.assertTrue((self.retired / "inbox" / sup.rid).exists())
 
-    def test_launch_gap_uses_existing_inbox_without_a_pre_start_entry(self):
+    def test_supervisor_archives_a_run_ended_before_its_first_entry(self):
+        sup = self.supervisor()
+        (self.root / "inbox" / sup.rid).mkdir()
+        sup.s.update(state="ended", entry_state="ended", ended=core.now())
+        with self.installed_code(), core.Board.from_conf() as b:
+            sup.archive_entry(b)
+            archived, = move.archive_entries(b)
+            self.assertTrue(move.end_record(archived[0]))
+        self.cutover()
+
+    def test_second_install_cannot_clear_an_inbox_while_first_install_starts(self):
+        other = self.tmp / "other"
+        env = dict(self.env, AGENT_BUS_CONFIG=str(other / "config"), AGENT_BUS_STATE=str(other / "state"),
+                   AGENT_BUS_BIN=str(other / "bin" / "bus"), AGENT_BUS_BUILDS=str(other / "builds"))
+        self.bus("_install", "--src", str(REPO), "--board", str(self.root), env=env, check=True)
         args = cli.parser().parse_args(["run", "--gpus", "0", "--detach", "true"])
 
         def start(rid, state):
             self.assertFalse((self.root / "agents" / f"{rid}.json").exists())
+            other_adopt = subprocess.run([PY, "-IB", env["AGENT_BUS_BIN"], "adopt", "--all"], env=env,
+                                         capture_output=True, text=True, timeout=10)
+            self.assertEqual(other_adopt.returncode, 0, other_adopt.stderr)
+            marker = self.root / "agents" / ".heartbeat" / f"{move.CLIENT_PREFIX}{core.USER}.json"
+            self.assertTrue(json.loads(marker.read_bytes())["idle"])
+            self.assertGreaterEqual(marker.stat().st_ctime, (self.root / "inbox" / rid).stat().st_ctime)
             result = self.cutover(check=False)
-            self.assertIn("unaccounted run inboxes", result.stderr)
+            self.assertIn("run inbox without an end record", result.stderr)
             self.assertIn(rid, result.stderr)
             self.assertFalse(self.target.exists())
             return 0, ""
@@ -227,16 +259,17 @@ class BoardMove(BusTest):
         with core.Board.from_conf() as old:
             with patch.object(time, "time", return_value=t - 24 * 3600):
                 bookings.publish_booking(old, [0, 1], t - 7200, t - 3600, objection_s=1)
-            move.announce(old, runner.build_version())
+        self.bus("adopt", "--all", check=True)
         self.assertTrue((self.home / "state" / "slots.json").is_file())
         with patch.object(core, "now", return_value=t + bookings.SEEN_GAP_S + 2):
             move.command(str(self.root), str(self.target))
-        with core.Board.from_conf() as new:
+        with self.installed_code(), core.Board.from_conf() as new:
             self.assertEqual(new.receipts(), {})
             self.assertEqual(bookings.evaluate(new), [])
-            self.assertEqual(new.origin["usage"], {core.USER: [[t - 7200, t - 3600, 2]]})
+            self.assertEqual(new.origin["usage"], {core.USER: [dict(start=t - 7200, end=t - 3600,
+                                                                   gpus=2, charged=True)]})
             self.assertEqual(bookings.previous_usage(new, t, "another"), [])
-            self.assertFalse(bookings.previous_usage(new, new.origin["budget_until"], core.USER))
+            self.assertFalse(bookings.previous_usage(new, t - 3600 + new.limits["budget_span_s"], core.USER))
             with self.assertRaisesRegex(core.Refused, "over your budget"):
                 bookings.publish_booking(new, [0], t + 3600, t + 7200, objection_s=1)
             b = bookings.publish_booking(new, [0], t + 7 * 86400, t + 7 * 86400 + 3600, objection_s=1)
@@ -244,6 +277,30 @@ class BoardMove(BusTest):
             self.assertNotEqual(bookings.seen_file(new), str(self.home / "state" / "slots.json"))
             self.assertEqual(bookings.evaluate(new)[0]["state"], "pending")
         self.assertTrue((self.retired / "seq" / "0" / "1").is_file())
+
+    def test_lapsed_budget_ages_from_booking_end_not_cutover(self):
+        t = core.now()
+        start, end = t - 3600, t + 3600
+        moved_at = t + bookings.SEEN_GAP_S + 2
+        with (self.root / "config").open("a") as f:
+            f.write("budget_gpu_h=2\nlapse_s=1\n")
+        with core.Board.from_conf() as old, patch.object(time, "time", return_value=t - 7200):
+            bookings.publish_booking(old, [0], start, end, objection_s=1)
+        self.bus("adopt", "--all", check=True)
+        self.assertEqual(self.bus_json("cal", "--all", "--json")["bookings"][0]["state"], "lapsed")
+        with patch.object(core, "now", return_value=moved_at):
+            move.command(str(self.root), str(self.target))
+        with self.installed_code(), core.Board.from_conf() as new:
+            span = new.limits["budget_span_s"]
+            after_day_seven = moved_at + span + 5
+            with patch.object(time, "time", return_value=after_day_seven):
+                self.assertTrue(bookings.previous_usage(new, after_day_seven, core.USER))
+                with self.assertRaisesRegex(core.Refused, "over your budget"):
+                    bookings.publish_booking(new, [0, 1, 2, 3], after_day_seven, after_day_seven + 1800, objection_s=1)
+            expiry = end + span
+            with patch.object(time, "time", return_value=expiry):
+                self.assertFalse(bookings.previous_usage(new, expiry, core.USER))
+                bookings.publish_booking(new, [0, 1, 2, 3], expiry, expiry + 1800, objection_s=1)
 
     def test_aborted_transaction_restores_source_and_rerun_activates(self):
         with patch.object(move, "prepare", side_effect=OSError("fixture failure")):
@@ -258,8 +315,33 @@ class BoardMove(BusTest):
                 move.command(str(self.root), str(self.target))
         self.assertTrue(self.retired.exists())
         self.assertTrue((self.target / core.MOVE_PENDING).exists())
+        (self.target / "arrivals").chmod(0o700)
         self.cutover()
+        self.assertEqual(stat.S_IMODE((self.target / "arrivals").stat().st_mode), 0o1777)
         self.assertEqual(self.bus_json("ls", "--json")["board"]["path"], str(self.target))
+
+    def test_retry_repairs_partial_directories_and_refuses_foreign_owner(self):
+        self.target.mkdir(mode=0o700)
+        source = dict(path=self.pin["path"], inode=int(self.pin["inode"]), fsid=int(self.pin["fsid"]))
+        (self.target / core.MOVE_PENDING).write_bytes(core.dumps(source))
+        partial = [self.target / p for p in ("agents", "agents/.heartbeat", "seq", "seq/0")]
+        for path in partial:
+            path.mkdir(mode=0o700)
+        ino, fstat = partial[-1].stat().st_ino, os.fstat
+
+        def wrong_owner(fd):
+            st = fstat(fd)
+            if st.st_ino == ino:
+                return SimpleNamespace(st_uid=st.st_uid + 1)
+            return st
+
+        with patch.object(os, "fstat", side_effect=wrong_owner), self.assertRaisesRegex(core.Refused, "belongs to"):
+            move.command(str(self.root), str(self.target))
+        self.assertTrue(self.root.exists())
+        self.assertEqual(stat.S_IMODE(partial[-1].stat().st_mode), 0o700)
+        self.cutover()
+        for path in partial:
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o1777)
 
     def test_drain_waits_for_writer_and_seals_open_directories(self):
         self.bus("mailbox", "history", check=True)
@@ -290,7 +372,44 @@ class BoardMove(BusTest):
         self.assertNotEqual(self.bus("ls").returncode, 0)
         self.assertEqual(core.load_conf(), self.pin)
         core.write_private(auto_upgrade.state_file(), {})
+        self.assertNotEqual(self.bus("ls").returncode, 0)
+        self.assertEqual(core.load_conf(), self.pin)
+        core.write_private(auto_upgrade.state_file(), {"upgrades": [{"build": runner.installed_build()}]})
         self.assertEqual(self.bus_json("ls", "--json")["board"]["path"], str(self.target))
+
+    def test_rolled_back_running_page_cannot_repin(self):
+        self.cutover()
+        candidate = Path(self.entry_point()).resolve().parents[1]
+        previous = self.tmp / "previous"
+        (previous / "bin").mkdir(parents=True)
+        (previous / "bin" / "bus").touch()
+        state = auto_upgrade.read_state()
+        state["pending"] = dict(build=candidate.name, previous=str(previous), runs={}, commit="a" * 40, to="v9.0.0")
+        core.write_private(auto_upgrade.state_file(), state)
+        script = """
+import sys
+sys.path.insert(0, sys.argv[1])
+from agentbus import core, page
+conf = core.load_conf()
+print("ready", flush=True)
+sys.stdin.readline()
+print(page.collect(conf, history=False)["board"])
+"""
+        with subprocess.Popen([PY, "-IB", "-c", script, str(candidate / "lib")], env=self.env,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as p:
+            try:
+                self.assertEqual(p.stdout.readline().strip(), "ready")
+                with auto_upgrade.lock():
+                    auto_upgrade.rollback(state, cli.flip, "fixture")
+                self.assertFalse(auto_upgrade.read_state().get("pending"))
+                self.assertEqual(runner.build_root(core.BIN()), str(previous))
+                output, error = p.communicate("\n", timeout=10)
+                self.assertEqual(p.returncode, 0, error)
+                self.assertEqual(output.strip(), "")
+                self.assertEqual(core.load_conf(), self.pin)
+            finally:
+                if p.poll() is None:
+                    p.kill()
 
     def test_exclusive_board_lock_times_out_and_private_cleanup_runs(self):
         sup = self.supervisor()
