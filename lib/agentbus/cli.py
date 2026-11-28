@@ -374,6 +374,8 @@ def cmd_doctor(a):
         current = upgrade["current_tag"] or upgrade["current_build"] or "none"
         print(f"auto-upgrade: {'on' if upgrade['enabled'] else 'off'} (timer {upgrade['timer']})")
         print(f"  current tag or build: {current}; last check: {checked}; last result: {upgrade['last_result'] or '-'}")
+        for commit, failed in upgrade["retries"].items():
+            print(f"  failed attempt {failed['attempts']}/3 for {failed['build'] or commit}: {failed['reason']}")
         for commit, bad in upgrade["quarantine"].items():
             print(f"  quarantined {bad['build'] or commit}: {bad['reason']}")
     return 0 if all(c["ok"] for c in checks) else 1
@@ -436,10 +438,22 @@ def cmd_upgrade(a):
         before = runner.installed_build()
         prior = runner.build_root(core.BIN())
         feature = os.path.join("lib", "agentbus", "auto_upgrade.py")
+        capable = os.path.isfile(os.path.join(build, feature))
         timer = None
-        if before and not os.path.isfile(os.path.join(prior, feature)) and os.path.isfile(os.path.join(build, feature)):
+        if before and capable and not os.path.isfile(os.path.join(prior, feature)):
+            auto_upgrade.probe(build, [])
             timer = auto_upgrade.sync_timer(build)
         flip(build)
+        if timer is None and os.path.exists(auto_upgrade.driver()):
+            if capable:
+                try:
+                    auto_upgrade.probe(build, [])
+                    auto_upgrade.link_to_build(auto_upgrade.driver(), build)
+                except Refused as e:
+                    print(f"bus: kept the previous timer driver: {e}", file=sys.stderr)
+            else:
+                auto_upgrade.sync_timer(available=False)
+                auto_upgrade.link_to_build(auto_upgrade.driver(), build)
     live = [r["id"] for r in runner.cmd_runs() if r["state"] in runner.NONTERMINAL and r.get("host") == core.HOST]
     res = dict(previous=before, installed=os.path.basename(build), supervisors=live)
     if timer is not None:
@@ -457,11 +471,13 @@ def cmd_auto_upgrade(a):
     if a.action != "check":
         print(f"auto-upgrade: {auto_upgrade.configure(a.action, a.allow_major)}")
         return
-    return cmd_auto_timer(a, force=True)
+    result, code = auto_upgrade.request_check()
+    print(f"auto-upgrade: {result}")
+    return code
 
 
-def cmd_auto_timer(a, force=False):
-    if not force and (not runner.user_manager_ok() or auto_upgrade.linger_status() != "yes"):
+def cmd_auto_timer(a):
+    if not runner.user_manager_ok() or auto_upgrade.linger_status() != "yes":
         print('auto-upgrade: timer unavailable; run loginctl enable-linger "$USER"')
         return
     result, code = auto_upgrade.check(flip)

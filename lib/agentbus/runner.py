@@ -124,17 +124,18 @@ def installed_build():
 
 
 class Locked:
-    """fcntl.lockf on a private file: exclusive; non-blocking or with a monotonic timeout."""
+    """fcntl.lockf on a private file, non-blocking or with a monotonic timeout."""
 
-    def __init__(self, path, timeout=None):
+    def __init__(self, path, timeout=None, shared=False):
         self.path, self.timeout, self.f = path, timeout, None
+        self.mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
 
     def acquire(self):
         self.f = open(self.path, "a+")
         end = None if self.timeout is None else time.monotonic() + self.timeout
         while True:
             try:
-                fcntl.lockf(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.lockf(self.f, self.mode | fcntl.LOCK_NB)
                 return True
             except OSError:
                 if end is None or time.monotonic() >= end:
@@ -147,6 +148,17 @@ class Locked:
         if self.f:
             self.f.close()
             self.f = None
+
+    def change_mode(self, shared):
+        mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        try:
+            fcntl.lockf(self.f, mode | fcntl.LOCK_NB)
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EAGAIN):
+                return False
+            raise
+        self.mode = mode
+        return True
 
     def __enter__(self):
         if not self.acquire():
@@ -1917,6 +1929,22 @@ def classify(board, rows, gpus, scheduled, t):
 
 
 def cmd_run(a):
+    from . import auto_upgrade
+    launch = auto_upgrade.lock(shared=True)
+    if not launch.acquire():
+        raise Refused("another build operation holds the launch lock; retry bus run")
+    try:
+        if auto_upgrade.read_state().get("pending"):
+            raise Refused("an interrupted upgrade is awaiting recovery; retry bus run after adoption")
+        root = build_root()
+        if os.path.dirname(root) == os.path.realpath(core.BUILDS()) and root != build_root(core.BIN()):
+            raise Refused("the installed build changed; retry bus run using the installed entry point")
+        return launch_run(a, launch)
+    finally:
+        launch.release()
+
+
+def launch_run(a, launch):
     conf = core.load_conf()
     board = core.Board.from_conf(conf)
     try:
@@ -1989,7 +2017,7 @@ def cmd_run(a):
         board.close()
     print(f"bus: {prot_text}", file=sys.stderr)
     if not systemd:
-        return run_fallback(rid, a)
+        return run_fallback(rid, a, launch)
     if not handoff:
         rc, out = start_main_unit(rid, s)
         if os.environ.get("AGENT_BUS_TEST_MAIN_TIMEOUT"):
@@ -2014,6 +2042,7 @@ def cmd_run(a):
         # the job may be running: nothing is stopped or ended here; the adopt timer supervises it
         print(f"bus: the supervisor did not start ({out.strip()[:160]}); the adopt timer (bus adopt --all) "
               f"supervises {rid}", file=sys.stderr)
+    launch.release()
     info = dict(id=rid, run=gen, state_file=state_path(rid), log=log, mode="systemd", slice=s["units"]["slice"],
                 main_unit=s["units"]["main"], **{"class": cls}, booking=s["booking"])
     if a.info_file:
@@ -2047,7 +2076,7 @@ def wait_ended(rid, report_handoff=False):
         time.sleep(1)
 
 
-def run_fallback(rid, a):
+def run_fallback(rid, a, launch):
     """No user manager: the client forks the job in a new session and process group and supervises it itself."""
     s = load_state(rid)
     spec = core.read_private(job_path(rid))
@@ -2067,6 +2096,7 @@ def run_fallback(rid, a):
     os.close(logfd)
     s.update(state="running", entry_state="running", pgid=pid, leader=core.proc_identity(pid), main_started=now())
     core.write_private(state_path(rid), s)
+    launch.release()
     info = dict(id=rid, run=s["run"], state_file=state_path(rid), log=spec["log"], mode="fallback", slice=None,
                 main_unit=None, **{"class": s["class"]}, booking=s["booking"])
     if a.info_file:
@@ -2142,16 +2172,30 @@ def cmd_reconcile(rid, confirm):
 
 def cmd_adopt_all():
     """Start a supervisor for every nonterminal run of this host whose supervisor lock is free."""
-    out = []
     from . import auto_upgrade
     if auto_upgrade.read_state().get("pending"):
-        return out
+        recovery = auto_upgrade.lock()
+        if not recovery.acquire():
+            return []
+        try:
+            recovered = auto_upgrade.settle(lambda build: auto_upgrade.link_to_build(core.BIN(), build), stale_only=True)
+            if not recovered and auto_upgrade.read_state().get("pending"):
+                return []
+        finally:
+            recovery.release()
+    return adopt_runs()
+
+
+def adopt_runs(only=None):
+    out = []
     if not user_manager_ok():
         return [dict(error="no user manager: adoption needs one")]
     for name in sorted(os.listdir(runs_dir())):
         if not name.endswith(".json") or name.endswith((".job.json", ".admit.json")):
             continue
         rid = name[:-5]
+        if only is not None and rid not in only:
+            continue
         s = core.read_private(os.path.join(runs_dir(), name)) or {}
         if s.get("state") not in NONTERMINAL or s.get("host") != core.HOST or s.get("mode") != "systemd":
             continue

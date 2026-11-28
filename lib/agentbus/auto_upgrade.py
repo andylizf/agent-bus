@@ -20,8 +20,19 @@ REPO = "https://github.com/andylizf/agent-bus.git"
 SOAK_S = 24 * 60 * 60
 TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 OID = re.compile(r"[0-9a-f]{40}")
-TAKEOVER_S = 60
+PASS_ALLOWANCE_S = 6 * 60  # Up to two 60 s GPU views plus systemd, admission and hook waits in a pass.
+TAKEOVER_S = 2 * PASS_ALLOWANCE_S + 60
+SERVICE_TIMEOUT_S = 30 * 60
+PENDING_STALE_S = TAKEOVER_S + 5 * 60  # Includes the probes before and after the switch.
+RETRY_DELAYS_S = (15 * 60, 60 * 60)
 WITHDRAWALS = "auto-upgrade-withdrawn"
+
+
+class TagChanged(Refused):
+    def __init__(self, tag, expected, actual):
+        self.tag, self.actual = tag, actual
+        super().__init__(f"{tag} changed during fetch: expected {expected[0]} ({expected[1]}), "
+                         f"got {actual[0]} ({actual[1]})")
 
 
 def version(tag):
@@ -65,9 +76,16 @@ def fetch(src, tag, oid, commit):
     ref = f"refs/tags/{tag}"
     git("init", "--quiet", "--template=", src)
     git("-C", src, "-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--depth=1", "--no-tags", REPO, ref)
-    actual = (git("-C", src, "rev-parse", "FETCH_HEAD"), git("-C", src, "rev-parse", "FETCH_HEAD^{commit}"))
+    actual_oid = git("-C", src, "rev-parse", "FETCH_HEAD")
+    try:
+        actual_commit = git("-C", src, "rev-parse", "FETCH_HEAD^{commit}")
+    except Refused:
+        if actual_oid != oid:
+            raise TagChanged(tag, (oid, commit), (actual_oid, None)) from None
+        raise
+    actual = (actual_oid, actual_commit)
     if actual != (oid, commit):
-        raise Refused(f"{tag} changed during fetch: expected {oid} ({commit}), got {actual[0]} ({actual[1]})")
+        raise TagChanged(tag, (oid, commit), actual)
 
 
 def release_blobs(src, commit):
@@ -211,13 +229,18 @@ def install_timer():
     unit = f"[Unit]\nDescription=agent-bus automatic upgrade\nConditionHost={fqdn}\n"
     (units / f"{name}.service").write_text(
         f"{unit}\n[Service]\nType=oneshot\n{env}\nExecStart={executable} _auto-upgrade-timer\n"
-        f"ExecStopPost={executable} _auto-upgrade-recover\nTimeoutStartSec=15min\n")
+        f"ExecStopPost={executable} _auto-upgrade-recover\nTimeoutStartSec={SERVICE_TIMEOUT_S}\n")
     (units / f"{name}.timer").write_text(
         f"{unit}\n[Timer]\nOnActiveSec=15min\nOnUnitActiveSec=1d\n\n[Install]\nWantedBy=timers.target\n")
+    adopt = core.component(os.environ.get("AGENT_BUS_TIMER") or "bus-adopt", "adopt unit")
+    if (units / f"{adopt}.service").is_file():
+        drop_in = units / f"{adopt}.service.d"
+        drop_in.mkdir(exist_ok=True)
+        (drop_in / "auto-upgrade.conf").write_text(f"[Service]\nExecStart=\nExecStart={executable} adopt --all\n")
 
 
-def lock():
-    return runner.Locked(os.path.join(core.private_dir(), "upgrade.lock"))
+def lock(shared=False):
+    return runner.Locked(os.path.join(core.private_dir(), "upgrade.lock"), shared=shared)
 
 
 def configure(action, allow_major=False):
@@ -230,11 +253,11 @@ def configure(action, allow_major=False):
         return sync_timer()
 
 
-def sync_timer(build=None):
-    enabled = settings().get("enabled") != "off"
+def sync_timer(build=None, available=True):
+    enabled = available and settings().get("enabled") != "off"
     timer = unit_name() + ".timer"
     if enabled:
-        if not os.path.exists(driver()):
+        if build or not os.path.exists(driver()):
             link_to_build(driver(), build or runner.build_root(core.BIN()))
         install_timer()
     elif not (unit_dir() / timer).exists():
@@ -267,26 +290,60 @@ def read_state():
     return core.read_private(state_file()) or {}
 
 
+def request_check():
+    if settings().get("enabled") == "off":
+        return "off", 0
+    if not runner.user_manager_ok() or linger_status() != "yes":
+        raise Refused('timer unavailable; run loginctl enable-linger "$USER", then bus auto-upgrade on')
+    previous = read_state()
+    rc, out, err = runner.sysctl("start", unit_name() + ".service", timeout=SERVICE_TIMEOUT_S + 60)
+    state = read_state()
+    if (state.get("last_check"), state.get("last_result")) != (previous.get("last_check"), previous.get("last_result")) \
+            and state.get("last_result"):
+        return state["last_result"], int(rc != 0)
+    if rc:
+        raise Refused(f"upgrade service: {(err or out).strip() or 'systemctl start failed'}")
+    return "service finished without a new check", 0
+
+
+def record_failure(state, tag, commit, build, reason):
+    retries = state.setdefault("retries", {})
+    attempts = retries.get(commit, {}).get("attempts", 0) + 1
+    failure = dict(build=build, reason=reason, attempts=attempts)
+    if attempts > len(RETRY_DELAYS_S):
+        retries.pop(commit, None)
+        state.setdefault("quarantine", {})[commit] = failure
+        detail = "quarantined after 3 failures"
+    else:
+        delay = RETRY_DELAYS_S[attempts - 1]
+        retries[commit] = dict(failure, retry_at=wall_time() + delay)
+        detail = f"attempt {attempts}/3, retry in {delay // 60} min"
+    return f"failed: {tag} {detail}: {reason}"
+
+
 def rollback(state, flip, reason):
     pending = state["pending"]
-    state.setdefault("quarantine", {})[pending["commit"]] = dict(build=pending["build"], reason=reason)
-    state["last_result"] = f"failed: {pending['to']} quarantined: {reason}"
+    if "failure" not in pending:
+        pending["failure"] = reason
+        state["last_result"] = record_failure(state, pending["to"], pending["commit"], pending["build"], reason)
     core.write_private(state_file(), state)
-    changed = runner.build_root(core.BIN()) != pending["previous"]
-    if changed:
+    if runner.build_root(core.BIN()) != pending["previous"]:
         flip(pending["previous"])
     del state["pending"]
     core.write_private(state_file(), state)
-    if changed:
-        runner.cmd_adopt_all()
     return state["last_result"]
 
 
-def settle(flip):
+def settle(flip, stale_only=False):
     state = read_state()
-    if "pending" in state:
-        failure = state.get("quarantine", {}).get(state["pending"]["commit"], {})
-        return rollback(state, flip, failure.get("reason") or "takeover was interrupted")
+    pending = state.get("pending")
+    if not pending:
+        return None
+    if stale_only:
+        host = core.load_conf().get("host")
+        if host not in (core.HOST, socket.gethostname()) or wall_time() - pending.get("time", 0) < PENDING_STALE_S:
+            return None
+    return rollback(state, flip, "takeover was interrupted")
 
 
 def doctor(user_manager, linger):
@@ -304,7 +361,7 @@ def doctor(user_manager, linger):
     pending = state.get("pending")
     result = state.get("last_result") or (f"verifying takeover of {pending['to']}" if pending else None)
     return dict(enabled=enabled, timer=timer, current_tag=current.get("tag"), current_build=installed,
-                base=current.get("base"), quarantine=state.get("quarantine", {}),
+                base=current.get("base"), quarantine=state.get("quarantine", {}), retries=state.get("retries", {}),
                 last_check=state.get("last_check"), last_result=result)
 
 
@@ -320,12 +377,13 @@ def installed_release(refs):
     tag, oid, commit = max(matches, key=lambda ref: version(ref[0]))
     with tempfile.TemporaryDirectory(prefix="identify-", dir=core.STATE()) as src:
         fetch(src, tag, oid, commit)
-        expected = {name: (mode, data) for name, mode, data in release_blobs(src, commit) if name != WITHDRAWALS}
+        expected = {name: (mode & stat.S_IXUSR, data) for name, mode, data in release_blobs(src, commit)
+                    if name != WITHDRAWALS}
         files = [build / "bin", build / "lib"]
         files += [p for part in ("bin", "lib") for p in (build / part).rglob("*")]
         if any(p.is_symlink() or not (p.is_file() or p.is_dir()) for p in files):
             raise Refused("legacy build contains a non-regular path")
-        actual = {p.relative_to(build).as_posix(): (stat.S_IMODE(p.stat().st_mode), p.read_bytes())
+        actual = {p.relative_to(build).as_posix(): (p.stat().st_mode & stat.S_IXUSR, p.read_bytes())
                   for p in files if p.is_file()}
         if actual != expected:
             raise Refused("legacy build files differ from the matching release tag")
@@ -348,8 +406,9 @@ def probe(build, runs):
 def wait_for_takeover(build, runs):
     deadline = time.monotonic() + TAKEOVER_S
     waiting = dict(runs)
+    next_adopt = 0
     while waiting:
-        for rid, (generation, previous) in list(waiting.items()):
+        for rid, generation in list(waiting.items()):
             s = runner.load_state(rid)
             if s.get("run") != generation:
                 raise Refused(f"{rid}: run generation changed during takeover")
@@ -361,12 +420,15 @@ def wait_for_takeover(build, runs):
                 continue
             identity = core.proc_identity(sup["pid"])
             if (identity == {k: sup.get(k) for k in ("pid", "boot_id", "ticks")}
-                    and (previous is None or identity == previous)
                     and not runner.lock_free(os.path.join(runner.runs_dir(), f"{rid}.lock"))):
                 del waiting[rid]
         if waiting:
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if now >= deadline:
                 raise Refused(f"takeover deadline expired for {', '.join(sorted(waiting))}")
+            if now >= next_adopt:
+                runner.adopt_runs(only=set(waiting))
+                next_adopt = time.monotonic() + 30
             time.sleep(0.25)
 
 
@@ -382,19 +444,6 @@ def live_runs():
         if state.get("state") in runner.NONTERMINAL and state.get("host") == core.HOST:
             runs.append(state)
     return runs
-
-
-def supervised_runs(runs):
-    live = {}
-    for run_state in runs:
-        rid = run_state["id"]
-        if run_state["mode"] != "systemd" or runner.lock_free(os.path.join(runner.runs_dir(), f"{rid}.lock")):
-            continue
-        sup = runner.load_state(rid).get("supervisor") or {}
-        identity = {k: sup.get(k) for k in ("pid", "boot_id", "ticks")}
-        current = core.proc_identity(identity["pid"]) if identity["pid"] else None
-        live[rid] = (run_state["run"], identity if current == identity else None)
-    return live
 
 
 def check(flip):
@@ -414,22 +463,28 @@ def check(flip):
         state = read_state()
         state["last_check"] = wall_time()
         try:
+            upgrade_lock.change_mode(shared=True)
             result = update(state, conf.get("allow_major") == "yes")
             if isinstance(result, str):
                 state["last_result"] = result
                 core.write_private(state_file(), state)
                 return result, 0
             build, pending = result
+            if not upgrade_lock.change_mode(shared=False):
+                state["last_result"] = "skipped: a run is starting"
+                core.write_private(state_file(), state)
+                return state["last_result"], 0
             runs = live_runs()
+            active = {r["id"]: r["run"] for r in runs if r["mode"] == "systemd"}
+            pending["time"] = wall_time()
             state["pending"] = pending
             state.pop("last_result", None)
             core.write_private(state_file(), state)
             ids = [r["id"] for r in runs]
             run(sys.executable, "-IB", os.path.join(build, "bin", "bus"), "_auto-upgrade-timer", "--help")
             run(sys.executable, "-IB", os.path.join(build, "bin", "bus"), "_auto-upgrade-recover", "--help")
-            if probe(build, ids) != runner.STATE_VERSION and any(r["mode"] == "systemd" for r in runs):
+            if probe(build, ids) != runner.STATE_VERSION and active:
                 raise Refused("candidate changes private state version while a systemd run is active")
-            active = supervised_runs(runs)
             flip(build)
             wait_for_takeover(pending["build"], active)
             probe(build, [r["id"] for r in live_runs()])
@@ -438,7 +493,15 @@ def check(flip):
             confirmed = dict(state, last_result=f"upgraded {pending['from']} to {pending['to']}",
                              upgrades=state.get("upgrades", []) + [entry])
             del confirmed["pending"]
+            if "retries" in confirmed:
+                confirmed["retries"] = {k: v for k, v in state["retries"].items() if k != pending["commit"]}
             core.write_private(state_file(), confirmed)
+        except TagChanged as e:
+            oid, commit = e.actual
+            state.setdefault("seen", {})[e.tag] = dict(oid=oid, commit=commit, first=wall_time())
+            state["last_result"] = f"failed: {e}; 24 h soak restarted"
+            core.write_private(state_file(), state)
+            return state["last_result"], 1
         except (OSError, Refused) as e:
             if "pending" in state:
                 return rollback(state, flip, str(e)), 1
@@ -485,13 +548,16 @@ def update(state, allow_major):
         return "no newer release"
     tag = max(eligible, key=version)
     oid, commit = refs[tag]
+    retry = state.get("retries", {}).get(commit)
+    if retry and now < retry["retry_at"]:
+        retry_at = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(retry["retry_at"]))
+        return f"{tag} retry after {retry_at}: {retry['reason']}"
     with tempfile.TemporaryDirectory(prefix="fetch-", dir=core.STATE()) as src:
         fetch(src, tag, oid, commit)
         try:
             build, withdrawn = stage_release(src, tag, commit)
         except Refused as e:
-            state.setdefault("quarantine", {})[commit] = dict(build=None, reason=str(e))
-            raise
+            raise Refused(record_failure(state, tag, commit, None, str(e)).removeprefix("failed: ")) from e
     state["withdrawn"] = sorted(set(state.get("withdrawn", [])) | set(withdrawn), key=version)
     before = current.get("tag") or f"{runner.installed_build()} (based on {base})"
     pending = {"from": before, "to": tag, "time": wall_time(), "commit": commit, "build": os.path.basename(build),

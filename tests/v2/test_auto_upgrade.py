@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from helpers import REPO
 from agentbus import auto_upgrade as au, cli, core, runner
@@ -147,13 +147,16 @@ if sys.argv[1] == '_upgrade-probe':
         self.tags = {"v2.0.9": ("a" * 40, "b" * 40)}
         self.check()
         self.now += au.SOAK_S
-        self.fetch = ("a" * 40, "c" * 40)
+        self.fetch = ("c" * 40, "b" * 40)
         result, rc = self.check()
         self.assertEqual(rc, 1)
         self.assertIn("changed during fetch", result)
         self.assertEqual(au.doctor(False, False)["last_result"], result)
         self.assertEqual(runner.installed_build(), "v2.0.8")
+        self.assertEqual(au.read_state()["seen"]["v2.0.9"], dict(oid="c" * 40, commit="b" * 40, first=self.now))
         self.fetch = None
+        self.assertEqual(self.check(), ("waiting for the 24 h soak", 0))
+        self.now += au.SOAK_S
         self.broken = True
         result, rc = self.check()
         self.assertEqual(rc, 1)
@@ -164,9 +167,16 @@ if sys.argv[1] == '_upgrade-probe':
     def test_network_failure_and_busy_lock(self):
         with patch.object(au, "git", side_effect=core.Refused("no network")):
             self.assertEqual(au.check(cli.flip), ("failed: no network", 1))
-        with au.lock():
-            proc = subprocess.run([sys.executable, "-IB", str(REPO / "bin" / "bus"), "auto-upgrade", "check"],
-                                  capture_output=True, text=True, timeout=5, env=os.environ.copy())
+        with au.lock(shared=True):
+            tools = self.root / "tools"
+            tools.mkdir()
+            for name, reply in (("systemctl", "running"), ("loginctl", "yes")):
+                command = tools / name
+                command.write_text(f"#!/bin/sh\necho {reply}\n")
+                command.chmod(0o755)
+            proc = subprocess.run([sys.executable, "-IB", str(REPO / "bin" / "bus"), "_auto-upgrade-timer"],
+                                  capture_output=True, text=True, timeout=5,
+                                  env=dict(os.environ, AGENT_BUS_SYSTEMD="on", PATH=f"{tools}:{os.environ['PATH']}"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("another upgrade is in progress", proc.stdout)
         self.assertEqual(au.doctor(False, False)["last_result"], "failed: no network")
@@ -177,12 +187,29 @@ if sys.argv[1] == '_upgrade-probe':
         self.check()
         self.now += au.SOAK_S
         with patch.object(cli, "flip", side_effect=OSError("cannot replace symlink")):
-            self.assertEqual(self.check(), ("failed: v2.0.9 quarantined: cannot replace symlink", 1))
+            self.assertEqual(self.check(), ("failed: v2.0.9 attempt 1/3, retry in 15 min: cannot replace symlink", 1))
         self.assertEqual(runner.installed_build(), "v2.0.8")
         self.assertNotIn("upgrades", au.read_state())
-        self.assertEqual(au.doctor(False, False)["last_result"], "failed: v2.0.9 quarantined: cannot replace symlink")
+        self.assertIn("cannot replace symlink", au.doctor(False, False)["last_result"])
+
+    def test_manual_check_waits_for_shared_service_result(self):
+        def start(*args, timeout):
+            self.assertEqual(args, ("start", "bus-auto-upgrade.service"))
+            self.assertGreater(timeout, au.SERVICE_TIMEOUT_S)
+            core.private_dir()
+            core.write_private(au.state_file(), dict(last_check=self.now, last_result="no newer release"))
+            return 0, "", ""
+
+        args = Mock(action="check", allow_major=False)
+        with patch.object(runner, "user_manager_ok", return_value=True), \
+                patch.object(au, "linger_status", return_value="yes"), patch.object(runner, "sysctl", side_effect=start), \
+                patch.object(au, "check", side_effect=AssertionError("foreground must never switch")):
+            self.assertEqual(cli.cmd_auto_upgrade(args), 0)
+        self.assertEqual(runner.installed_build(), "v2.0.8")
 
     def test_timer_default_opt_out_and_early_daily_schedule(self):
+        au.unit_dir().mkdir(parents=True)
+        (au.unit_dir() / "bus-adopt.service").touch()
         with patch.object(runner, "user_manager_ok", return_value=True), \
                 patch.object(au, "linger_status", return_value="yes"), \
                 patch.object(runner, "sysctl", return_value=(0, "", "")) as systemctl:
@@ -194,6 +221,8 @@ if sys.argv[1] == '_upgrade-probe':
             self.assertIn("OnActiveSec=15min\nOnUnitActiveSec=1d", timer)
             self.assertIn(f'"{au.driver()}" _auto-upgrade-timer', service)
             self.assertIn(f'"{au.driver()}" _auto-upgrade-recover', service)
+            adopt = (au.unit_dir() / "bus-adopt.service.d" / "auto-upgrade.conf").read_text()
+            self.assertIn(f'"{au.driver()}" adopt --all', adopt)
             self.assertEqual(au.configure("off"), "off")
             systemctl.assert_called_with("disable", "--now", "bus-auto-upgrade.timer")
         self.assertEqual(self.check(), ("off", 0))
@@ -240,16 +269,36 @@ if sys.argv[1] == '_upgrade-probe':
             self.assertNotIn("upgrades", au.read_state())
             raise core.Refused("existing job did not take over")
 
-        with patch.object(au, "wait_for_takeover", side_effect=fails_on_candidate), \
-                patch.object(runner, "cmd_adopt_all") as adopt:
+        with patch.object(au, "wait_for_takeover", side_effect=fails_on_candidate):
             result, rc = self.check()
-            adopt.assert_called_once()
+            self.assertEqual(rc, 1)
+            self.assertIn("v2.0.10 attempt 1/3", result)
+            self.assertNotIn("quarantine", au.read_state())
+            self.assertIn("retry after", self.check()[0])
+            self.now += au.RETRY_DELAYS_S[0]
+            self.assertIn("attempt 2/3", self.check()[0])
+            self.now += au.RETRY_DELAYS_S[1]
+            result, rc = self.check()
         self.assertEqual(rc, 1)
-        self.assertIn("v2.0.10 quarantined: existing job did not take over", result)
+        self.assertIn("v2.0.10 quarantined after 3 failures: existing job did not take over", result)
         self.assertEqual(runner.installed_build(), "v2.0.8")
         self.assertIn("b" * 40, au.read_state()["quarantine"])
         self.assertEqual(self.check(), ("newer releases are withdrawn or quarantined", 0))
-        self.assertEqual(len([a for a in self.calls if "fetch" in a]), 1)
+        self.assertEqual(len([a for a in self.calls if "fetch" in a]), 3)
+
+    def test_slow_pass_can_succeed_on_retry(self):
+        commit = "a" * 40
+        self.tags["v2.0.9"] = (commit, commit)
+        self.check()
+        self.now += au.SOAK_S
+        with patch.object(au, "wait_for_takeover", side_effect=core.Refused("slow pass")):
+            self.assertIn("attempt 1/3", self.check()[0])
+        before = os.readlink(core.BIN())
+        self.assertIn("retry after", self.check()[0])
+        self.assertEqual(os.readlink(core.BIN()), before)
+        self.now += au.RETRY_DELAYS_S[0]
+        self.assertEqual(self.check(), ("upgraded v2.0.8 to v2.0.9", 0))
+        self.assertNotIn(commit, au.read_state()["retries"])
 
     def test_a_tag_that_reverts_has_to_soak_again(self):
         self.tags["v2.0.9"] = ("a" * 40, "b" * 40)
@@ -295,10 +344,69 @@ if sys.argv[1] == '_upgrade-probe':
         self.assertEqual(runner.installed_build(), old.name)
         self.assertIn("takeover was interrupted", au.doctor(False, False)["last_result"])
 
-    def test_takeover_requires_live_same_process_and_healthy_pass(self):
+    def test_adopt_restores_stale_pending_then_adopts_on_previous_build(self):
+        previous = runner.build_root(core.BIN())
+        self.install_current("v2.0.9")
+        pending = {"previous": previous, "from": "v2.0.8", "to": "v2.0.9", "build": "v2.0.9",
+                   "commit": "b" * 40, "time": self.now - au.PENDING_STALE_S + 1}
+        core.private_dir()
+        core.write_private(au.state_file(), dict(pending=pending))
+
+        def adopt():
+            self.assertEqual(runner.installed_build(), "v2.0.8")
+            return [{"started": True}]
+
+        with patch.object(runner, "adopt_runs", side_effect=adopt) as sweep:
+            self.assertEqual(runner.cmd_adopt_all(), [])
+            sweep.assert_not_called()
+            self.now += 1
+            self.assertEqual(runner.cmd_adopt_all(), [{"started": True}])
+        self.assertNotIn("pending", au.read_state())
+
+    def test_manual_rollback_moves_service_driver(self):
+        old = self.copy_without_release_metadata()
+        new = old.with_name("new")
+        shutil.copytree(old, new)
+        cli.flip(str(new))
+        au.link_to_build(au.driver(), str(new))
+        cli.cmd_upgrade(Mock(build=str(old), json=True))
+        self.assertEqual(runner.installed_build(), old.name)
+        self.assertEqual(os.path.realpath(au.driver()), str(old / "bin" / "bus"))
+
+    def test_exclusive_upgrade_lock_keeps_launch_from_writing_run_state(self):
+        command = [sys.executable, "-IB", str(REPO / "bin" / "bus"), "run", "--gpus", "0", "--", "true"]
+        with au.lock():
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=5)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("holds the launch lock", proc.stderr)
+        self.assertFalse(Path(core.STATE(), "runs").exists())
+
+    def test_launch_arriving_during_download_defers_switch(self):
+        commit = "a" * 40
+        self.tags["v2.0.9"] = (commit, commit)
+        self.check()
+        self.now += au.SOAK_S
+        upgrade = Mock(wraps=au.lock())
+        upgrade.change_mode.side_effect = [True, False]
+        with patch.object(au, "lock", return_value=upgrade):
+            self.assertEqual(self.check(), ("skipped: a run is starting", 0))
+        self.assertEqual(runner.installed_build(), "v2.0.8")
+        self.assertNotIn("pending", au.read_state())
+        self.assertNotIn("retries", au.read_state())
+
+    def test_launch_refuses_already_loaded_candidate_after_rollback(self):
+        installed = runner.build_root(core.BIN())
+        candidate = str(Path(installed).with_name("candidate"))
+        with patch.object(runner, "build_root", side_effect=[candidate, installed]), \
+                patch.object(runner, "launch_run") as launch:
+            with self.assertRaisesRegex(core.Refused, "installed build changed"):
+                runner.cmd_run(Mock())
+            launch.assert_not_called()
+
+    def test_takeover_accepts_re_adoption_and_still_requires_healthy_live_process(self):
         identity = dict(pid=123, ticks=10, boot_id="test")
         state = dict(run="generation", state="running", supervisor=dict(identity, code="new", healthy=True))
-        runs = {"test-run": ("generation", identity)}
+        runs = {"test-run": "generation"}
         with patch.object(runner, "load_state", return_value=state), patch.object(runner, "lock_free", return_value=False), \
                 patch.object(core, "proc_identity", return_value=identity), patch.object(au, "TAKEOVER_S", 0):
             au.wait_for_takeover("new", runs)
@@ -306,8 +414,18 @@ if sys.argv[1] == '_upgrade-probe':
             with self.assertRaisesRegex(core.Refused, "deadline expired for test-run"):
                 au.wait_for_takeover("new", runs)
             state["supervisor"]["healthy"] = True
+            state["supervisor"]["pid"] = 124
             with self.assertRaisesRegex(core.Refused, "deadline expired for test-run"):
-                au.wait_for_takeover("new", {"test-run": ("generation", dict(identity, pid=124))})
+                au.wait_for_takeover("new", runs)
+        stale = dict(run="generation", state="running", supervisor=None)
+        new_identity = dict(identity, pid=124)
+        state["supervisor"].update(new_identity)
+        with patch.object(runner, "load_state", side_effect=[stale, state]), \
+                patch.object(runner, "lock_free", return_value=False), \
+                patch.object(core, "proc_identity", return_value=new_identity), \
+                patch.object(runner, "adopt_runs") as adopt, patch.object(au.time, "sleep"):
+            au.wait_for_takeover("new", runs)
+            adopt.assert_called_once_with(only={"test-run"})
 
     def test_candidate_dry_adopts_without_writing_and_refuses_newer_state(self):
         rid = "test-run"
@@ -350,6 +468,16 @@ if sys.argv[1] == '_upgrade-probe':
         self.assertNotEqual(first, second)
         self.assertEqual((Path(second) / "bin" / "bus").read_bytes(), bus.read_bytes())
         self.assertEqual((Path(second) / "lib" / "agentbus" / "__init__.py").read_bytes(), b"\x23\xff\n")
+        installed = Path(core.BUILDS(), good[:12])
+        shutil.copytree(second, installed)
+        (installed / "bin" / "bus").chmod(0o700)
+        (installed / "lib" / "agentbus" / "__init__.py").chmod(0o600)
+        core.write_private(installed / runner.BUILD_RELEASE, dict(legacy_build=installed.name))
+        cli.flip(str(installed))
+        au.git("-C", str(repo), "tag", "v2.0.9", good)
+        core.private_dir()
+        with patch.object(au, "REPO", repo.as_uri()):
+            self.assertEqual(au.installed_release(au.release_refs()), dict(tag="v2.0.9", base="v2.0.9", commit=good))
         (repo / "bin" / "link").symlink_to(self.root / "outside")
         bad = commit()
         with self.assertRaisesRegex(core.Refused, "not a regular file: bin/link"):

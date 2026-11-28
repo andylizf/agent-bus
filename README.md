@@ -165,9 +165,17 @@ The updater picks the newest eligible version. It stays within the installed maj
 `bus auto-upgrade on --allow-major`, and it requires a higher version in either mode.
 
 The updater builds from regular files in the verified Git commit. The previous build drives the switch and
-checks that the candidate can load existing run state. It waits up to 60 seconds for live supervisors to report a
-healthy pass on the candidate. A failed or interrupted switch restores the previous build and quarantines the
-failed commit. The timer uses a separate entry point that stays on the previous build until takeover is confirmed.
+checks that the candidate can load existing run state. The takeover budget is 13 minutes: six minutes each for
+the old pass and the new pass, plus one minute for re-exec or adoption. A pass can spend up to two minutes on
+serial GPU queries, with the rest of the allowance for systemd, admission, and hook waits. An existing run can
+report a healthy pass from its re-executed supervisor or from a supervisor adopted by the new build.
+
+The timer and `bus auto-upgrade check` start the same systemd service. The service keeps its previous entry
+point until it confirms takeover. A failed or interrupted switch restores the previous build. If the recovery
+hook leaves a switch pending, the adopt service recovers it after 18 minutes. Failed commits can retry after
+15 minutes and then one hour. A third failure quarantines the commit. A manual rollback also moves the service
+entry point to the selected build. New launches share the updater's lock during download. The updater takes it
+exclusively before switching builds, so a launch already in progress defers the switch.
 
 To recall a release, remove its tag from the public repository and publish the replacement under a higher version.
 A release can also include a root-level `auto-upgrade-withdrawn` file listing older `vX.Y.Z` tags, one per line.
@@ -189,7 +197,7 @@ For an install on v2.0.0 through v2.0.8, fetch and check out a release that incl
 The checkout's `bus` sets up the timer as part of the switch. If the installed older `bus` performs the upgrade,
 the new build sets up the timer and creates `release.json` on its first invocation. Its first check identifies the
 installed tag from the commit and installed files. `bus doctor` shows the current tag or build ID, timer
-availability, last check, result, and quarantine reasons. The timer requires a systemd user manager with linger
+availability, last check, result, retry, and quarantine reasons. The timer requires a systemd user manager with linger
 enabled. Run `loginctl enable-linger "$USER"`, then `bus auto-upgrade on` to start the timer when it was
 unavailable. Automatic upgrades record the source version, destination tag and time in
 `~/.local/state/agent-bus/auto-upgrade.json`.
