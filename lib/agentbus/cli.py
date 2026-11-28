@@ -32,7 +32,7 @@ def board(*, write=False):
         try:
             yield b
         finally:
-            if write:
+            if write and b.fd is not None:
                 move.announce(b, runner.build_version())
 
 
@@ -288,38 +288,58 @@ def cmd_gc(a):
     with board(write=True) as b:
         if b.ok:
             entries = {e["id"]: e for e in b.entries() if e["user"] == core.USER}
-            ended = {e["id"] for e, _ in move.archive_entries(b) if move.end_record(e)}
+            archives = [e for e, _ in move.archive_entries(b) if e["user"] == core.USER]
+            ended = {e["id"] for e in archives if move.end_record(e)}
+            has_archive = {e["id"] for e in archives}
             inboxes = {rid for rid in my_boxes(b) if move.run_inbox(core.USER, rid) and rid not in ended}
+            exclusive = False
             for rid in sorted(entries.keys() | inboxes):
-                # decided under the run's own supervisor lock, from its private state read now: only a run that is
-                # positively ended is archived; one with no private state, or live, is left and listed
                 lk = runner.Locked(os.path.join(runner.runs_dir(), f"{rid}.lock"))
                 if not lk.acquire():
                     continue                         # a supervisor holds it: live
                 try:
                     st = core.read_private(runner.state_path(rid))
-                    if not st or st.get("state") != "ended":
-                        if not st:
-                            res["unknown"].append(rid)
-                        continue
                     e = entries.get(rid)
-                    pinned = st.get("board") or {}
-                    if (st.get("id") != rid or (e and st.get("run") != e.get("run"))
-                            or st.get("host", core.HOST) != core.HOST or str(pinned.get("inode")) != str(b.ino)
-                            or str(pinned.get("fsid")) != str(b.fsid)):
-                        res["unknown"].append(rid)
-                        continue
-                    if not e:
-                        sup = runner.Supervisor(rid)
-                        sup.s = st
-                        try:
-                            e = sup.entry()
-                        except KeyError:
+                    if not st or st.get("state") != "ended":
+                        if (rid in inboxes and e is None and rid not in has_archive
+                                and (st or {}).get("state") in (None, "preparing")):
+                            if not exclusive:
+                                # Fence admissions from other installations before testing or closing this inbox.
+                                b.lease(exclusive=True)
+                                if not b.recheck() or b.pending:
+                                    raise Refused("the board changed during gc; retry")
+                                exclusive = True
+                            st = core.read_private(runner.state_path(rid))
+                            if core.read_file(b.wdir("agents"), f"{rid}.json") is not None:
+                                res["unknown"].append(rid)
+                                continue
+                            end = move.abandoned_inbox(b, rid, st)
+                            if end is None:
+                                res["unknown"].append(rid)
+                                continue
+                        elif not st:
                             res["unknown"].append(rid)
                             continue
-                    end = dict(core.clean(e), state="ended", ended=st.get("ended", now()),
-                               end_reason=st.get("end_reason"))
-                    if not core.check_entry(end, b.ngpus) or not move.end_record(end):
+                        else:
+                            continue
+                    else:
+                        pinned = st.get("board") or {}
+                        if (st.get("id") != rid or (e and st.get("run") != e.get("run"))
+                                or st.get("host", core.HOST) != core.HOST or str(pinned.get("inode")) != str(b.ino)
+                                or str(pinned.get("fsid")) != str(b.fsid)):
+                            res["unknown"].append(rid)
+                            continue
+                        if not e:
+                            sup = runner.Supervisor(rid)
+                            sup.s = st
+                            try:
+                                e = sup.entry()
+                            except KeyError:
+                                res["unknown"].append(rid)
+                                continue
+                        end = dict(core.clean(e), state="ended", ended=st.get("ended", now()),
+                                   end_reason=st.get("end_reason"))
+                    if not move.valid_archive_entry(end, b.ngpus) or not move.end_record(end):
                         res["unknown"].append(rid)
                         continue
                     try:
@@ -341,7 +361,7 @@ def cmd_gc(a):
     for x in res["archived"]:
         print(f"archived {x} (its run has ended)")
     for x in res["unknown"]:
-        print(f"left {x}: no private state of its run here, so not known to be ended")
+        print(f"left {x}: run end or abandoned launch could not be verified")
 
 
 def cmd_doctor(a):
@@ -773,10 +793,11 @@ def main(argv=None):
             print("bus: give the command after --", file=sys.stderr)
             return 2
     explicit_opt_out = a.cmd == "auto-upgrade" and a.action == "off"
-    if not explicit_opt_out and a.cmd not in ("_install", "_auto-upgrade-setup", "_auto-upgrade-timer",
-                                             "_auto-upgrade-recover", "_upgrade-probe"):
+    if a.cmd not in ("_install", "_upgrade-probe"):
+        timer = not explicit_opt_out and a.cmd not in ("_auto-upgrade-setup", "_auto-upgrade-timer",
+                                                       "_auto-upgrade-recover")
         try:
-            auto_upgrade.bootstrap()
+            auto_upgrade.bootstrap(timer=timer)
         except (Refused, OSError) as e:
             print(f"bus: automatic upgrade setup: {e}", file=sys.stderr)
     try:

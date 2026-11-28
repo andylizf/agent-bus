@@ -247,6 +247,7 @@ def passthrough_env():
 
 
 CG_ROOT = "/sys/fs/cgroup"
+PREPARING_INBOX_MODE = 0o500
 
 
 def cgroup_of(unit, tries=1):
@@ -270,6 +271,15 @@ def main_unit_state(unit):
                                            int(p.get("ExecMainStartTimestampMonotonic") or 0) > 0):
         return "exists"
     return "absent"
+
+
+def launch_units_absent(rid):
+    if not sys.platform.startswith("linux"):
+        return True
+    stem = "*-" + rid.replace("-", "_")
+    rc, out, _ = sysctl("list-units", "--all", "--plain", "--no-legend", "--no-pager", stem + "-main.service",
+                        stem + "-sup*.service", stem + ".slice", timeout=3)
+    return rc == 0 and not out.strip()
 
 
 def recover_cgroup(slice_unit):
@@ -2001,11 +2011,9 @@ def launch_run(a, launch):
             # second with the same slug never share an id, and nothing overwrites another run's record
             if core.read_file(board.wdir("agents"), f"{rid}.json") is None and reserve_state(rid):
                 try:
-                    os.mkdir(rid, 0o700, dir_fd=inbox)   # created now, so its mode is set now, on its own descriptor
+                    os.mkdir(rid, PREPARING_INBOX_MODE, dir_fd=inbox)
                     fd = core.sub(inbox, rid)
-                    if fd is not None and os.fstat(fd).st_uid == core.UID:
-                        os.fchmod(fd, board.inbox_mode)
-                    elif fd is not None:
+                    if fd is not None and os.fstat(fd).st_uid != core.UID:
                         os.close(fd)
                         fd = None
                 except FileExistsError:
@@ -2029,7 +2037,7 @@ def launch_run(a, launch):
         un = core.unit_name(rid)
         handoff = bool(a.exclusive and cls == "scheduled")
         s = dict(state_version=STATE_VERSION, id=rid, run=gen, host=core.HOST, user=core.USER,
-                 board=dict(path=board.path, inode=board.ino, fsid=board.fsid), state="starting",
+                 board=dict(path=board.path, inode=board.ino, fsid=board.fsid), state="preparing",
                  entry_state="waiting-handoff" if handoff else "running", end_reason=None, exit_status=None,
                  mode="systemd" if systemd else "fallback", handoff=handoff,
                  units=dict(slice=f"{un}.slice", main=f"{un}-main.service", sup=f"{un}-sup.service", cgroup_path=None),
@@ -2044,6 +2052,13 @@ def launch_run(a, launch):
         if os.path.exists(log) is False:
             open(log, "a").close()
             os.chmod(log, 0o600)
+        # A private inbox or a preparing state is proof of death before admission once the board lease is free.
+        fd = board.wdir("inbox", rid)
+        if os.fstat(fd).st_uid != core.UID:
+            raise Refused(f"the inbox for {rid} changed during launch")
+        os.fchmod(fd, board.inbox_mode)
+        s["state"] = "starting"
+        core.write_private(state_path(rid), s)
     finally:
         board.close()
     print(f"bus: {prot_text}", file=sys.stderr)

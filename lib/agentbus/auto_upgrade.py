@@ -199,25 +199,33 @@ def link_to_build(link, build):
             os.unlink(tmp)
 
 
-def bootstrap():
+def bootstrap(*, timer=True):
     """An older upgrader copies only bin/ and lib/. Initialize that build on its first invocation."""
     build = runner.build_root()
     if (os.path.dirname(build) != os.path.realpath(core.BUILDS()) or build != runner.build_root(core.BIN())
             or not core.load_conf().get("host")):
         return
     metadata = Path(build, runner.BUILD_RELEASE)
-    if metadata.is_file():
-        current = runner.build_release(build)
-        if "legacy_build" not in current or os.path.exists(service_entry()) or settings().get("enabled") == "off":
-            return
+    current = runner.build_release(build) if metadata.is_file() else {}
+    install_timer = timer and (not metadata.is_file() or (
+        "legacy_build" in current and not os.path.exists(service_entry()) and settings().get("enabled") != "off"))
+    state = read_state()
+    if state.get("pending") or (build_confirmed(state, runner.build_id(build)) and not install_timer):
+        return
     upgrade_lock = lock()
     if not upgrade_lock.acquire():
         return
     try:
+        state = read_state()
+        if state.get("pending") or build != runner.build_root(core.BIN()):
+            return
+        bid = runner.build_id(build)
         if not metadata.is_file():
-            bid = runner.build_id(build)
             core.write_private(metadata, {"legacy_build": bid})
-        sync_timer()
+        if not build_confirmed(state, bid):
+            confirm_manual(build)
+        if install_timer:
+            sync_timer()
     finally:
         upgrade_lock.release()
 
@@ -310,6 +318,10 @@ def state_file():
 
 def read_state():
     return core.read_private(state_file()) or {}
+
+
+def build_confirmed(state, build):
+    return state.get("manual_build") == build or any(e.get("build") == build for e in state.get("upgrades", []))
 
 
 def confirm_manual(build):

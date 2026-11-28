@@ -12,7 +12,9 @@ SEAL = ".move-seal"
 CLIENT_PREFIX = "account-build-"
 MOVE_PROTOCOL = 2
 PUBLISHER_LOOKBACK_S = 14 * 86400
+ABANDONED_INBOX_S = 120
 RUN_INBOX = re.compile(r"\d{8}-\d{6}-.+")
+PUBLISH_TEMP = re.compile(r"\.tmp-[0-9a-f]{16}")
 
 
 def confirmed():
@@ -20,8 +22,7 @@ def confirmed():
     state = auto_upgrade.read_state()
     if state.get("pending") or runner.build_root() != runner.build_root(core.BIN()):
         return False
-    build = runner.build_id()
-    return state.get("manual_build") == build or any(e.get("build") == build for e in state.get("upgrades", []))
+    return auto_upgrade.build_confirmed(state, runner.build_id())
 
 
 def announce(board, build, *, idle=False):
@@ -102,6 +103,14 @@ def names_in(board, *parts):
     return names
 
 
+def valid_archive_entry(entry, ngpus):
+    if entry.get("never_started") is not True:
+        return core.check_entry(entry, ngpus)
+    user = entry.get("user")
+    return (isinstance(user, str) and run_inbox(user, entry.get("id"))
+            and end_record(entry) and core.note_ok(entry.get("end_reason")))
+
+
 def archive_entries(board):
     archive = board.dir("archive")
     for name in names_in(board, "archive"):
@@ -110,17 +119,49 @@ def archive_entries(board):
         row = core.read_json(archive, name)
         if row:
             e, st, _ = row
-            if (core.check_entry(e, board.ngpus) and e["user"] == core.owner_name(st.st_uid)
+            if (valid_archive_entry(e, board.ngpus) and e["user"] == core.owner_name(st.st_uid)
                     and not st.st_mode & 0o022 and re.fullmatch(re.escape(e["id"]) + r"-\d+\.json", name)):
                 yield e, st
 
 
 def end_record(entry):
-    return entry["state"] == "ended" and core.is_int(entry.get("ended"))
+    return entry.get("state") == "ended" and core.is_int(entry.get("ended"))
 
 
 def run_inbox(user, box):
     return core.owned_id(box, user) and RUN_INBOX.fullmatch(box[len(user) + 1:]) is not None
+
+
+def abandoned_inbox(board, rid, state):
+    """A private inbox precedes admission; a matching preparing state also covers the chmod-to-commit gap."""
+    from . import runner
+    try:
+        st = os.stat(rid, dir_fd=board.dir("inbox"), follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if (not stat.S_ISDIR(st.st_mode) or st.st_uid != core.UID
+            or core.now() - st.st_ctime < ABANDONED_INBOX_S):
+        return None
+    state = state or {}
+    if state.get("state") == "preparing":
+        if (state.get("id") != rid or state.get("host") != core.HOST or state.get("user") != core.USER
+                or state.get("board") != board.pin_fields()):
+            return None
+    elif (state.get("state") is not None
+          or stat.S_IMODE(st.st_mode) & ~stat.S_ISGID != runner.PREPARING_INBOX_MODE):
+        return None
+    hb = board.dir("agents", ".heartbeat")
+    if (state.get("main_started") or state.get("main_pin_required") or state.get("supervisor")
+            or state.get("leader") or state.get("pgid") or (state.get("units") or {}).get("cgroup_path")
+            or os.path.lexists(os.path.join(core.STATE(), "ctl", rid, "main-cgroup.json"))
+            or (hb is not None and core.read_file(hb, rid, 4096) is not None)
+            or not runner.launch_units_absent(rid)):
+        return None
+    end = dict(id=rid, user=core.USER, host=core.HOST, state="ended", never_started=True, build=runner.build_version(),
+               end_reason="run never started: launch stopped before admission", ended=core.now())
+    if confirmed():
+        end["move_protocol"] = MOVE_PROTOCOL
+    return end
 
 
 def publishers(board, entries, receipts, t):
@@ -144,7 +185,7 @@ def publishers(board, entries, receipts, t):
 
     for e, st in archive_entries(board):
         if end_record(e):
-            archived.add(e["id"])
+            archived.add((e["user"], e["id"]))
         observe(e["user"], st.st_ctime, e.get("build") or "unknown", capable(e))
 
     for e in [*board.bookings_raw(), *board.objections(), *board.arrivals(), *receipts.values()]:
@@ -175,7 +216,7 @@ def publishers(board, entries, receipts, t):
             continue
         for m in board.messages(box):
             observe(m["sender"], m["_ctime"], "unreported")
-        if run_inbox(user, box) and box not in archived:
+        if run_inbox(user, box) and (user, box) not in archived:
             unaccounted.append(f"{box} ({user})")
     missing = [f"{user} ({versions.get(user, (0, 'unknown', False))[1]})" for user in sorted(authors)
                if not versions.get(user, (0, "", False))[2]]
@@ -269,8 +310,15 @@ def prepare(old, path):
             marker = core.read_json(fd, core.MOVE_PENDING)
             pin = old.pin_fields()
             if marker is None:
-                if os.listdir(fd):
-                    raise Refused(f"{path}: destination must be empty")
+                temps = os.listdir(fd)
+                for temp in temps:
+                    st = os.stat(temp, dir_fd=fd, follow_symlinks=False)
+                    if (not PUBLISH_TEMP.fullmatch(temp) or not stat.S_ISREG(st.st_mode)
+                            or st.st_uid != old.creator or st.st_nlink != 1 or st.st_mode & 0o022):
+                        raise Refused(f"{path}: destination must be empty")
+                os.fchmod(fd, 0o700)
+                for temp in temps:
+                    core.unlink_own(fd, temp)
                 core.publish(fd, core.MOVE_PENDING, core.dumps(pin))
             elif marker[0] != pin or marker[1].st_uid != old.creator or marker[1].st_mode & 0o022:
                 raise Refused(f"{path}: destination belongs to another transaction")

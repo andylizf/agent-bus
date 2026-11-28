@@ -158,6 +158,49 @@ class BoardMove(BusTest):
             self.assertTrue(move.end_record(archived[0]))
         self.cutover()
 
+    def test_gc_archives_interrupted_admission_only_after_age_and_unit_checks(self):
+        args = cli.parser().parse_args(["run", "--gpus", "0", "--detach", "true"])
+        write = core.write_private
+
+        for before_state in (True, False):
+            with self.subTest(before_state=before_state):
+                args.slug = "no-state" if before_state else "preparing"
+
+                def interrupt(path, data):
+                    if (before_state and str(path).endswith(".job.json")) or data.get("state") == "starting":
+                        raise OSError("interrupted launch")
+                    return write(path, data)
+
+                with patch.object(core, "write_private", side_effect=interrupt):
+                    with self.assertRaisesRegex(OSError, "interrupted launch"):
+                        runner.cmd_run(args)
+                inbox, = (p for p in (self.root / "inbox").iterdir() if p.name.endswith(args.slug))
+                self.assertEqual(stat.S_IMODE(inbox.stat().st_mode), runner.PREPARING_INBOX_MODE if before_state else 0o1777)
+                self.assertIn(inbox.name, self.bus_json("gc", "--mine", "--json")["unknown"])
+                aged = int(inbox.stat().st_ctime) + move.ABANDONED_INBOX_S + 2
+                gc = cli.parser().parse_args(["gc", "--mine", "--json"])
+                with patch.object(core, "now", return_value=aged), self.installed_code(), patch.object(cli, "out") as out:
+                    with patch.object(runner, "launch_units_absent", return_value=False):
+                        cli.cmd_gc(gc)
+                    self.assertIn(inbox.name, out.call_args.args[0]["unknown"])
+                    with patch.object(runner, "launch_units_absent", return_value=True):
+                        cli.cmd_gc(gc)
+                    self.assertEqual(out.call_args.args[0]["archived"], [inbox.name])
+                archived = next((self.root / "archive").glob(inbox.name + "-*.json"))
+                self.assertIn("run never started", json.loads(archived.read_bytes())["end_reason"])
+        self.cutover()
+
+    def test_end_record_from_a_hyphenated_name_prefix_cannot_clear_another_users_inbox(self):
+        other = core.USER + "-lab"
+        rid = f"{other}-20261128-000000-run"
+        (self.root / "inbox" / rid).mkdir()
+        sup = self.supervisor()
+        end = dict(sup.entry(), id=rid, state="ended", ended=core.now(), move_protocol=move.MOVE_PROTOCOL)
+        (self.root / "archive" / f"{rid}-123.json").write_bytes(core.dumps(end))
+        with core.Board.from_conf() as board, patch.object(board, "inbox_owner", return_value=other):
+            with self.assertRaisesRegex(core.Refused, rf"run inbox without an end record: {rid}"):
+                move.require_empty(board)
+
     def test_second_install_cannot_clear_an_inbox_while_first_install_starts(self):
         other = self.tmp / "other"
         env = dict(self.env, AGENT_BUS_CONFIG=str(other / "config"), AGENT_BUS_STATE=str(other / "state"),
@@ -343,6 +386,29 @@ class BoardMove(BusTest):
         for path in partial:
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o1777)
 
+    def test_retry_recovers_temp_from_interrupted_first_pending_publish(self):
+        publish = core.publish
+
+        def interrupt(fd, name, data, *args, **kwargs):
+            if name == core.MOVE_PENDING:
+                core._tmp(fd, data[:6])
+                raise OSError("interrupted marker")
+            return publish(fd, name, data, *args, **kwargs)
+
+        with patch.object(core, "publish", side_effect=interrupt):
+            with self.assertRaisesRegex(core.Refused, "interrupted marker"):
+                move.command(str(self.root), str(self.target))
+        self.assertTrue(self.root.exists())
+        temp, = self.target.iterdir()
+        self.assertFalse((self.target / core.MOVE_PENDING).exists())
+        unrelated = self.target / ".tmp-unrelated"
+        unrelated.touch()
+        self.assertIn("destination must be empty", self.cutover(check=False).stderr)
+        self.assertTrue(temp.exists())
+        unrelated.unlink()
+        self.cutover()
+        self.assertFalse(temp.exists())
+
     def test_drain_waits_for_writer_and_seals_open_directories(self):
         self.bus("mailbox", "history", check=True)
         with core.Board.from_conf() as old:
@@ -371,10 +437,28 @@ class BoardMove(BusTest):
         core.write_private(auto_upgrade.state_file(), {"pending": {"build": "candidate"}})
         self.assertNotEqual(self.bus("ls").returncode, 0)
         self.assertEqual(core.load_conf(), self.pin)
-        core.write_private(auto_upgrade.state_file(), {})
-        self.assertNotEqual(self.bus("ls").returncode, 0)
-        self.assertEqual(core.load_conf(), self.pin)
+        self.assertNotIn("manual_build", auto_upgrade.read_state())
         core.write_private(auto_upgrade.state_file(), {"upgrades": [{"build": runner.installed_build()}]})
+        self.assertEqual(self.bus_json("ls", "--json")["board"]["path"], str(self.target))
+
+    def test_v209_manual_upgrade_repairs_confirmation_on_first_start(self):
+        result = subprocess.run(["git", "archive", "--prefix=v209/", "d4a77f4", "lib", "bin"],
+                                cwd=REPO, capture_output=True, check=True)
+        with tarfile.open(fileobj=io.BytesIO(result.stdout)) as archive:
+            archive.extractall(self.tmp)
+        source = self.tmp / "v209"
+        old = cli.copy_build(str(source))
+        cli.flip(old)
+        core.write_private(auto_upgrade.state_file(), {})
+        self.bus("upgrade", "--build", str(REPO), check=True)
+        build = runner.installed_build()
+        self.assertNotEqual(build, Path(old).name)
+        self.assertNotIn("manual_build", auto_upgrade.read_state())
+        self.bus("adopt", "--all", check=True)
+        self.assertEqual(auto_upgrade.read_state()["manual_build"], build)
+        marker = self.root / "agents" / ".heartbeat" / f"{move.CLIENT_PREFIX}{core.USER}.json"
+        self.assertTrue(move.capable(json.loads(marker.read_bytes())))
+        self.cutover()
         self.assertEqual(self.bus_json("ls", "--json")["board"]["path"], str(self.target))
 
     def test_rolled_back_running_page_cannot_repin(self):

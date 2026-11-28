@@ -173,6 +173,9 @@ class Gate(unittest.TestCase):
         early = self.install("early")
         late = self.install("late")
         self.start(early)
+        with patch.dict(os.environ, early["env"], clear=True):
+            self.assertFalse(runner.launch_units_absent(early["info"]["id"]))
+            self.assertTrue(runner.launch_units_absent(core.new_id("no-fixture-unit")))
         self.upgrade(early)
         refused = lambda: self.command(ROOT / "bin" / "bus", "move-board", self.old, self.new, env=self.env, expected=1)
         refusal = refused()
@@ -222,7 +225,9 @@ class Gate(unittest.TestCase):
         self.command(late["bus"], "ls", "--json", env=late["env"], expected=1)
         conf = Path(late["env"]["AGENT_BUS_CONFIG"], "board.conf")
         self.assertEqual(core.load_conf(str(conf))["path"], str(self.old))
-        self.upgrade(late)
+        manual = json.loads(self.command(late["bus"], "upgrade", "--build", ROOT, "--json", env=late["env"]))
+        state_file = Path(late["env"]["AGENT_BUS_STATE"], "auto-upgrade.json")
+        self.assertNotIn("manual_build", core.read_private(state_file) or {})
         for client in (early, late):
             result = json.loads(self.command(client["bus"], "ls", "--json", env=client["env"]))
             self.assertEqual(result["board"], dict(path=str(self.new), identity="ok"))
@@ -238,7 +243,8 @@ class Gate(unittest.TestCase):
         refusal = self.command(late["bus"], "book", "--gpus", "0", "--from", t + 3600, "--to", t + 7200,
                                "--objection", "1s", env=late["env"], expected=1)
         self.assertIn("over your budget", refusal)
-        report("both confirmed clients re-pinned on their next CLI call; the legacy client stayed pinned until upgrade")
+        self.assertEqual(core.read_private(state_file)["manual_build"], manual["installed"])
+        report("the auto-upgraded and v2.0.9 manually upgraded clients both re-pinned on their next CLI call")
         report("history stayed on GPFS; XFS started empty and enforced the prior GPU-hour budget")
         quick = dict(late, info=json.loads(self.command(late["bus"], "run", "--gpus", "0", "--slug", "quick",
                                                        "--detach", "--", "true", env=late["env"])))

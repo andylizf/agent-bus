@@ -264,7 +264,9 @@ bus move-board "$OLD" "$NEW"
 
 The command lists blockers and leaves the source active. Retry when there are zero runs, zero pending or
 standing bookings, and zero open objection windows. Each run inbox needs its own archived end record.
-The owner can use `bus gc --mine` to complete an archive when the same run's private state confirms it ended.
+The owner can use `bus gc --mine` when the same run's private state confirms it ended or the launch was
+interrupted before admission. GC checks the inbox or its matching preparation state, waits at least two
+minutes, and checks for units and invocation evidence before recording that a run never started.
 Unreceipted future booking revisions also block. Each account that published in the past 14 days must report
 a confirmed move-capable build. Board writes, supervisor passes and automatic timers report the build.
 Allow up to 30 seconds for other clients to observe a new receipt when checking its objection deadline.
