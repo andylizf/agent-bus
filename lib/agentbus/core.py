@@ -4,7 +4,7 @@ Every path on a board is reached by an openat walk from `/` with O_NOFOLLOW at e
 read relative to the walked directory descriptor, so nothing a member puts on the board (a symlink, a FIFO, a huge
 file, a record claiming someone else's name) can redirect a read or a write. Python 3.9, standard library only.
 """
-import errno, hashlib, json, os, pwd, re, secrets, socket, stat, time
+import errno, fcntl, hashlib, json, os, pwd, re, secrets, socket, stat, time
 
 # ------------------------------------------------------------------------------------------------ settings
 
@@ -36,7 +36,14 @@ IDLE_S = lambda: env_num("AGENT_BUS_IDLE_S", 1800)           # under 5% this lon
 MAX_RECORD = 64 * 1024
 RACY_NS = 5 * 10 ** 9      # receipts changed this recently are always re-read (ctime granularity)
 MAX_LISTING = 20000
+MAX_MESSAGES_PER_HOUR = 128
 MOVE_PENDING = ".move-pending"
+MOVE_ORIGIN = ".move-origin"
+MOVE_LIMIT = 4 * 1024 * 1024
+DEFAULT_BOARD = "/scratch/agent-bus-v2"
+DEFAULT_BOARD_OWNER = "al9080"
+DEFAULT_BOARD_HOST = "della-tridao"
+HOST_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\Z")
 NOTE_MAX, MSG_NOTE_MAX, REASON_MAX = 80, 200, 200
 KINDS = ("training", "eval", "benchmark-timing", "serving", "interactive-dev", "other")
 CLASSES = ("scheduled", "backfill")
@@ -488,6 +495,10 @@ def owned_id(v, user):
     return isinstance(v, str) and STAMP_ID.fullmatch(v) is not None and v.startswith(user + "-") and len(v) > len(user) + 1
 
 
+def move_mail_prefix(box):
+    return "mail-" + hashlib.sha256(box.encode()).hexdigest()[:32] + "-"
+
+
 def note_ok(v, n=NOTE_MAX):
     return isinstance(v, str) and len(v) <= n and not any(ord(c) < 32 or ord(c) == 127 for c in v)
 
@@ -566,7 +577,8 @@ class Board:
         st = os.fstat(self.fd)
         self.creator = st.st_uid       # the account that ran setup-board.sh owns the board's directories
         self.group_shared = bool(st.st_mode & stat.S_ISGID)
-        self.pending = read_file(self.fd, MOVE_PENDING, 4096) is not None
+        self.leased = False
+        self.read_move()
         self.pin = pin
         self.ok = pin is None or (int(pin[0]) == self.ino and int(pin[1]) == self.fsid)
         self.warnings = []
@@ -591,7 +603,7 @@ class Board:
         if not p:
             raise Refused("no board configured: run install.sh --board <dir> (or pass --board)")
         if not conf.get("inode") or (path is not None and path != conf.get("path")):
-            return cls(p)
+            return cls(p).lease()
         board = cls.from_pin(conf)
         if board.path != p and not board.pending:
             try:
@@ -605,13 +617,13 @@ class Board:
     def from_pin(cls, conf):
         from . import move
         try:
-            board = cls(conf["path"], (conf["inode"], conf["fsid"]))
+            board = cls(conf["path"], (conf["inode"], conf["fsid"])).lease()
         except OSError as error:
             moved = move.follow(conf)
             if moved is None:
                 raise Refused(f"{conf['path']}: {errno_name(error)}") from error
             return moved
-        if board.ok:
+        if board.ok and board.recheck():
             return board
         try:
             moved = move.follow(conf)
@@ -631,6 +643,23 @@ class Board:
         if (conf.get("path"), conf.get("inode"), conf.get("fsid")) == (
                 old["path"], str(old["inode"]), str(old["fsid"])):
             save_conf(dict(conf, **self.pin_fields(), host=self.host))
+
+    def read_move(self):
+        self.pending = read_file(self.fd, MOVE_PENDING, 4096) is not None
+        row = read_json(self.fd, MOVE_ORIGIN, MOVE_LIMIT)
+        self.origin = row[0] if row and row[1].st_uid == self.creator and not row[1].st_mode & 0o022 else {}
+        self.receipt_floor = self.origin.get("floor", 0)
+
+    def lease(self, *, exclusive=False):
+        """Keep a board transaction on one side of a cutover, even when it holds child descriptors."""
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            self.leased = True
+            self.read_move()
+        except BaseException:
+            self.close()
+            raise
+        return self
 
     @property
     def inbox_mode(self):
@@ -687,15 +716,18 @@ class Board:
             self._dirs[key] = fd if owned else None
         return self._dirs[key]
 
-    def writable(self, *, during_move=False):
+    def writable(self):
+        if not self.leased:
+            self.lease()
+            self.recheck()
         if not self.ok:
             raise Refused(f"board identity changed at {self.path}: nothing is written there")
-        if self.pending and not during_move:
-            raise Refused(f"board move in progress at {self.path}: waiting for booking records")
+        if self.pending:
+            raise Refused(f"{self.path} is a prepared destination; the source is still active")
 
     # --- readers
 
-    def records(self, sub_dir, check, owner_field="user", stem_field="id"):
+    def records(self, sub_dir, check, owner_field="user", stem_field="id", prefix=""):
         """Valid records of one directory: right shape, file owner equal to its user field, stem equal to its id."""
         fd = self.dir(*sub_dir.split("/"))
         if fd is None:
@@ -706,7 +738,7 @@ class Board:
             return []
         out = []
         for name in names:
-            if not name.endswith(".json"):
+            if not name.startswith(prefix) or not name.endswith(".json"):
                 continue
             r = read_json(fd, name)
             if r is None:
@@ -716,7 +748,9 @@ class Board:
                 good = check(obj)
             except (TypeError, AttributeError):
                 good = False
-            if not good or owner_name(st.st_uid) != obj.get(owner_field) or str(obj.get(stem_field)) != name[:-5]:
+            if (not good or (owner_field != "sender" and st.st_mode & 0o022)
+                    or owner_name(st.st_uid) != obj.get(owner_field)
+                    or prefix + str(obj.get(stem_field)) != name[:-5]):
                 continue
             obj = dict(obj)
             obj["_mode"], obj["_sha"], obj["_mtime"] = stat.S_IMODE(st.st_mode), sha, st.st_mtime
@@ -734,7 +768,7 @@ class Board:
             st = os.stat(e["id"], dir_fd=fd, follow_symlinks=False)
         except OSError:
             return None
-        if not stat.S_ISREG(st.st_mode) or owner_name(st.st_uid) != e["user"]:
+        if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o022 or owner_name(st.st_uid) != e["user"]:
             return None
         return max(0, time.time() - st.st_mtime)
 
@@ -798,7 +832,8 @@ class Board:
                 if r is None:
                     continue
                 obj, st, sha = r
-                if not check_receipt(obj) or obj["slot"] != slot or owner_name(st.st_uid) != obj["user"]:
+                if (not check_receipt(obj) or obj["slot"] != slot or st.st_mode & 0o022
+                        or owner_name(st.st_uid) != obj["user"]):
                     continue
                 obj = dict(obj, _sha=sha)
                 out[slot] = obj
@@ -806,13 +841,19 @@ class Board:
                     cache[key] = obj
                 n += 1
             empty_run = empty_run + 1 if n == 0 else 0
-            if empty_run >= 2:
+            if empty_run >= 2 and k >= (self.receipt_floor + 1) // 10000:
                 break
         return out
 
     def messages(self, box):
         """Valid messages in inbox/<box>/: owner equal to the sender field, stem equal to the id."""
-        return self.records(f"inbox/{box}", check_message, owner_field="sender")
+        local = self.records(f"inbox/{box}", check_message, owner_field="sender")
+        if not self.origin:
+            return local
+        carried = self.records("migration", lambda m: check_message(m) and m["to"] == box,
+                               owner_field="sender", prefix=move_mail_prefix(box))
+        ids = {m["id"] for m in local}
+        return local + [m for m in carried if m["id"] not in ids]
 
     def inbox_owner(self, box):
         try:
@@ -828,10 +869,16 @@ class Board:
             return None
         return owner_name(st.st_uid) if stat.S_ISDIR(st.st_mode) else None
 
+    def send(self, box, record):
+        self.writable()
+        if sum(m["sender"] == USER and m["_mtime"] >= now() - 3600 for m in self.messages(box)) >= MAX_MESSAGES_PER_HOUR:
+            raise Refused(f"your message limit for {box} is {MAX_MESSAGES_PER_HOUR} per hour")
+        publish(self.wdir("inbox", box), f"{record['id']}.json", dumps(record))
+
     # --- writers (only after writable())
 
-    def wdir(self, *parts, during_move=False):
-        self.writable(during_move=during_move)
+    def wdir(self, *parts):
+        self.writable()
         fd = self.dir(*parts)
         if fd is None:
             raise Refused(f"{'/'.join(parts)} missing on the board (setup-board.sh creates it)")

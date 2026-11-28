@@ -7,7 +7,8 @@ import grp, os, stat
 from . import core
 from .core import Refused
 
-DIRS = ("agents", "agents/.heartbeat", "inbox", "bookings", "objections", "arrivals", "seq", "archive", "log")
+DIRS = ("agents", "agents/.heartbeat", "inbox", "bookings", "objections", "arrivals", "seq", "archive", "log",
+        "migration")
 
 
 def _dir(parent_fd, name, mode, gid, made, fixed=False):
@@ -77,10 +78,12 @@ def setup_board(root, host=None, group=None, gpus=8, blocks=1000, add_blocks=Non
             os.close(sfd)
             os.close(rfd)
             return dict(blocks=f"0-{last + add_blocks}", made=made)
-        if not host or not all(c.isalnum() or c in ".-" for c in host):
+        if not host or not core.HOST_NAME.fullmatch(host):
             raise Refused("bad host name")
         rfd = _dir(pfd, core.component(name, "board directory"), 0o2755 if group else 0o755, gid, made)
         try:
+            if os.fstat(rfd).st_mode & 0o022:
+                raise Refused(f"{root}: the board root must be writable only by its owner")
             b = core.sub(rfd, "bin")
             if b is not None:
                 old = core.read_file(b, "bus.py") is not None

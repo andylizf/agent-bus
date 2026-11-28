@@ -6,7 +6,7 @@ unpublished, invalid / over-budget, conflicting, objected, pending, standing (an
 """
 import fcntl, hashlib, json, os, secrets, time
 
-from . import core
+from . import core, move
 from .core import Refused, dumps, now
 
 SEEN_GAP_S = 30          # a reader that read the sequence this recently is watching: new slots are arrivals it saw
@@ -20,7 +20,7 @@ def claim_receipt(board, kind, rid, revision):
     """Claim the next free slot for a receipt; returns the slot."""
     board.writable()
     recs = board.receipts()
-    n = max(recs, default=0) + 1
+    n = max(max(recs, default=0), board.receipt_floor) + 1
     for _ in range(10000):
         k = n // 10000
         bfd = board.dir("seq", str(k))
@@ -36,7 +36,7 @@ def claim_receipt(board, kind, rid, revision):
     raise Refused("could not claim a receipt slot")
 
 
-def seen_update(receipts):
+def seen_update(receipts, imported_through=0):
     """Record each receipt slot this user's bus processes have read (~/.local/state/agent-bus/slots.json, under
     lockf on slots.lock): {slot: {sha, first_seen, rec}}. first_seen is an observed arrival only when the previous
     read was at most SEEN_GAP_S ago; otherwise it is None and the sequence time t(n) alone applies."""
@@ -53,7 +53,7 @@ def seen_update(receipts):
         for slot, r in receipts.items():
             s = str(slot)
             if s not in slots:
-                slots[s] = dict(sha=r["_sha"], first_seen=t if watching else None, rec=t)
+                slots[s] = dict(sha=r["_sha"], first_seen=t if watching and slot > imported_through else None, rec=t)
         for s in [s for s, v in slots.items() if t - (v.get("rec") or 0) > SEEN_KEEP_S]:
             del slots[s]
         core.write_private(path, dict(slots=slots, last_read=t))
@@ -62,17 +62,27 @@ def seen_update(receipts):
         lock.close()
 
 
-def sequence_times(receipts, seen):
+def sequence_times(receipts, seen, origin=None):
     """{slot: (reader receipt time, replaced)}: t(n) = max(created(n), t(n-1)) along the sequence; a reader that saw
     the slot arrive also takes the later of t(n) and its first sight; a slot whose receipt differs from what this
     reader recorded for it is replaced."""
+    origin = origin or {}
+    imported = origin.get("times", {})
+    floor = origin.get("floor", 0)
+    floor_time = max((r[0] for r in imported.values()), default=0)
     out, prev = {}, None
     for slot in sorted(receipts):
         r = receipts[slot]
         tn = r["created"] if prev is None else max(r["created"], prev)
+        original = imported.get(str(slot))
+        if original is not None:
+            tn = original[0]
+        elif slot > floor:
+            tn = max(tn, floor_time)
         prev = tn
         rec = (seen or {}).get(str(slot))
-        replaced = bool(rec) and rec.get("sha") != r["_sha"]
+        replaced = (bool(rec) and rec.get("sha") != r["_sha"]) or (
+            slot <= floor and (original is None or original[1] != r["_sha"]))
         tr = max(tn, rec["first_seen"]) if rec and rec.get("first_seen") else tn
         out[slot] = (tr, replaced)
     return out
@@ -108,10 +118,13 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
     order, revision, receipt_time, objection_close, state, why, objections."""
     t = now() if t is None else t
     lim = board.limits
+    origin = getattr(board, "origin", {})
+    inherited = {b["id"]: b for b in origin.get("bookings", [])}
+    ready = move.completed(board) if inherited else {}
     recs = receipts if receipts is not None else board.receipts(cache)
     if seen is None and record:
-        seen = seen_update(recs)
-    times = sequence_times(recs, seen)
+        seen = seen_update(recs, origin.get("floor", 0))
+    times = sequence_times(recs, seen, origin)
     by_rev = {}
     for slot in sorted(recs):
         r = recs[slot]
@@ -152,6 +165,10 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
         rt = times[slot][0]
         info = dict(slot=slot, order=slot, receipt_time=rt, objection_close=rt + b["objection_s"], replaced=repl,
                     inherited=False)
+        carried = inherited.get(b["id"])
+        if carried and carried["revision"] == rev and info["objection_close"] > origin["at"]:
+            ready_at = ready.get(b["user"], t)
+            info["objection_close"] += max(0, ready_at - origin["at"])
         prev = b.get("previous")
         if isinstance(prev, str) and depth < CHAIN_MAX and not (depth == 0 and b["id"] in revoked):
             try:
@@ -260,6 +277,15 @@ def evaluate(board, t=None, seen=None, entries=None, sticky_lapsed=(), receipts=
         arrived.setdefault(x["id"], []).append(x)
     for r in rows:
         r.setdefault("objections", [])
+        if r.get("state") == "standing":
+            before = inherited.get(r["id"])
+            revisions = [r["revision"], *r.get("lineage", [])]
+            if before and before["revision"] in revisions and any(u not in ready for u in before["objectors"]):
+                r.update(state="pending", why="waiting for an objection from the previous board")
+            elif any(b["user"] != r["user"] and b["user"] not in ready and b["end"] > t and b["order"] < r["order"]
+                     and b["state"] in ("pending", "standing", "conflicting", "lapsed") and overlap(b, r)
+                     for b in inherited.values()):
+                r.update(state="pending", why="waiting for an earlier overlapping booking from the previous board")
         if r.get("state") == "standing":
             lapse_at = max(r["start"], r["objection_close"]) + lim["lapse_s"]
             revs = [r["revision"]] + (r.get("lineage") or [])
@@ -432,7 +458,7 @@ def publish_objection(board, booking_id, reason):
         raise Refused(f"no booking {booking_id}")
     if b["user"] == core.USER:
         raise Refused("you cannot object to your own booking; `bus unbook` withdraws it")
-    if b.get("state") not in ("pending", "objected", "conflicting"):
+    if b.get("state") not in ("pending", "objected", "conflicting") or now() >= b.get("objection_close", 0):
         raise Refused(f"{booking_id} is {b.get('state')}: an objection counts only while its objection window is open")
     oid = core.new_id(f"obj-{booking_id[-12:]}")
     o = dict(id=oid, booking=booking_id, booking_revision=b["revision"], user=core.USER, reason=reason, created=now())

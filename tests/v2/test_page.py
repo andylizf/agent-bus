@@ -160,6 +160,16 @@ class Page(unittest.TestCase):
                         "Class deadline", "gpuhost", "Fake GPU"):
             self.assertNotIn(private, json.dumps(feed))
 
+    def test_unconfirmed_old_runs_are_not_shown_as_free(self):
+        data = sample()
+        data["old_runs"] = [dict(user="alice", gpus=[0], id="private-old-run")]
+        data["old_bookings"] = [dict(user="192.0.2.10", gpus=[1], id="private-old-booking")]
+        data["gpus"][0].update(users={}, mem_mb=0, util=0)
+        self.assertIn("Old run unconfirmed", page.render(data))
+        feed = page.public_feed(data)
+        self.assertEqual(feed["old_runs"], [dict(user="alice", gpus=[0])])
+        self.assertEqual(feed["old_bookings"], [dict(user="Unknown user", gpus=[1])])
+
     def test_only_get_root_is_served(self):
         port, _ = self.serve()
         for m in ("POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT", "CUSTOM"):

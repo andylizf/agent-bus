@@ -14,7 +14,7 @@
 import errno, fcntl, json, os, queue, secrets, signal, stat, subprocess, sys, threading, time
 
 from . import bookings as bk
-from . import core
+from . import core, move
 from .core import Refused, now
 
 STATE_VERSION = int(os.environ.get("AGENT_BUS_TEST_STATE_VERSION") or 1)
@@ -880,27 +880,33 @@ class Supervisor:
         return e
 
     def write_entry(self, board):
-        fd = board.wdir("agents", during_move=True)
-        data = core.dumps(self.entry())
+        fd = board.wdir("agents")
+        data = core.dumps(self.entry()).decode()
         pin = board.pin_fields()
-        if data.decode() != self.s.get("_entry_written") or pin != self.s.get("_entry_board"):
+        if data != self.s.get("_entry_written") or pin != self.s.get("_entry_board"):
             cur = core.read_json(fd, f"{self.rid}.json")
             if cur and cur[0].get("run") != self.s["run"]:
                 raise Refused(f"the board holds {self.rid} for another generation ({cur[0].get('run')}); not overwritten")
-            core.replace(fd, f"{self.rid}.json", data)
-            self.s["_entry_written"] = data.decode()
+            core.replace(fd, f"{self.rid}.json", data.encode())
+            self.s["_entry_written"] = data
             self.s["_entry_board"] = pin
             self.s["entry_on_board"] = True
 
     def publish_entry(self, board):
         self.write_entry(board)
-        core.touch(board.wdir("agents", ".heartbeat", during_move=True), self.rid, data=(self.version + "\n").encode())
+        if not core.touch(board.wdir("agents", ".heartbeat"), self.rid, data=(self.version + "\n").encode()):
+            raise Refused(f"could not publish heartbeat {self.rid}")
 
     def archive_entry(self, board):
         """Archive the run's entry if it is on the board. Decided by the board, not by the state's entry_on_board: a
         supervisor killed between writing its first entry and saving its state leaves that flag unset."""
         if not board.ok:
             return
+        if any(e["id"] == self.rid and e["run"] == self.s["run"] for e in board.origin.get("runs", [])):
+            try:
+                move.record_end(board, self.entry())
+            except (OSError, Refused) as e:
+                self.s["archive_error"] = str(e)
         afd, gfd = board.dir("agents"), board.dir("archive")
         try:
             st = os.stat(f"{self.rid}.json", dir_fd=afd, follow_symlinks=False)
@@ -944,8 +950,8 @@ class Supervisor:
                  reply_to=None, answer=answer, reason=text if answer == "no" else None, note=text[:core.MSG_NOTE_MAX],
                  gpus=self.s["gpus"], minutes=None, from_entry=self.rid, schema=core.SCHEMA, created=now())
         try:
-            core.publish(board.dir("inbox", req["reply_to"]), f"{mid}.json", core.dumps(m))
-        except (OSError, TypeError):
+            board.send(req["reply_to"], m)
+        except (OSError, Refused):
             pass
 
     # --- class rules
@@ -1542,18 +1548,14 @@ class Supervisor:
             board = None
             err = str(e)
         with_board = board is not None and board.ok and not board.pending
-        moved = board is not None and board.ok and board.path != s["board"]["path"]
-        entry_board = board if with_board or moved else _NoBoard()
+        moved = with_board and board.path != s["board"]["path"]
+        entry_board = board if with_board else _NoBoard()
         if not with_board:
             if not s.get("identity_alarm"):
                 s["identity_alarm"] = t
-                pending = board is not None and board.pending
                 notice(self.rid, s, self.hooks, "board-identity-changed",
-                       detail=err if board is None else f"{board.path}: " +
-                       ("board move awaiting booking records" if pending else "inode or filesystem id differs"),
-                       action=("publishing run and owner booking records while board decisions are paused" if pending
-                               else "nothing is written to the board and no board record acts on this run; "
-                                    "the job keeps running"))
+                       detail=err if board is None else f"{board.path}: inode or filesystem id differs",
+                       action="board actions are suspended and the job keeps running")
         elif s.get("identity_alarm"):
             s.pop("identity_alarm")
             notice(self.rid, s, self.hooks, "board-identity-restored")
@@ -1565,15 +1567,12 @@ class Supervisor:
                 self.save_completed_pass()
                 return
             if moved:
-                fd = core.mkdir_own(board.wdir("inbox", during_move=True), self.rid, board.inbox_mode)
-                if fd is None:
-                    raise Refused(f"inbox {self.rid} is occupied on the new board")
-                os.close(fd)
-                self.publish_entry(board)
-                if with_board:
+                try:
                     board.repin_conf(s["board"])
                     s["board"] = board.pin_fields()
                     self.save()
+                except OSError as e:
+                    s["board_error"] = str(e)
             if s["mode"] == "systemd" and s["state"] in ("running", "leader-exited", "stopping", "needs-reconcile") \
                     and not s["units"].get("cgroup_path"):
                 s["units"]["cgroup_path"] = recover_cgroup(s["units"]["slice"])
@@ -1597,7 +1596,12 @@ class Supervisor:
             rows, entries = [], []
             if with_board:
                 entries = bk.entries_with_occupancy(board)
-                msgs = board.messages(self.rid)
+                if board.inbox_owner(self.rid) == core.USER:
+                    msgs = board.messages(self.rid)
+                    s.pop("inbox_unavailable", None)
+                else:
+                    msgs = []
+                    s["inbox_unavailable"] = True
                 rows = self.board_rows(board, t, entries, msgs)
                 for r in rows:
                     key = f"{r['id']}@{r.get('revision')}"
@@ -1615,8 +1619,12 @@ class Supervisor:
                     and set(s["gpus"]) <= set(own["gpus"]) and s.get("booking_revision") == own["revision"]
                     and s["state"] in ("running", "waiting-handoff")
                     and max(own["start"], own["objection_close"]) <= t <= own.get("lapse_at", t)):
-                s["arrival_recorded"] = bk.record_arrival(board, own["id"], own["revision"], self.rid, s["run"], t)
-                s["arrival_revision"] = own["revision"]
+                try:
+                    s["arrival_recorded"] = bk.record_arrival(board, own["id"], own["revision"], self.rid, s["run"], t)
+                    s["arrival_revision"] = own["revision"]
+                    s.pop("arrival_error", None)
+                except (OSError, Refused) as e:
+                    s["arrival_error"] = str(e)
             s["protected_until"] = own["end"] if prot else None
             if own and s["class"] == "scheduled" and own.get("state") == "objected" and not s.get("told_objected"):
                 s["told_objected"] = True
@@ -1695,7 +1703,11 @@ class Supervisor:
             if self.passes % core.SAMPLE_EVERY() == 1 % core.SAMPLE_EVERY() and s["state"] == "running":
                 self.sample()
             if entry_board.ok and s["state"] in NONTERMINAL:
-                self.publish_entry(entry_board)
+                try:
+                    self.publish_entry(entry_board)
+                    s.pop("board_error", None)
+                except (OSError, Refused) as e:
+                    s["board_error"] = str(e)
             s["last_pass"] = t
             s["last_pass_s"] = round(time.monotonic() - t0, 3)
             s["max_pass_s"] = max(s.get("max_pass_s") or 0, s["last_pass_s"])
@@ -1851,6 +1863,9 @@ def handoff_waits(board, entries, s):
         if e["id"] != s["id"] and set(e["gpus"]) & set(s["gpus"]):
             occ = "" if e.get("occupancy") == "live" else ", occupancy unknown"
             waits.append(f"entry {e['id']} ({e['user']}, {e['state']}{occ})")
+    for e in move.legacy_runs(board, entries):
+        if e["id"] != s["id"] and set(e["gpus"]) & set(s["gpus"]):
+            waits.append(f"old entry {e['id']} ({e['user']}, occupancy unknown after the board move)")
     ok, idx, apps, _ = nvidia_view()
     if not ok:
         waits.append("nvidia-smi failed")

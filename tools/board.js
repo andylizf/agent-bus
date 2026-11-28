@@ -31,8 +31,9 @@ const IN_USE_MB = 2048;  // a CUDA context alone stays below this; more memory, 
 const inUse = gpu => Object.keys(gpu.users).length > 0 || gpu.mem_mb > IN_USE_MB || gpu.util > 0;
 
 // A GPU that reads as in use is never Free, whether or not anyone is listed on it.
-function gpuStatus(gpu, entries) {
+function gpuStatus(gpu, entries, oldRuns = []) {
   if (!gpu.available) return ["unknown", "Unavailable"];
+  if (oldRuns.some(run => run.gpus.includes(gpu.gpu))) return ["claimed", "Old run unconfirmed"];
   if (!inUse(gpu)) return entries.length ? ["claimed", "Claimed"] : ["free", "Free"];
   const owners = new Set(entries.map(entry => entry.user));
   const users = Object.keys(gpu.users);
@@ -63,9 +64,9 @@ function colors(data) {
   return slots;
 }
 
-function tile(gpu, entries, slots, now) {
+function tile(gpu, entries, slots, now, oldRuns) {
   const users = grouped(gpu);
-  const [state, label] = gpuStatus(gpu, entries);
+  const [state, label] = gpuStatus(gpu, entries, oldRuns);
   const colour = user => user === UNKNOWN ? "var(--crit)" : slots.get(user);
   const flags = { off: '<span class="flag">Not on board</span>', unknown: '<span class="flag">Owner unknown</span>' };
   let occupants = users.map(([user, mb]) => {
@@ -111,8 +112,15 @@ function tile(gpu, entries, slots, now) {
 }
 
 function warnings(data, entries) {
-  const states = data.gpus.map(g => gpuStatus(g, entries(g.gpu))[0]);
-  return [["unattributed", "in use, owner unknown"], ["offboard", "not on board"]].map(([state, text]) => {
+  const states = data.gpus.map(g => gpuStatus(g, entries(g.gpu), data.old_runs)[0]);
+  const old = [
+    [data.old_runs, "old run unconfirmed", "old runs unconfirmed"],
+    [data.old_bookings, "booking awaiting replay", "bookings awaiting replay"],
+  ].map(([rows, singular, plural]) => {
+    const n = rows?.length || 0;
+    return n ? `<span class="chip alert"><b>${n}</b> ${n === 1 ? singular : plural}</span>` : "";
+  }).join("");
+  return old + [["unattributed", "in use, owner unknown"], ["offboard", "not on board"]].map(([state, text]) => {
     const n = states.filter(s => s === state).length;
     return n ? `<span class="chip alert ${state}"><b>${n}</b> GPU${n === 1 ? "" : "s"} ${text}</span>` : "";
   }).join("");
@@ -202,12 +210,12 @@ function bookings(data, slots) {
 function render(data) {
   const slots = colors(data);
   const entries = gpu => data.entries.filter(entry => entry.gpus.includes(gpu));
-  const free = data.gpus.filter(g => gpuStatus(g, entries(g.gpu))[0] === "free").length;
+  const free = data.gpus.filter(g => gpuStatus(g, entries(g.gpu), data.old_runs)[0] === "free").length;
   const upcoming = data.bookings.filter(b => b.start > data.t).length;
   el("gpu-count").textContent = `${data.gpus.length} GPUs`;
   el("summary").innerHTML = `<span class="chip free"><b>${free}</b> of ${data.gpus.length} free</span>
     <span class="chip"><b>${upcoming}</b> booking${upcoming === 1 ? "" : "s"} ahead</span>${warnings(data, entries)}`;
-  el("tiles").innerHTML = data.gpus.map(g => tile(g, entries(g.gpu), slots, data.t)).join("");
+  el("tiles").innerHTML = data.gpus.map(g => tile(g, entries(g.gpu), slots, data.t, data.old_runs)).join("");
   el("calendar").innerHTML = calendar(data, slots);
   el("bookings").innerHTML = bookings(data, slots);
   el("board-path").innerHTML = data.board ? ` · <code>${esc(data.board)}</code>` : "";

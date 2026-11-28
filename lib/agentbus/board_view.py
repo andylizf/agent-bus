@@ -64,10 +64,12 @@ def in_use(g):
     return bool(g["users"]) or g["mem_mb"] > IN_USE_MB or (g["util"] or 0) > 0
 
 
-def gpu_status(g, entries):
+def gpu_status(g, entries, old_runs=()):
     """(state, label) for a GPU. A GPU that reads as in use is never Free, whether or not anyone is listed."""
     if not g["available"]:
         return "unknown", "Unavailable"
+    if any(g["gpu"] in run["gpus"] for run in old_runs):
+        return "claimed", "Old run unconfirmed"
     if not in_use(g):
         return ("claimed", "Claimed") if entries else ("free", "Free")
     owners = {e["user"] for e in entries}
@@ -115,10 +117,10 @@ def spark(usage, gpu, now, span_s):
             f'<polygon points="{area}" class="spark-area"/><polyline points="{line}" class="spark-line"/></svg>')
 
 
-def tile(g, entries, slot, usage, now, span_s):
+def tile(g, entries, slot, usage, now, span_s, old_runs=()):
     occ = occupants(g)
     mine = [e for e in entries if g["gpu"] in e["gpus"]]
-    state, label = gpu_status(g, mine)
+    state, label = gpu_status(g, mine, old_runs)
     total = g["total_mb"]
     segs = []
     if total:
@@ -347,8 +349,9 @@ def render(data, snapshot=False):
     users = {u for g in gpus for u in g["users"]} | {e["user"] for e in entries} | {b["user"] for b in bookings}
     slot = colours(users)
     span_s = history_span(usage, now)
-    tiles = "".join(tile(g, entries, slot, usage, now, span_s) for g in gpus)
-    nfree = sum(gpu_status(g, [e for e in entries if g["gpu"] in e["gpus"]])[0] == "free" for g in gpus)
+    old_runs = data.get("old_runs", ())
+    tiles = "".join(tile(g, entries, slot, usage, now, span_s, old_runs) for g in gpus)
+    nfree = sum(gpu_status(g, [e for e in entries if g["gpu"] in e["gpus"]], old_runs)[0] == "free" for g in gpus)
     upcoming = sum(b["start"] > now for b in bookings)
     notes = "".join(f'<p class="warn">{esc(message)}</p>' for message in data["notices"])
     mode = "Snapshot" if snapshot else "Live"

@@ -1,8 +1,8 @@
 """`bus`: the agent-bus v2 command line. `bus <command> -h` for each command's options."""
-import argparse, hashlib, json, os, secrets, shlex, shutil, subprocess, sys, time
+import argparse, hashlib, json, os, pwd, secrets, shlex, shutil, subprocess, sys, time
 
 from . import bookings as bk
-from . import auto_upgrade, core, runner
+from . import auto_upgrade, core, move, runner
 from .core import Refused, now
 
 USAGE = """bus: coordinate a shared GPU host through a board directory (agent-bus v2)
@@ -27,7 +27,7 @@ def board():
     b = core.Board.from_conf()
     if b.pending:
         b.close()
-        raise Refused(f"board move in progress at {b.path}: waiting for booking records")
+        raise Refused(f"{b.path} is a prepared destination; the source is still active")
     return b
 
 
@@ -45,9 +45,10 @@ def view(b, days=2, all_bookings=False):
 def cmd_ls(a):
     with board() as b:
         t, entries, rows = view(b, 1)
+        old_runs, old_bookings = move.leftovers(b) if b.origin else ([], [])
         if a.json:
             return out(dict(board=dict(path=b.path, identity="ok" if b.ok else "changed"), now=t, entries=entries,
-                            bookings=rows, warnings=b.warnings))
+                            bookings=rows, warnings=b.warnings, old_runs=old_runs, old_bookings=old_bookings))
         if not b.ok:
             print(f"board identity changed at {b.path}: shown as read; nothing will act on it")
         for e in entries:
@@ -56,6 +57,10 @@ def cmd_ls(a):
                   f"until {when(e['until'])}  {e['kind']}  {e.get('note', '')}{occ}")
         if not entries:
             print("no runs on the board")
+        for e in old_runs:
+            print(f"old run {e['id']} ({e['user']}): occupancy unknown, holds GPUs {core.gpu_text(e['gpus'])}")
+        for b in old_bookings:
+            print(f"old booking {b['id']}: awaiting replay by {', '.join(b['awaiting'])}")
         for r in rows:
             print(f"  booking {r['id']}  {r['user']}  gpus {core.gpu_text(r['gpus'])}  {when(r['start'])} - "
                   f"{when(r['end'])}  {r['state']}{'  ' + r['why'] if r.get('why') else ''}")
@@ -150,7 +155,7 @@ def cmd_send(a):
                  created=now())
         if not core.check_message(m):
             raise Refused("message does not validate (note at most 200 characters)")
-        core.publish(fd, f"{mid}.json", core.dumps(m))
+        b.send(a.to, m)
         b.log("send", msg=mid, to=a.to, kind=a.kind)
     if a.json:
         return out(dict(id=mid, request_id=m["request_id"], reply_to=reply_to, to_run=to_run))
@@ -180,7 +185,7 @@ def cmd_reply(a):
         mid = core.new_id(f"re-{secrets.token_hex(3)}")
         r = dict(id=mid, sender=core.USER, to=m["reply_to"], kind="reply", request_id=m.get("request_id"),
                  answer=a.answer, reason=a.reason, note=a.note or "", reply_to=None, schema=core.SCHEMA, created=now())
-        core.publish(b.dir("inbox", m["reply_to"]), f"{mid}.json", core.dumps(r))
+        b.send(m["reply_to"], r)
     print(f"replied {a.answer} to {a.msg}")
 
 
@@ -303,6 +308,8 @@ def cmd_gc(a):
                         continue
                     afd, gfd = b.dir("agents"), b.dir("archive")
                     try:
+                        if any(old["id"] == e["id"] and old["run"] == e["run"] for old in b.origin.get("runs", [])):
+                            move.record_end(b, e)
                         os.rename(f"{e['id']}.json", f"{e['id']}-{now()}.json", src_dir_fd=afd, dst_dir_fd=gfd)
                         res["archived"].append(e["id"])
                         hb = b.dir("agents", ".heartbeat")
@@ -516,12 +523,24 @@ def cmd_setup_board(a):
 def cmd_install(a):
     """`bus _install --board DIR` (install.sh calls it): copy the build, flip the entry point, pin the board by inode
     and filesystem id in ~/.config/agent-bus/board.conf."""
+    path = os.path.abspath(a.board)
+    default = path == core.DEFAULT_BOARD
+    owner = core.DEFAULT_BOARD_OWNER if default else a.board_owner or core.USER
+    host = core.DEFAULT_BOARD_HOST if default else core.HOST
+    if default and a.board_owner and a.board_owner != owner:
+        raise Refused(f"the default board must belong to {owner}")
+    try:
+        uid = pwd.getpwnam(owner).pw_uid
+    except KeyError:
+        raise Refused(f"unknown board owner {owner}") from None
     conf = core.load_conf()
-    with core.Board(os.path.abspath(a.board)) as b:
+    with core.Board(path).lease() as b:
         b.writable()
-        if not b.host:
-            raise Refused(f"{b.path} is not a v2 board")
-        conf.update(b.pin_fields(), host=b.host)
+        if (b.creator != uid or not move.owner_file(b, "config") or os.fstat(b.fd).st_mode & 0o022):
+            raise Refused(f"{b.path} must have a root and config owned and writable only by {owner}")
+        if b.host != host or host != core.HOST or not core.HOST_NAME.fullmatch(os.uname().nodename):
+            raise Refused(f"install on the verified board host {host}")
+        conf.update(b.pin_fields(), host=host)
     with auto_upgrade.lock():
         auto_upgrade.settle(flip)
         if auto_upgrade.read_state().get("pending"):
@@ -529,12 +548,14 @@ def cmd_install(a):
         build = copy_build(a.src)
         flip(build)
         core.save_conf(conf)
-    out(dict(build=os.path.basename(build), bin=core.BIN(), conf=conf))
+    if a.print_host:
+        print(os.uname().nodename)
+    else:
+        out(dict(build=os.path.basename(build), bin=core.BIN(), conf=conf))
 
 
 def cmd_move_board(a):
-    from . import move
-    move.command(a.action, a.old, a.new)
+    move.command(a.action, a.old, a.new, a.wait)
 
 
 # ------------------------------------------------------------------------------------------------ parser
@@ -673,10 +694,13 @@ def parser():
     s = p("_install", cmd_install)
     s.add_argument("--src", required=True)
     s.add_argument("--board", required=True)
-    s = p("move-board", cmd_move_board, "stage, replay or finish a board move")
-    s.add_argument("action", choices=("stage", "replay", "finish"))
+    s.add_argument("--board-owner")
+    s.add_argument("--print-host", action="store_true")
+    s = p("move-board", cmd_move_board, "stage or finish a board move with automatic replay")
+    s.add_argument("action", choices=("stage", "finish"))
     s.add_argument("old")
     s.add_argument("new")
+    s.add_argument("--wait", type=float, default=10, help="seconds to observe replay after switching (0–30)")
     s = p("page", None, "serve the read-only board page")
     s.add_argument("--port", type=int, default=8300)
     s.add_argument("--host", default="127.0.0.1")
@@ -717,6 +741,13 @@ def main(argv=None):
         except (Refused, OSError) as e:
             print(f"bus: automatic upgrade setup: {e}", file=sys.stderr)
     try:
+        if a.cmd in ("state", "runs", "release", "reconcile", "exec", "adopt", "upgrade", "auto-upgrade", "stop-hook"):
+            conf = core.load_conf()
+            if conf.get("host") == core.HOST and conf.get("path") and not os.path.isdir(conf["path"]):
+                try:
+                    core.Board.from_conf(conf).close()
+                except (OSError, Refused):
+                    pass  # private run operations remain available while the board is unreachable
         rc = a.f(a)
     except Refused as e:
         print(f"bus: {e}", file=sys.stderr)

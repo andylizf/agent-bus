@@ -140,6 +140,14 @@ owner can use `bus release <id>` to stop an older run through the explicit relea
 - The owner of a pinned board can authorize a new board path through `move.json`. The client opens every
   component without following symlinks and checks the destination's owner, inode, filesystem id and host.
   Ordinary records supply no write paths, signal targets, SSH hosts or shell words.
+- Any account with node access can now use the actions below. Sticky directories protect existing names from
+  most other accounts, but anyone with write access can take vacant receipt or inbox names and fill shared
+  directories. The board's XFS has no quota, so raw filesystem writes can consume inodes. The client caps
+  each sender at 128 messages per inbox per hour. It checks receipt-block ownership and bounds collision retries.
+  These checks do not count or limit raw filesystem writes. The client relies on record ownership and modes
+  directly, independent of the runtime `fs.protected_*` settings.
+- The source GPFS parent is group-writable and lacks the sticky bit. A group member can rename a child there and
+  interrupt a move. Clients require the exact pinned inode before trusting any move record.
 
 What any member can cause, by design: a request stops a backfill run within one supervisor pass; a standing, unlapsed
 booking stops every backfill run on its GPUs when its window starts; a reasoned objection during a booking's
@@ -238,36 +246,50 @@ at it, pins the board in `~/.config/agent-bus/board.conf`, writes the adopt time
 directories shared across nodes would otherwise start it everywhere), and prints the Claude Code stop hook to add.
 
 Releases are the repository's tags (`git -C ~/src/agent-bus tag`). The default board is `/scratch/agent-bus-v2`.
-On the GPU host, its owner creates it with `~/src/agent-bus/setup-board.sh /scratch/agent-bus-v2 "$(hostname -s)"`.
-For a different board path, pass `--board <board-dir>` to `install.sh`.
+Its root and config must belong to `al9080` on `della-tridao`. Setup accepts a protected empty root owned by
+that account, so the owner can create it before advertising the path. For a different board path, pass
+`--board <board-dir> --board-owner <account>` to `install.sh` on its host. Omit the owner for a board you own.
+The timer uses the verified local hostname.
 
 ### Move an installed board
 
-Run these steps on the board host. `OLD` is the absolute path pinned by members and `NEW` is the path of an
-empty board on the destination filesystem. Both roots must have the same owner, host, GPU count and booking
-limits. Allocate enough receipt blocks on `NEW` to hold the original sequence.
+The move build ships through the normal release channel after automatic upgrades are active. Each account's
+24-hour soak starts when it first sees the release, so accounts can switch at different times. Once the board
+owner's install has the move build, the owner runs the following on `della-tridao`.
 
-1. Have each installed user run `bus upgrade --build ~/src/agent-bus` from a checkout with move support. Verify
-   `supervisor.code` in `bus state <id>` for each live systemd supervisor. Foreground supervisors on earlier builds
-   keep running without board coordination after the source moves. Let them finish first if their jobs need coordination.
-2. Pause launchers and manual board commands. As the board owner, run `bus move-board stage "$OLD" "$NEW"`.
-   This writes `move.json` in the pinned root and renames that root to `$OLD.retired-<inode>` on the same
-   filesystem. Keep that archive in place for installed users who still need to follow its move record.
-   Treat it as read-only and keep new installs pointed at `NEW`. Let any in-flight passes on the old path finish.
-3. Each author runs `bus move-board replay "$OLD" "$NEW"`. Upgraded supervisors also replay their owner's
-   records and publish their current run, inbox and heartbeat at a pass boundary. Replay preserves the original
-   bytes, authors, and receipt slots for bookings, objections and arrivals. Historical inboxes, archived entries
-   and logs stay on the retired board. Users recreate their standalone mailboxes with `bus mailbox <name>`.
-4. The owner runs `bus move-board finish "$OLD" "$NEW"`. It checks the booking records against the source and
-   checks for entries with fresh source heartbeats that still need to appear on the new board. Once it succeeds,
-   `bus ls` re-pins each user's install on first use and supervisors re-pin their own runs on their next pass.
-   Verify `bus doctor`, `bus ls` and `bus cal` before resuming launchers.
+```sh
+OLD=/scratch/gpfs/TRIDAO/agent-bus-v2
+NEW=/scratch/agent-bus-v2
+~/src/agent-bus/setup-board.sh "$NEW" della-tridao
+bus move-board stage "$OLD" "$NEW"
+bus move-board finish "$OLD" "$NEW"
+```
 
-Before `finish`, the board owner can roll back by confirming that `OLD` is vacant and running
-`mv -T -- "$ARCHIVE" "$OLD"` with the archive path printed by `stage`. Clients still pin the original inode.
-Put the staged destination aside before retrying. After `finish`, use the same move procedure from the active
-board to an empty replacement. Use `OLD` only if every author can reach and write to it. Keep the original
-archive in place.
+The roots must have the same owner, host, GPU count and booking limits. Stage prepares the destination while
+the old board accepts writes. Finish waits for in-flight transactions that already hold a board lock, seals
+the old publication directories, and renames the original root to `$OLD.retired-<inode>`. New transactions
+follow the signed move record. Keep the archive in place and use it as read-only. Jobs keep running and
+launchers keep their normal configuration.
+
+A move-aware client replays its own records before it saves the new pin. Supervisors do this at a pass boundary,
+including after the regular hot upgrade. The replay keeps receipt slots, booking history and the seven-day
+budget. An open objection window keeps its remaining time when the booking reappears. A booking with an
+outstanding old objection or an earlier overlapping booking stays pending while it awaits the relevant
+author's records. Mailbox names are recreated by their owners. Senders replay messages they published after
+stage. Earlier messages and logs stay in the archive.
+
+Finish activates the destination without waiting for every account to upgrade. It observes replay for 10
+seconds by default and lists remaining runs and bookings. Older clients keep their jobs running and leave
+the board on their next pass. A run whose end or takeover has yet to be
+confirmed is shown as occupancy unknown and holds its GPUs for exclusive handoff, even after its old heartbeat
+expires. The page shows those holds, bookings awaiting replay, and GPU telemetry, including identifiable
+processes without current entries.
+
+Before finish, the source is still active. Set the staged destination aside to abandon the move. If finish
+is interrupted, rerun it with the same paths to finish the switch. After finish, move from the active board to
+an empty replacement and keep the original archive. This follows one move per pin, so let active clients re-pin
+before initiating a second move. An installation still pinned two moves back needs an explicit install at the
+current path. Only return to GPFS if every author can access it.
 
 ## Commands
 

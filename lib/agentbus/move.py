@@ -1,11 +1,15 @@
-"""Move a board without changing the authors or receipt order of its booking records."""
+"""Switch boards under a write lease. Replay creates files only as their original author."""
+import fcntl
 import hashlib
 import os
+import stat
+import time
 
 from . import core
 from .core import Refused
 
 RECORD = "move.json"
+SEAL = ".move-seal"
 
 
 def retired(pin):
@@ -16,11 +20,14 @@ def matches(board, pin):
     return board.ino == int(pin["inode"]) and board.fsid == int(pin["fsid"])
 
 
-def owned_json(board, name):
-    record = core.read_json(board.fd, name, 4096)
-    if record and record[1].st_uid == board.creator and not record[1].st_mode & 0o022:
-        return record[0]
-    return None
+def owner_file(board, name, limit=4096):
+    record = core.read_file(board.fd, name, limit)
+    return record if record and record[1].st_uid == board.creator and not record[1].st_mode & 0o022 else None
+
+
+def owned_json(board, name, limit=4096):
+    record = core.read_json(board.fd, name, limit)
+    return record[0] if record and record[1].st_uid == board.creator and not record[1].st_mode & 0o022 else None
 
 
 def destination(old, pin):
@@ -29,24 +36,24 @@ def destination(old, pin):
         return None
     path = record.get("path")
     if (not isinstance(path, str) or not os.path.isabs(path) or path != path.strip()
-            or any(c in path for c in "\0\r\n")
-            or path == pin["path"] or not all(core.is_int(record.get(k)) for k in ("inode", "fsid"))):
+            or any(c in path for c in "\0\r\n") or path == pin["path"]
+            or not all(core.is_int(record.get(k)) for k in ("inode", "fsid"))):
         return None
     try:
-        new = core.Board(path, (record["inode"], record["fsid"]))
+        new = core.Board(path, (record["inode"], record["fsid"])).lease()
     except (OSError, ValueError):
         return None
-    config = core.read_file(new.fd, "config", 4096)
     if (new.ok and new.creator == old.creator and new.host == core.HOST and new.limits == old.limits
-            and not os.fstat(new.fd).st_mode & 0o022 and config and config[1].st_uid == new.creator
-            and not config[1].st_mode & 0o022):
+            and not os.fstat(new.fd).st_mode & 0o022 and owner_file(new, "config")
+            and new.origin.get("source") == dict(path=pin["path"], inode=old.ino, fsid=old.fsid)
+            and not new.pending):
         return new
     new.close()
     return None
 
 
 def follow(pin):
-    """Follow a move only from the original pinned inode, now at its archive name."""
+    """The archive must be the exact pinned source, even if someone reuses its old name."""
     if pin.get("host") != core.HOST:
         return None
     try:
@@ -57,13 +64,9 @@ def follow(pin):
         if not matches(old, pin):
             return None
         new = destination(old, pin)
-        if new is not None and new.pending:
+        if new is not None:
             try:
-                stamp = os.path.join(core.private_dir("board-moves"), hashlib.sha256(
-                    core.dumps([old.pin_fields(), new.pin_fields()])).hexdigest() + ".json")
-                if core.read_private(stamp) is None:
-                    replay(old, new)
-                    core.write_private(stamp, True)
+                replay(old, new)
             except BaseException:
                 new.close()
                 raise
@@ -81,99 +84,293 @@ def artifact_refs(board):
         yield ("seq", str(slot // 10000)), str(slot), row["user"], row["_sha"]
 
 
+def copy_owned(old, new, parts, name, sha, target=None):
+    target_parts, target_name = target or (parts, name)
+    fd = new.dir(*target_parts)
+    if fd is None or os.fstat(fd).st_uid != new.creator:
+        raise Refused(f"{'/'.join(parts)} must belong to the board owner")
+    src = core.read_file(old.dir(*parts), name)
+    if src is None or src[1].st_uid != core.UID or hashlib.sha256(src[0]).hexdigest() != sha:
+        raise Refused(f"{'/'.join(parts)}/{name} changed during migration")
+    try:
+        core.publish(fd, target_name, src[0])
+    except FileExistsError:
+        cur = core.read_file(fd, target_name)
+        if not cur or cur[1].st_uid != core.UID or cur[0] != src[0]:
+            raise Refused(f"{'/'.join(parts)}/{name} is occupied on the destination")
+
+
+def record_end(board, entry):
+    record = dict(id=entry["id"], run=entry["run"], state="ended")
+    fd = board.wdir("migration")
+    name = f"{entry['id']}.ended.json"
+    try:
+        core.publish(fd, name, core.dumps(record))
+    except FileExistsError:
+        pass
+
+
+def publish_entry(old, new, entry):
+    state = core.read_private(os.path.join(core.STATE(), "runs", f"{entry['id']}.json")) or {}
+    if state.get("state") == "ended" and state.get("run") == entry["run"]:
+        record_end(new, entry)
+        return
+    rid = entry["id"]
+    inbox = core.mkdir_own(new.wdir("inbox"), rid, new.inbox_mode)
+    if inbox is not None:
+        os.close(inbox)
+    copy_owned(old, new, ("agents",), f"{rid}.json", entry["_sha"])
+    old_hb = old.dir("agents", ".heartbeat")
+    hb = new.wdir("agents", ".heartbeat")
+    if old_hb is None:
+        return
+    original = core.read_file(old_hb, rid, 4096)
+    if original is None or original[1].st_uid != core.UID or original[1].st_mode & 0o022:
+        return
+    data, st = original
+    try:
+        core.publish(hb, rid, data)
+    except FileExistsError:
+        return
+    os.utime(rid, ns=(st.st_atime_ns, st.st_mtime_ns), dir_fd=hb, follow_symlinks=False)
+
+
 def replay(old, new):
-    count = 0
-    if not new.pending:
-        raise Refused("the destination is not awaiting replay")
-    for parts, name, user, sha in artifact_refs(old):
-        if user != core.USER:
+    # This lock is private to the author. Its shared completion marker is published after the last record.
+    lock = os.path.join(core.private_dir("board-moves"), f"{new.fsid}-{new.ino}.lock")
+    with open(lock, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        marker = f"{core.USER}.json"
+        fd = new.wdir("migration")
+        done = core.read_file(fd, marker)
+        if done and done[1].st_uid == core.UID and not done[1].st_mode & 0o022:
+            return
+        for parts, name, user, sha in artifact_refs(old):
+            if user == core.USER:
+                copy_owned(old, new, parts, name, sha)
+        old_inboxes = old.dir("inbox")
+        names, _ = core.scan(old_inboxes) if old_inboxes is not None else ([], 0)
+        for name in names or []:
+            if core.owned_id(name, core.USER) and old.inbox_owner(name) == core.USER:
+                inbox = core.mkdir_own(new.wdir("inbox"), name, new.inbox_mode)
+                if inbox is not None:
+                    os.close(inbox)
+            if old.inbox_owner(name) is None:
+                continue
+            prefix = core.move_mail_prefix(name)
+            messages = old.records(f"inbox/{name}", core.check_message, owner_field="sender")
+            for m in messages:
+                if (m["sender"] == core.USER and m["to"] == name and m["_mode"] == 0o644
+                        and m["_mtime"] >= new.origin["staged_at"]):
+                    filename = m["id"] + ".json"
+                    copy_owned(old, new, ("inbox", name), filename, m["_sha"],
+                               target=(("migration",), prefix + filename))
+        for e in old.entries():
+            if e["user"] == core.USER:
+                publish_entry(old, new, e)
+        core.publish(fd, marker, b"{}\n")
+
+
+def completed(board):
+    fd = board.dir("migration")
+    names, _ = core.scan(fd) if fd is not None else ([], 0)
+    out = {}
+    for name in names or []:
+        if name.endswith(".json") and not name.endswith(".ended.json"):
+            row = core.read_file(fd, name, 4096)
+            if row and core.owner_name(row[1].st_uid) == name[:-5] and not row[1].st_mode & 0o022:
+                out[name[:-5]] = int(row[1].st_ctime)
+    return out
+
+
+def legacy_runs(board, entries):
+    """An old entry is evidence to hold a GPU until its author takes over or reports its verified end."""
+    holds = getattr(board, "origin", {}).get("runs", [])
+    if not holds:
+        return []
+    seen = {(e["id"], e["run"]) for e in entries}
+    fd = board.dir("migration")
+    for e in holds:
+        r = core.read_json(fd, f"{e['id']}.ended.json") if fd is not None else None
+        if (r and core.owner_name(r[1].st_uid) == e["user"] and not r[1].st_mode & 0o022
+                and r[0].get("id") == e["id"] and r[0].get("run") == e["run"] and r[0].get("state") == "ended"):
+            seen.add((e["id"], e["run"]))
+    return [e for e in holds if (e["id"], e["run"]) not in seen]
+
+
+def leftovers(board, entries=None):
+    ready = completed(board)
+    runs = legacy_runs(board, board.entries() if entries is None else entries)
+    bookings = []
+    for b in board.origin.get("bookings", []):
+        if b["end"] <= core.now():
             continue
-        fd = new.dir(*parts)
-        if fd is None or os.fstat(fd).st_uid != new.creator:
-            raise Refused(f"{'/'.join(parts)} must belong to the board owner")
-        src = core.read_file(old.dir(*parts), name)
-        if src is None or src[1].st_uid != core.UID or hashlib.sha256(src[0]).hexdigest() != sha:
-            raise Refused(f"{'/'.join(parts)}/{name} changed during replay")
-        try:
-            core.publish(fd, name, src[0])
-        except FileExistsError:
-            cur = core.read_file(fd, name)
-            if not cur or cur[1].st_uid != core.UID or cur[0] != src[0]:
-                raise Refused(f"{'/'.join(parts)}/{name} is occupied on the destination")
-        count += 1
-    return count
+        missing = [u for u in [b["user"], *b["objectors"]] if u not in ready]
+        if missing:
+            bookings.append(dict(b, awaiting=missing))
+    return runs, bookings
+
+
+def manifest(old, t):
+    from . import bookings
+
+    entries = bookings.entries_with_occupancy(old)
+    receipts = old.receipts()
+    times = bookings.sequence_times(receipts, None, getattr(old, "origin", {}))
+    rows = bookings.evaluate(old, t, entries=entries, receipts=receipts, record=False)
+    objections = {}
+    received = {(r["kind"], r["id"], r["revision"]): times[slot][0]
+                for slot, r in receipts.items() if not times[slot][1]}
+    for o in old.objections():
+        when = received.get(("objection", o["id"], o["_sha"]))
+        if when is not None:
+            objections.setdefault((o["booking"], o["booking_revision"]), []).append((o["user"], when))
+    future = []
+    for row in rows:
+        if row["end"] <= t or row.get("order") is None:
+            continue
+        guard = {k: row[k] for k in ("id", "user", "gpus", "start", "end", "revision", "order", "objection_close",
+                                    "state")}
+        revisions = [row["revision"], *row.get("lineage", [])]
+        guard["objectors"] = sorted({u for rev in revisions for u, when in objections.get((row["id"], rev), [])
+                                    if u != row["user"] and when < row["objection_close"]})
+        future.append(guard)
+    runs = [{k: e[k] for k in ("id", "user", "gpus", "run")} for e in entries]
+    runs.extend(legacy_runs(old, entries))
+    if old.warnings:
+        raise Refused("the source could not be read completely")
+    clocks = dict(old.origin.get("times", {}))
+    clocks.update({str(s): [when, receipts[s]["_sha"]] for s, (when, replaced) in times.items() if not replaced})
+    return dict(at=t, floor=max(old.receipt_floor, max(receipts, default=0)), source=old.pin_fields(),
+                times=clocks, runs=runs, bookings=future)
 
 
 def require_owner(board):
-    config = core.read_file(board.fd, "config", 4096)
-    if (board.creator != core.UID or os.fstat(board.fd).st_mode & 0o022
-            or not config or config[1].st_uid != core.UID or config[1].st_mode & 0o022):
+    if board.creator != core.UID or os.fstat(board.fd).st_mode & 0o022 or not owner_file(board, "config"):
         raise Refused(f"{board.path}: run this as the board owner with an owner-writable root and config")
 
 
 def stage(old, new):
     require_owner(old)
     require_owner(new)
-    if old.path == new.path or old.host != core.HOST or new.host != core.HOST or old.limits != new.limits:
+    if old.host != core.HOST or new.host != core.HOST or old.limits != new.limits:
         raise Refused("use two boards on this host with the same GPU count and booking limits")
-    if old.pending or new.entries() or any(artifact_refs(new)) or new.warnings:
-        raise Refused("the source must be active and the destination must be empty")
+    if old.pending or new.origin or new.entries() or any(artifact_refs(new)) or new.warnings:
+        raise Refused("the source must be active and the destination empty")
+    if new.pending:
+        if owned_json(new, core.MOVE_PENDING) != old.pin_fields():
+            raise Refused("the destination is reserved for another move")
+    else:
+        core.replace(new.fd, core.MOVE_PENDING, core.dumps(old.pin_fields()))
+    print(f"destination prepared at {new.path}; source remains active at {old.path}")
+
+
+def write_dirs(old):
+    seq = old.dir("seq")
+    blocks, _ = core.scan(seq) if seq is not None else ([], 0)
+    if blocks is None:
+        raise Refused("cannot enumerate receipt blocks")
+    return [("seq", name) for name in blocks if name.isdecimal()] + [
+        ("bookings",), ("objections",), ("arrivals",), ("agents",), ("agents", ".heartbeat"),
+        ("inbox",), ("archive",), ("log",), ("seq",), ("migration",)]
+
+
+def directory_mode(old, parts, mode=None):
+    parent = old.dir(*parts[:-1]) if len(parts) > 1 else old.fd
+    fd = core.sub(parent, parts[-1]) if parent is not None else None
+    if fd is None:
+        return None
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != old.creator:
+            return None
+        if mode is not None:
+            os.fchmod(fd, mode)
+        return stat.S_IMODE(st.st_mode)
+    finally:
+        os.close(fd)
+
+
+def finish(old, new, fenced_at):
+    require_owner(old)
+    require_owner(new)
     pin = old.pin_fields()
     archive = retired(pin)
+    if owned_json(new, core.MOVE_PENDING) != pin or os.path.lexists(archive):
+        raise Refused("the destination is not staged for this source or the archive name is taken")
     parent = core.walk(os.path.dirname(old.path))
+    modes = {}
+    switched = False
     try:
         name = os.path.basename(old.path)
         st = os.stat(name, dir_fd=parent, follow_symlinks=False)
         if (st.st_dev, st.st_ino) != (os.fstat(old.fd).st_dev, old.ino):
-            raise Refused("the source changed while staging the move")
-        if os.path.lexists(archive):
-            raise Refused(f"archive path already exists: {archive}")
-        pending = owned_json(new, core.MOVE_PENDING)
-        if new.pending and pending != pin:
-            raise Refused("the destination is already reserved for another move")
-        core.replace(new.fd, core.MOVE_PENDING, core.dumps(pin))
+            raise Refused("the source changed while finishing the move")
+        saved = owned_json(old, SEAL, core.MOVE_LIMIT)
+        if saved is None:
+            modes = {"/".join(parts): mode for parts in write_dirs(old)
+                     if (mode := directory_mode(old, parts)) is not None}
+            core.replace(old.fd, SEAL, core.dumps(modes))
+        else:
+            modes = saved
+        for part, mode in modes.items():
+            directory_mode(old, part.split("/"), mode & ~0o222)
+        origin = manifest(old, fenced_at)
+        origin["staged_at"] = owner_file(new, core.MOVE_PENDING)[1].st_mtime
+        if new.dir("seq", str((origin["floor"] + 1) // 10000)) is None:
+            raise Refused("allocate more receipt blocks on the destination before finishing")
+        data = core.dumps(origin)
+        if len(data) > core.MOVE_LIMIT:
+            raise Refused("the source migration index exceeds the board limit")
+        core.replace(new.fd, core.MOVE_ORIGIN, data)
         core.replace(old.fd, RECORD, core.dumps(dict(new.pin_fields(), host=new.host)))
         os.rename(name, os.path.basename(archive), src_dir_fd=parent, dst_dir_fd=parent)
+        switched = True
+        core.unlink_own(new.fd, core.MOVE_PENDING)
     finally:
-        os.close(parent)
-    print(f"source archived at {archive}; replay each author's booking records before finishing")
+        try:
+            if not switched:
+                for part, mode in modes.items():
+                    directory_mode(old, part.split("/"), mode)
+                core.unlink_own(old.fd, SEAL)
+        finally:
+            os.close(parent)
+    print(f"source sealed at {archive}; board active at {new.path}", flush=True)
 
 
-def command(action, old_path, new_path):
+def command(action, old_path, new_path, wait):
     old_path, new_path = os.path.abspath(old_path), os.path.abspath(new_path)
+    if old_path == new_path or not 0 <= wait <= 30:
+        raise Refused("use distinct source and destination paths and a wait of 0–30 seconds")
     try:
-        with core.Board(new_path) as new:
-            if action == "stage":
-                with core.Board(old_path) as old:
-                    stage(old, new)
-                return
-            pin = owned_json(new, core.MOVE_PENDING)
-            if not pin or pin.get("path") != old_path:
-                raise Refused("the destination has no pending move from this source")
-            with core.Board(retired(pin)) as old:
-                moved = destination(old, pin) if matches(old, pin) else None
-                if moved is None:
-                    raise Refused("the archived source does not authorize this move")
-                with moved:
-                    if moved.path != new.path or not matches(moved, new.pin_fields()):
-                        raise Refused("the archived source names a different destination")
-                    if action == "replay":
-                        print(f"replayed {replay(old, new)} booking records owned by {core.USER}")
-                        return
-                    require_owner(new)
-                    expected, actual = set(artifact_refs(old)), set(artifact_refs(new))
-                    if old.warnings or new.warnings:
-                        raise Refused("the source or destination calendar could not be read completely")
-                    if expected != actual:
-                        missing = ", ".join(sorted({a[2] for a in expected - actual})) or "none"
-                        raise Refused(f"calendar differs: missing authors {missing}; "
-                                      f"{len(actual - expected)} extra records")
-                    present = {(e["id"], e["run"]) for e in new.entries() if new.occupancy(e) == "live"}
-                    waiting = [e["id"] for e in old.entries()
-                               if old.occupancy(e) == "live" and (e["id"], e["run"]) not in present]
-                    if waiting:
-                        raise Refused("waiting for fresh entries or old heartbeats to expire: " + ", ".join(waiting))
+        if action == "finish" and not os.path.lexists(old_path):
+            with core.Board(new_path).lease(exclusive=True) as new:
+                require_owner(new)
+                pin = new.origin.get("source")
+                if not pin or pin["path"] != old_path:
+                    raise Refused("the destination has no move from this source")
+                with core.Board(retired(pin)) as old:
+                    record = owned_json(old, RECORD)
+                    if not matches(old, pin) or record != dict(new.pin_fields(), host=new.host):
+                        raise Refused("the archived source does not authorize this destination")
                     core.unlink_own(new.fd, core.MOVE_PENDING)
-                    print(f"board active at {new.path} with {len(actual)} booking records")
+        else:
+            with core.Board(old_path).lease(exclusive=action == "finish") as old:
+                fenced_at = core.now()
+                with core.Board(new_path).lease(exclusive=True) as new:
+                    if action == "stage":
+                        return stage(old, new)
+                    finish(old, new, fenced_at)
+        deadline = time.monotonic() + wait
+        while True:
+            with core.Board(new_path).lease() as new:
+                runs, bookings = leftovers(new)
+            if not (runs or bookings) or time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+        for record in runs:
+            print(f"old run {record['id']} remains unconfirmed; exclusive handoff still holds its GPUs")
+        for record in bookings:
+            print(f"old booking {record['id']} awaits replay by {', '.join(record['awaiting'])}")
     except (OSError, ValueError) as e:
         raise Refused(f"board move: {e}") from e

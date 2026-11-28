@@ -14,7 +14,7 @@ from pathlib import Path
 from socketserver import ThreadingMixIn
 
 from . import bookings as bk
-from . import core
+from . import core, move
 from .board_view import HISTORY, PAST, ROBOTS, clock, render
 
 THREADS = 16
@@ -142,7 +142,8 @@ def public_bookings(bookings, now):
 
 def collect(conf, *, history=True):
     now = core.now()
-    data = dict(t=now, host=core.HOST, board="", model="GPUs", entries=[], bookings=[], gpus=[], notices=[])
+    data = dict(t=now, host=core.HOST, board="", model="GPUs", entries=[], bookings=[], gpus=[], notices=[],
+                old_runs=[], old_bookings=[])
     ngpus = 0
     try:
         with core.Board.from_conf(conf) as b:
@@ -154,6 +155,14 @@ def collect(conf, *, history=True):
             bookings = bk.evaluate(b, now, seen=seen, entries=entries, record=False)
             data.update(board=b.path, entries=public_entries(entries, bookings),
                         bookings=public_bookings(bookings, now))
+            if b.origin:
+                old_runs, old_bookings = move.leftovers(b, entries)
+                data["old_runs"] = [dict(user=lab_user(e["user"]), gpus=e["gpus"]) for e in old_runs]
+                data["old_bookings"] = [dict(user=lab_user(r["user"]), gpus=r["gpus"]) for r in old_bookings]
+                if old_runs:
+                    data["notices"].append("Unconfirmed old runs still hold their GPUs for exclusive handoff.")
+                if old_bookings:
+                    data["notices"].append("Some bookings are on the previous board until their authors reconnect.")
             if b.warnings:
                 data["notices"].append("Some board records could not be read.")
     except (OSError, core.Refused):
@@ -188,7 +197,11 @@ def public_feed(data):
     bookings = [dict(user=netid(booking["user"]), gpus=booking["gpus"], start=booking["start"], end=booking["end"],
                      state=booking["state"], objection_close=booking["objection_close"])
                 for booking in data["bookings"] if booking["state"] in BOOKING_STATES]
-    return dict(t=data["t"], board=data["board"], gpus=gpus, entries=entries, bookings=bookings)
+    feed = dict(t=data["t"], board=data["board"], gpus=gpus, entries=entries, bookings=bookings)
+    for name in ("old_runs", "old_bookings"):
+        if data.get(name):
+            feed[name] = [dict(user=netid(row["user"]), gpus=row["gpus"]) for row in data[name]]
+    return feed
 
 
 class Page:
